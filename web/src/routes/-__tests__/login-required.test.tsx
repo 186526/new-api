@@ -146,7 +146,9 @@ test('anonymous direct visits redirect before loading business pages and retain 
   )
   await router.load()
   expect(router.state.location.pathname).toBe('/sign-in')
-  expect(router.state.location.search.redirect).toBe('/?view=usage#details')
+  expect(router.state.location.search).toMatchObject({
+    redirect: '/?view=usage#details',
+  })
   expect(businessLoader).not.toHaveBeenCalled()
 })
 
@@ -206,7 +208,7 @@ test.each([
     const { router, businessLoader } = await createSiteRouter(href)
     await router.load()
     expect(router.state.location.pathname).toBe('/sign-in')
-    expect(router.state.location.search.redirect).toBe(href)
+    expect(router.state.location.search).toMatchObject({ redirect: href })
     expect(businessLoader).not.toHaveBeenCalled()
   }
 )
@@ -265,7 +267,9 @@ test('legacy conversion preserves query and hash before login return', async () 
   const { router } = await createSiteRouter('/console/token?group=default#key')
   await router.load()
   expect(router.state.location.pathname).toBe('/sign-in')
-  expect(router.state.location.search.redirect).toBe('/keys?group=default#key')
+  expect(router.state.location.search).toMatchObject({
+    redirect: '/keys?group=default#key',
+  })
 })
 
 test('hintless refresh restores authentication and subsequent navigation stays usable', async () => {

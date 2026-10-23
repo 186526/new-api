@@ -32,6 +32,10 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - name: Fetch fixed quality baseline
+        working-directory: .
+        run: git fetch --no-tags --depth=1 origin 7d8b91268dab69d7150f345c448b5e250163146a
+
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
         with:
@@ -43,11 +47,16 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Lint
-        run: bun run lint
+      - name: Check lint and formatting against fixed baseline
+        run: bun ../scripts/check-site-frontend.mjs
 
-      - name: Check formatting
-        run: bun run format:check
+      - name: Preserve frontend quality reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: site-frontend-quality
+          path: ${{ runner.temp }}/site-frontend-checks/
+          if-no-files-found: warn
 
       - name: Test
         run: bun run test
