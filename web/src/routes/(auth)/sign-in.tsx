@@ -32,8 +32,6 @@ export const Route = createFileRoute('/(auth)/sign-in')({
   component: SignIn,
   validateSearch: searchSchema,
   beforeLoad: async ({ search }) => {
-    // 根 guard 可能因为没有会话提示而跳过了 refresh。此处必须回源确认，
-    // 否则持有有效 Refresh Cookie 的用户会被要求重新输入密码。
     await resolveAuthentication()
 
     const { auth } = useAuthStore.getState()

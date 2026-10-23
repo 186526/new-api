@@ -29,6 +29,10 @@ type AuthLayoutProps = {
 export function AuthLayout({ children }: AuthLayoutProps) {
   const { t } = useTranslation()
   const { systemName, logo, loading } = useSystemConfig()
+  const version = import.meta.env.VITE_REACT_APP_VERSION
+  const sourceRevision = /^sha-[0-9a-f]{40}$/i.test(version ?? '')
+    ? version.slice(4)
+    : 'site/login-required'
 
   return (
     <div className='relative grid h-svh max-w-none'>
@@ -56,6 +60,14 @@ export function AuthLayout({ children }: AuthLayoutProps) {
       <div className='container flex items-center pt-16 sm:pt-0'>
         <div className='mx-auto flex w-full flex-col justify-center space-y-2 px-4 py-8 sm:w-[480px] sm:p-8'>
           {children}
+          <a
+            href={`https://github.com/186526/new-api/tree/${sourceRevision}`}
+            target='_blank'
+            rel='noopener noreferrer'
+            className='text-muted-foreground hover:text-foreground mt-4 text-center text-xs underline underline-offset-4 transition-colors'
+          >
+            {t('Source code')}
+          </a>
         </div>
       </div>
     </div>

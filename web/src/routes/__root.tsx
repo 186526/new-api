@@ -25,6 +25,7 @@ import {
   useNavigate,
 } from '@tanstack/react-router'
 import { TanStackRouterDevtools } from '@tanstack/react-router-devtools'
+import { isAxiosError } from 'axios'
 import { useEffect } from 'react'
 
 import { NavigationProgress } from '@/components/navigation-progress'
@@ -39,6 +40,7 @@ import {
   bootstrapAuthentication,
   clearAuthenticatedClientState,
   clearAuthentication,
+  resolveAuthentication,
 } from '@/lib/auth-session'
 import { subscribeAuthSessionEvents } from '@/lib/auth-session-sync'
 import { resolveLegacyRoute } from '@/lib/legacy-route'
@@ -107,6 +109,14 @@ function RootComponent() {
   )
 }
 
+function routeRequestError(error: unknown): Error {
+  return Object.assign(new Error('Request failed'), {
+    response: isAxiosError(error)
+      ? { status: error.response?.status }
+      : undefined,
+  })
+}
+
 // 同一页面会话内避免重复检查；刷新后重新校验当前服务实例。
 let setupStatusChecked = false
 
@@ -120,32 +130,56 @@ export const Route = createRootRouteWithContext<{
       throw redirect({ href: legacyTarget, replace: true })
     }
 
-    const pathname = location?.pathname || ''
-    const needsSetupCheck =
-      !setupStatusChecked && !pathname.startsWith('/setup')
-    const authBootstrap = bootstrapAuthentication()
-
-    // 只检查 setup 状态（如果需要）
-    if (needsSetupCheck) {
-      const [status] = await Promise.all([
-        getSetupStatus().catch((error) => {
-          if (import.meta.env.DEV) {
-            // eslint-disable-next-line no-console
-            console.warn('[root.beforeLoad] setup status check failed', error)
-          }
-          return null
-        }),
-        authBootstrap,
-      ])
-
-      if (status?.success && status.data) {
+    const pathname = location.pathname.replace(/\/$/, '') || '/'
+    if (pathname === '/sign-up' || pathname === '/register') {
+      throw redirect({
+        to: '/sign-in',
+        search: location.search,
+        hash: location.hash,
+        replace: true,
+      })
+    }
+    const publicAuthenticationRoute =
+      [
+        '/sign-in',
+        '/otp',
+        '/oauth',
+        '/forgot-password',
+        '/reset',
+        '/user/reset',
+      ].includes(pathname) || /^\/oauth\/[^/]+$/.test(pathname)
+    const isSetupRoute = pathname === '/setup'
+    if (!setupStatusChecked || isSetupRoute) {
+      const status = await getSetupStatus().catch((error: unknown) => {
+        if (isSetupRoute) throw routeRequestError(error)
+        return null
+      })
+      if (status?.success && typeof status.data?.status === 'boolean') {
         if (!status.data.status) {
-          throw redirect({ to: '/setup' })
+          if (isSetupRoute) return
+          throw redirect({ to: '/setup', replace: true })
         }
         setupStatusChecked = true
+        if (isSetupRoute) {
+          throw redirect({ to: '/', replace: true })
+        }
+      } else if (isSetupRoute) {
+        throw new Error('Request failed')
       }
-    } else {
-      await authBootstrap
+    }
+
+    const outcome = await (publicAuthenticationRoute && pathname !== '/sign-in'
+      ? bootstrapAuthentication()
+      : resolveAuthentication())
+    if (outcome.kind === 'transient_error') {
+      throw routeRequestError(outcome.error)
+    }
+    if (!publicAuthenticationRoute && outcome.kind !== 'authenticated') {
+      throw redirect({
+        to: '/sign-in',
+        search: { redirect: location.href },
+        replace: true,
+      })
     }
   },
   component: RootComponent,

@@ -56,6 +56,12 @@
 
 ---
 
+## Site customization
+
+This fork was modified on 2026-10-23 from upstream `v1.0.0-rc.46` for `llm.real186526.cn`. The `site/login-required` branch redirects anonymous browser navigation to `/sign-in` before rendering business pages. Login, two-factor authentication, OAuth callbacks and password recovery remain accessible; registration pages redirect to sign-in. Setup is accessible only while the server confirms initialization is incomplete. API authorization continues to be enforced by the existing backend.
+
+The authentication pages link to the corresponding source revision in [186526/new-api](https://github.com/186526/new-api). Pushing the site branch runs frontend type, lint, formatting, test and production-build checks before publishing `linux/amd64` images to `ghcr.io/186526/new-api:sha-<full-commit>` and `:site`. Production deployments should pin the image digest. Upstream attribution and AGPL licensing are retained.
+
 ## 📝 Project Description
 
 New API is a self-hosted AI gateway for applications, agents, and teams. Connect upstream model services, expose a consistent API to your clients, and manage routing, access, usage, and costs in one place.

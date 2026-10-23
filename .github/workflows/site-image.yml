@@ -1,0 +1,107 @@
+name: Publish site image
+
+on:
+  push:
+    branches:
+      - site/login-required
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Check frontend
+    if: github.repository == '186526/new-api' && github.ref == 'refs/heads/site/login-required'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    env:
+      VITE_REACT_APP_VERSION: sha-${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version: '1.4.0'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Check formatting
+        run: bun run format:check
+
+      - name: Test
+        run: bun run test
+
+      - name: Build frontend
+        run: bun run build
+
+  image:
+    name: Build and publish site image
+    needs: frontend
+    if: github.repository == '186526/new-api' && github.ref == 'refs/heads/site/login-required'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Write image version
+        env:
+          IMAGE_VERSION: sha-${{ github.sha }}
+        run: printf '%s\n' "$IMAGE_VERSION" > VERSION
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4  # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/186526/new-api:site
+            ghcr.io/186526/new-api:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/186526/new-api
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=sha-${{ github.sha }}
+          cache-from: type=gha,scope=site-amd64
+          cache-to: type=gha,scope=site-amd64,mode=max
+          provenance: mode=max
+          sbom: true
