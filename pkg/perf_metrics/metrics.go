@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
@@ -34,22 +35,39 @@ func Init() {
 }
 
 // RecordRelayResult samples one finished relay exactly once, at the request
-// boundary, regardless of how many channel attempts it took.
-func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError) {
+// boundary, regardless of how many channel attempts it took. username is the
+// label value for the per-user counters; an empty value is reported as the
+// numeric user ID.
+func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError, username string) {
 	if info == nil {
 		return
 	}
 	outcome := ClassifyRelayOutcome(ctx, info, apiErr)
+	now := time.Now()
+	hasTtft := info.IsStream && info.HasSendResponse()
+	ttft := time.Duration(0)
+	if hasTtft {
+		ttft = info.FirstResponseTime.Sub(info.StartTime)
+	}
+	latency := now.Sub(info.StartTime)
+	if !info.IsChannelTest {
+		appmetrics.ObserveRelay(appmetrics.RelayResult{
+			UserID:   info.UserId,
+			Username: username,
+			Model:    info.OriginModelName,
+			Group:    info.UsingGroup,
+			Stream:   info.IsStream,
+			Outcome:  string(outcome),
+			Latency:  latency,
+			Ttft:     ttft,
+			HasTtft:  hasTtft,
+		})
+	}
 	if outcome == OutcomeIgnored {
 		return
 	}
-	now := time.Now()
-	hasTtft := info.IsStream && info.HasSendResponse()
-	ttftMs := int64(0)
-	if hasTtft {
-		ttftMs = info.FirstResponseTime.Sub(info.StartTime).Milliseconds()
-	}
-	latencyMs := now.Sub(info.StartTime).Milliseconds()
+	ttftMs := ttft.Milliseconds()
+	latencyMs := latency.Milliseconds()
 	generationMs := latencyMs
 	if hasTtft {
 		generationMs = now.Sub(info.FirstResponseTime).Milliseconds()

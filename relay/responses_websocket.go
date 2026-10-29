@@ -248,7 +248,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if info == nil && modelName != "" {
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
-		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
+		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr, c.GetString("username"))
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
 		// so neither policy record belongs here.

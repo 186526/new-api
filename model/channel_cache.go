@@ -3,7 +3,9 @@ package model
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 )
@@ -28,6 +31,7 @@ func InitChannelCache() {
 	if !common.MemoryCacheEnabled {
 		InvalidatePricingCache()
 		rebuildTaskAliasView()
+		appmetrics.SetPriceModels(GetEnabledModels())
 		return
 	}
 	newChannelId2channel := make(map[int]*Channel)
@@ -45,8 +49,12 @@ func InitChannelCache() {
 	var abilities []*Ability
 	DB.Find(&abilities)
 	groups := make(map[string]bool)
+	enabledModels := make(map[string]struct{}, len(abilities))
 	for _, ability := range abilities {
 		groups[ability.Group] = true
+		if ability.Enabled {
+			enabledModels[ability.Model] = struct{}{}
+		}
 	}
 	newGroup2model2channels := make(map[string]map[string][]int)
 	for group := range groups {
@@ -103,6 +111,7 @@ func InitChannelCache() {
 	// invalidating the pricing cache, otherwise the reversed order deadlocks.
 	InvalidatePricingCache()
 	rebuildTaskAliasView()
+	appmetrics.SetPriceModels(slices.Collect(maps.Keys(enabledModels)))
 	common.SysLog(common.LogText("channels synced from database"))
 }
 

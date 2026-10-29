@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
@@ -144,7 +145,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
-			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr)
+			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr, c.GetString("username"))
 		}
 		if recovered != nil {
 			panic(recovered)
@@ -203,6 +204,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		attemptStart := time.Now()
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -212,6 +214,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = geminiRelayHandler(c, relayInfo)
 		default:
 			newAPIError = relayHandler(c, relayInfo)
+		}
+		if !relayInfo.IsChannelTest {
+			appmetrics.ObserveUpstreamAttempt(appmetrics.UpstreamAttempt{
+				Model:       relayInfo.OriginModelName,
+				ChannelID:   channel.Id,
+				ChannelName: channel.Name,
+				Outcome:     string(perfmetrics.ClassifyRelayOutcome(c.Request.Context(), relayInfo, newAPIError)),
+				Duration:    time.Since(attemptStart),
+			})
 		}
 
 		if newAPIError == nil {

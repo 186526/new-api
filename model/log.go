@@ -7,6 +7,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -337,11 +338,30 @@ type RecordConsumeLogParams struct {
 }
 
 func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
+	username := c.GetString("username")
+	channelName := ""
+	if appmetrics.Enabled() {
+		if channel, err := CacheGetChannel(params.ChannelId); err == nil {
+			channelName = channel.Name
+		}
+	}
+	appmetrics.ObserveSettlement(appmetrics.Settlement{
+		UserID:           userId,
+		Username:         username,
+		Model:            params.ModelName,
+		ChannelID:        params.ChannelId,
+		ChannelName:      channelName,
+		Group:            params.Group,
+		PromptTokens:     params.PromptTokens,
+		CompletionTokens: params.CompletionTokens,
+		CacheReadTokens:  params.Other.publicInt("cache_tokens"),
+		CacheWriteTokens: params.Other.publicInt("cache_write_tokens"),
+		Quota:            params.Quota,
+	})
 	if !common.LogConsumeEnabled {
 		return
 	}
 	logger.LogInfo(c, common.LogText("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
-	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
 	upstreamRequestId := c.GetString(common.UpstreamRequestIdKey)
 	createdAt := common.GetTimestamp()
@@ -424,10 +444,18 @@ type RecordTaskBillingLogParams struct {
 }
 
 func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
+	username, _ := GetUsernameById(params.UserId, false)
+	appmetrics.ObserveTaskBilling(appmetrics.TaskBilling{
+		UserID:   params.UserId,
+		Username: username,
+		Model:    params.ModelName,
+		Group:    params.Group,
+		Quota:    params.Quota,
+		Refund:   params.LogType == LogTypeRefund,
+	})
 	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
 		return
 	}
-	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
 	if params.TokenId > 0 {
 		if token, err := GetTokenById(params.TokenId); err == nil {

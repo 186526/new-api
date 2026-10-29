@@ -76,6 +76,24 @@ func (o *LogOther) MergePublic(values map[string]any) {
 	}
 }
 
+// publicInt reads one user-visible numeric field, returning zero when the
+// field is absent or stored in another numeric form.
+func (o *LogOther) publicInt(key string) int {
+	if o == nil {
+		return 0
+	}
+	switch value := o.public[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
 // setContent stores structured content under content_parts, which the web
 // console renders in the viewer's language, and returns the English text kept
 // in the content column for exports and API callers.
