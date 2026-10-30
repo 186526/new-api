@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   CHANNEL_TYPES,
+  CHANNEL_TYPE_ANTIGRAVITY,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
 } from '../constants'
@@ -178,6 +179,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       baseUrl: 'Base URL is required for this channel type',
       key: 'Enter API key for this channel',
       models: 'Models',
+    },
+  },
+  [CHANNEL_TYPE_ANTIGRAVITY]: {
+    id: CHANNEL_TYPE_ANTIGRAVITY,
+    name: CHANNEL_TYPES[CHANNEL_TYPE_ANTIGRAVITY],
+    icon: 'google',
+    hints: {
+      baseUrl: 'Antigravity API endpoint, without /v1internal',
+      key: 'Paste Antigravity OAuth JSON credential (refresh_token)',
+      models: 'Models fetched from the Antigravity upstream',
     },
   },
 }

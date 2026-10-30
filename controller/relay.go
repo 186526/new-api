@@ -145,7 +145,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			resultErr = types.NewError(fmt.Errorf("relay panic: %v", recovered), types.ErrorCodeBadResponse)
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
-			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr, c.GetString("username"))
+			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr, perfmetrics.RequestLabels{
+				Username:    c.GetString("username"),
+				ChannelID:   common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+				ChannelName: common.GetContextKeyString(c, constant.ContextKeyChannelName),
+			})
 		}
 		if recovered != nil {
 			panic(recovered)

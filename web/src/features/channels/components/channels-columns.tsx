@@ -63,6 +63,7 @@ import { truncateText } from '@/lib/utils'
 import { getCodexUsage, updateChannelBalance } from '../api'
 import {
   CHANNEL_STATUS_CONFIG,
+  CHANNEL_TYPE_ANTIGRAVITY,
   CHANNEL_TYPE_TASK_PLUGIN,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
@@ -93,6 +94,7 @@ import { TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
 import { DataTableRowActions } from './data-table-row-actions'
 import { DataTableTagRowActions } from './data-table-tag-row-actions'
+import { AntigravityUsageDialog } from './dialogs/antigravity-usage-dialog'
 import { BalanceQueryDialog } from './dialogs/balance-query-dialog'
 import {
   CodexUsageDialog,
@@ -351,6 +353,7 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     null
   )
   const [codexUsageOpen, setCodexUsageOpen] = useState(false)
+  const [antigravityUsageOpen, setAntigravityUsageOpen] = useState(false)
   const [codexUsageResponse, setCodexUsageResponse] =
     useState<CodexUsageDialogData | null>(null)
   const currencyLabel = getCurrencyLabel()
@@ -444,6 +447,10 @@ export function BalanceCell({ channel }: { channel: Channel }) {
       setOpen('inference-status')
       return
     }
+    if (channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
+      setAntigravityUsageOpen(true)
+      return
+    }
     if (isUpdating) {
       return
     }
@@ -497,6 +504,8 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     remainingBadgeLabel = t('Updating...')
   } else if (sensitiveVisible && channel.type === 57) {
     remainingBadgeLabel = t('Account Info')
+  } else if (sensitiveVisible && channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
+    remainingBadgeLabel = t('Usage')
   } else if (sensitiveVisible && isInferenceChannel) {
     remainingBadgeLabel = inferenceStatusLabel
   }
@@ -505,11 +514,17 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     remainingTooltipLabel = maskedRemainingLabel
   } else if (channel.type === 57) {
     remainingTooltipLabel = t('Click to view Codex usage')
+  } else if (channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
+    remainingTooltipLabel = t('Click to view Antigravity usage')
   } else if (isInferenceChannel) {
     remainingTooltipLabel = inferenceStatusLabel
   }
   let remainingBadgeVariant: StatusBadgeProps['variant'] = variant
-  if (channel.type === 57 || isInferenceChannel) {
+  if (
+    channel.type === 57 ||
+    channel.type === CHANNEL_TYPE_ANTIGRAVITY ||
+    isInferenceChannel
+  ) {
     remainingBadgeVariant = 'info'
   } else if (isUpdating) {
     remainingBadgeVariant = 'neutral'
@@ -566,12 +581,19 @@ export function BalanceCell({ channel }: { channel: Channel }) {
           />
           <TooltipContent>
             <p>{remainingTooltipLabel}</p>
-            {channel.type !== 57 && !isInferenceChannel && (
-              <p>{t('Click to update balance')}</p>
-            )}
+            {channel.type !== 57 &&
+              channel.type !== CHANNEL_TYPE_ANTIGRAVITY &&
+              !isInferenceChannel && <p>{t('Click to update balance')}</p>}
           </TooltipContent>
         </Tooltip>
       </div>
+
+      <AntigravityUsageDialog
+        open={antigravityUsageOpen}
+        onOpenChange={setAntigravityUsageOpen}
+        channelId={channel.id}
+        channelName={channel.name}
+      />
 
       <CodexUsageDialog
         open={codexUsageOpen}

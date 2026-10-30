@@ -33,6 +33,8 @@ func init() {
 		upstreamAttemptsTotal, upstreamDurationSeconds, userRequestsTotal,
 		tokensTotal, promptCacheTokensTotal, quotaUsedTotal, costCnyTotal, refundCnyTotal,
 		userTokensTotal, userCostCnyTotal,
+		channelBalanceUSD, upstreamCreditsUsedUSD, upstreamCreditsCapUSD,
+		upstreamCreditsResetTimestamp, upstreamCreditsRefreshTimestamp,
 		newPriceCollector(), newCacheCollector(), redisCacheCollector{},
 	)
 }

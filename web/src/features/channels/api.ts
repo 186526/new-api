@@ -114,6 +114,32 @@ export type CodexResetCreditsResponse = CodexUsageResponse
 
 export type CodexUsageResetResponse = CodexUsageResponse
 
+export type AntigravityUsageBucket = {
+  bucket_id?: string
+  model_id?: string
+  display_name?: string
+  window?: string
+  description?: string
+  token_type?: string
+  remaining_fraction: number
+  reset_time?: string
+}
+
+export type AntigravityUsageGroup = {
+  display_name?: string
+  description?: string
+  buckets: AntigravityUsageBucket[]
+}
+
+export type AntigravityUsageResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    groups: AntigravityUsageGroup[]
+    fetched_at?: number
+  }
+}
+
 export type CodexCredentialRefreshResponse = {
   success: boolean
   message?: string
@@ -121,6 +147,20 @@ export type CodexCredentialRefreshResponse = {
     expires_at?: string
     last_refresh?: string
     account_id?: string
+    email?: string
+    channel_id?: number
+    channel_type?: number
+    channel_name?: string
+  }
+}
+
+export type AntigravityCredentialRefreshResponse = {
+  success: boolean
+  message?: string
+  data?: {
+    expires_at?: string
+    last_refresh?: string
+    project_id?: string
     email?: string
     channel_id?: number
     channel_type?: number
@@ -392,6 +432,28 @@ export async function refreshCodexCredential(
     `/api/channel/${channelId}/codex/refresh`,
     {},
     channelActionConfig()
+  )
+  return res.data
+}
+
+export async function refreshAntigravityCredential(
+  channelId: number
+): Promise<AntigravityCredentialRefreshResponse> {
+  const res = await api.post(
+    `/api/channel/${channelId}/antigravity/refresh`,
+    {},
+    channelActionConfig()
+  )
+  return res.data
+}
+
+export async function getAntigravityUsage(
+  channelId: number,
+  signal?: AbortSignal
+): Promise<AntigravityUsageResponse> {
+  const res = await api.get<AntigravityUsageResponse>(
+    `/api/channel/${channelId}/antigravity/usage`,
+    { signal, disableDuplicate: true, ...channelActionConfig() }
   )
   return res.data
 }

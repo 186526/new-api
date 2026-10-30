@@ -84,6 +84,7 @@ export interface ChannelSettings {
   task_extend_plugin_keys?: string[]
   force_format?: boolean
   thinking_to_content?: boolean
+  balance_source?: '' | 'commandcode'
   proxy?: string
   pass_through_body_enabled?: boolean
   responses_websocket_enabled?: boolean

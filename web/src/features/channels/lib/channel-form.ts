@@ -177,6 +177,20 @@ function isCodexCredential(value: string | undefined): boolean {
   }
 }
 
+function isAntigravityCredential(value: string | undefined): boolean {
+  try {
+    const parsed = parseOptionalJson(value)
+    if (parsed === undefined) return true
+    return (
+      isJsonObjectValue(parsed) &&
+      typeof parsed.refresh_token === 'string' &&
+      parsed.refresh_token.trim().length > 0
+    )
+  } catch {
+    return false
+  }
+}
+
 function isVertexJsonKey(value: string | undefined): boolean {
   try {
     const parsed = parseOptionalJson(value)
@@ -263,6 +277,7 @@ export const channelFormSchema = z
     // Channel extra settings (stored in setting JSON, not sent directly)
     force_format: z.boolean().optional(),
     thinking_to_content: z.boolean().optional(),
+    balance_source: z.enum(['openai', 'commandcode']).optional(),
     proxy: z
       .string()
       .optional()
@@ -379,6 +394,23 @@ export const channelFormSchema = z
       }
     }
 
+    if (data.type === 64) {
+      if (data.multi_key_mode && data.multi_key_mode !== 'single') {
+        addRequiredIssue(
+          ctx,
+          'multi_key_mode',
+          'Antigravity channels do not support batch creation'
+        )
+      }
+      if (data.key?.trim() && !isAntigravityCredential(data.key)) {
+        addRequiredIssue(
+          ctx,
+          'key',
+          'Antigravity credential must be a JSON object with refresh_token'
+        )
+      }
+    }
+
     if (
       data.type === 41 &&
       data.vertex_key_type === 'json' &&
@@ -460,6 +492,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   // Channel extra settings
   force_format: false,
   thinking_to_content: false,
+  balance_source: 'openai',
   proxy: '',
   http_protocol: HTTP_PROTOCOL_AUTO,
   http2_connection_shards: 1,
@@ -507,6 +540,7 @@ export function transformChannelToFormDefaults(
     task_extend_plugin_keys: [] as string[],
     force_format: false,
     thinking_to_content: false,
+    balance_source: 'openai' as 'openai' | 'commandcode',
     proxy: '',
     http_protocol: HTTP_PROTOCOL_AUTO as 'auto' | 'http1',
     http2_connection_shards: 1,
@@ -529,6 +563,10 @@ export function transformChannelToFormDefaults(
         task_extend_plugin_keys: readTaskExtendPluginKeys(channel.type, parsed),
         force_format: parsed.force_format || false,
         thinking_to_content: parsed.thinking_to_content || false,
+        balance_source:
+          channel.type === 1 && parsed.balance_source === 'commandcode'
+            ? 'commandcode'
+            : 'openai',
         proxy: parsed.proxy || '',
         http_protocol: protocol,
         http2_connection_shards: protocol === HTTP_PROTOCOL_HTTP1 ? 1 : shards,
@@ -676,6 +714,11 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
       formData.responses_websocket_enabled === true,
     system_prompt: formData.system_prompt || '',
     system_prompt_override: formData.system_prompt_override || false,
+  }
+
+  if (formData.type === 1) {
+    settingObj.balance_source =
+      formData.balance_source === 'commandcode' ? 'commandcode' : ''
   }
 
   const protocol = normalizeHttpProtocol(formData.http_protocol)

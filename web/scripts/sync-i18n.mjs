@@ -35,6 +35,8 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'AIGC2D',
   'Alipay',
   'Anthropic',
+  'Antigravity',
+  'Google Antigravity',
   'API URL',
   'API2GPT',
   'AccessKey / SecretAccessKey',

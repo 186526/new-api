@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	"github.com/QuantumNous/new-api/relay/channel/advancedcustom"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -626,6 +627,9 @@ func updateChannelBalance(channel *model.Channel) (channelBalanceResult, error) 
 		return fetchAdvancedCustomBalance(channel)
 	}
 	balance, err := updateStandardChannelBalance(channel)
+	if err == nil {
+		appmetrics.ObserveChannelBalanceUSD(channel.Name, channel.Id, balance)
+	}
 	return channelBalanceResult{Balance: balance}, err
 }
 
@@ -638,6 +642,9 @@ func updateStandardChannelBalance(channel *model.Channel) (float64, error) {
 	case constant.ChannelTypeOpenAI:
 		if channel.GetBaseURL() != "" {
 			baseURL = channel.GetBaseURL()
+		}
+		if channel.GetSetting().BalanceSource == dto.BalanceSourceCommandCode {
+			return updateChannelCommandCodeBalance(channel)
 		}
 	case constant.ChannelTypeAzure:
 		return 0, common.NewMessage("Not implemented yet")

@@ -131,8 +131,14 @@ func main() {
 		go controller.AutomaticallyUpdateChannels(frequency)
 	}
 
+	// Command Code reports its balance through an undocumented upstream route, so
+	// the figure the metrics endpoint publishes is refreshed here rather than
+	// derived from usage logs.
+	go controller.StartCommandCodeBalanceRefresh(controller.CommandCodeBalanceRefreshInterval)
+
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
 	service.StartCodexCredentialAutoRefreshTask()
+	service.StartAntigravityCredentialAutoRefreshTask()
 
 	// Subscription quota reset task (daily/weekly/monthly/custom)
 	service.StartSubscriptionQuotaResetTask()

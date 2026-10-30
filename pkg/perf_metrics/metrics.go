@@ -34,11 +34,21 @@ func Init() {
 	go flushLoop()
 }
 
+// RequestLabels carries the label values a finished relay reports that
+// RelayInfo does not hold: the calling user and the channel that served the
+// request. Call sites read them from the request context after the last
+// channel attempt.
+type RequestLabels struct {
+	Username    string
+	ChannelID   int
+	ChannelName string
+}
+
 // RecordRelayResult samples one finished relay exactly once, at the request
-// boundary, regardless of how many channel attempts it took. username is the
-// label value for the per-user counters; an empty value is reported as the
-// numeric user ID.
-func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError, username string) {
+// boundary, regardless of how many channel attempts it took. An empty username
+// is reported as the numeric user ID, and an empty channel name as the channel
+// ID.
+func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr *types.NewAPIError, labels RequestLabels) {
 	if info == nil {
 		return
 	}
@@ -52,15 +62,17 @@ func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr 
 	latency := now.Sub(info.StartTime)
 	if !info.IsChannelTest {
 		appmetrics.ObserveRelay(appmetrics.RelayResult{
-			UserID:   info.UserId,
-			Username: username,
-			Model:    info.OriginModelName,
-			Group:    info.UsingGroup,
-			Stream:   info.IsStream,
-			Outcome:  string(outcome),
-			Latency:  latency,
-			Ttft:     ttft,
-			HasTtft:  hasTtft,
+			UserID:      info.UserId,
+			Username:    labels.Username,
+			ChannelID:   labels.ChannelID,
+			ChannelName: labels.ChannelName,
+			Model:       info.OriginModelName,
+			Group:       info.UsingGroup,
+			Stream:      info.IsStream,
+			Outcome:     string(outcome),
+			Latency:     latency,
+			Ttft:        ttft,
+			HasTtft:     hasTtft,
 		})
 	}
 	if outcome == OutcomeIgnored {

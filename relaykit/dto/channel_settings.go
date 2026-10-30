@@ -35,6 +35,10 @@ type ChannelSettings struct {
 	// TLSInsecureSkipVerify accepts upstream certificates that fail
 	// verification, such as self-signed ones, for this channel only.
 	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
+	// BalanceSource selects the upstream API that reports the channel balance.
+	// An empty value keeps the OpenAI billing endpoints; BalanceSourceCommandCode
+	// reads Command Code's /alpha/billing/credits.
+	BalanceSource string `json:"balance_source,omitempty"`
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,
@@ -66,6 +70,9 @@ const (
 	HTTPProtocolAuto         = "auto"
 	HTTPProtocolHTTP1        = "http1"
 	MaxHTTP2ConnectionShards = 8
+	// BalanceSourceCommandCode makes an OpenAI channel read its balance from
+	// Command Code instead of the OpenAI billing endpoints.
+	BalanceSourceCommandCode = "commandcode"
 )
 
 // ValidateHTTPTransport validates save-time HTTP transport channel settings.

@@ -236,7 +236,7 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			}
 			groups := []string{"a", "b"}
 
-			RecordRelayResult(context.Background(), &relaycommon.RelayInfo{OriginModelName: "test-model", UsingGroup: "b", StartTime: now}, types.InitOpenAIError("unknown", 400), "")
+			RecordRelayResult(context.Background(), &relaycommon.RelayInfo{OriginModelName: "test-model", UsingGroup: "b", StartTime: now}, types.InitOpenAIError("unknown", 400), RequestLabels{})
 			businessRejected, err := QuerySummaryAll(24, groups)
 			require.NoError(t, err)
 			require.NotNil(t, businessRejected.Summary)
@@ -273,7 +273,7 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			assert.Equal(t, before.Summary, after.Summary)
 			assert.Equal(t, before.Series, after.Series)
 
-			RecordRelayResult(context.Background(), &relaycommon.RelayInfo{OriginModelName: "test-model", UsingGroup: "a", StartTime: now}, types.InitOpenAIError("context_length_exceeded", 400), "")
+			RecordRelayResult(context.Background(), &relaycommon.RelayInfo{OriginModelName: "test-model", UsingGroup: "a", StartTime: now}, types.InitOpenAIError("context_length_exceeded", 400), RequestLabels{})
 			after, err = Query(QueryParams{Model: "test-model", Hours: 24, AllowedGroups: groups})
 			require.NoError(t, err)
 			assert.Equal(t, before.Summary, after.Summary)

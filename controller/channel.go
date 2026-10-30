@@ -655,7 +655,56 @@ func validateChannel(channel *model.Channel, isAdd bool) error {
 		}
 	}
 
+	// Antigravity OAuth key validation (optional, only when JSON object is provided)
+	if channel.Type == constant.ChannelTypeAntigravity {
+		trimmedKey := strings.TrimSpace(channel.Key)
+		if isAdd || trimmedKey != "" {
+			if !strings.HasPrefix(trimmedKey, "{") {
+				return fmt.Errorf("Antigravity key must be a JSON object with refresh_token")
+			}
+			var keyMap map[string]any
+			if err := common.Unmarshal([]byte(trimmedKey), &keyMap); err != nil {
+				return fmt.Errorf("Antigravity key must be a JSON object with refresh_token")
+			}
+			if v, ok := keyMap["refresh_token"]; !ok || v == nil || strings.TrimSpace(fmt.Sprintf("%v", v)) == "" {
+				return fmt.Errorf("Antigravity key JSON must include refresh_token")
+			}
+		}
+	}
+
 	return nil
+}
+
+func RefreshAntigravityChannelCredential(c *gin.Context) {
+	channelId, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.ApiError(c, fmt.Errorf("invalid channel id: %w", err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	oauthKey, ch, err := service.RefreshAntigravityChannelCredential(ctx, channelId)
+	if err != nil {
+		common.SysError(common.LogText("failed to refresh antigravity channel credential: %s", err.Error()))
+		common.ApiErrorT(c, "Failed to refresh credentials. Please try again later")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "refreshed",
+		"data": gin.H{
+			"expires_at":   oauthKey.Expired,
+			"last_refresh": oauthKey.LastRefresh,
+			"project_id":   oauthKey.ProjectID,
+			"email":        oauthKey.Email,
+			"channel_id":   ch.Id,
+			"channel_type": ch.Type,
+			"channel_name": ch.Name,
+		},
+	})
 }
 
 func RefreshCodexChannelCredential(c *gin.Context) {
@@ -1452,7 +1501,7 @@ func FetchModels(c *gin.Context) {
 		}
 
 		key := strings.TrimSpace(req.Key)
-		if req.Type != constant.ChannelTypeCodex {
+		if req.Type != constant.ChannelTypeCodex && req.Type != constant.ChannelTypeAntigravity {
 			key = strings.Split(key, "\n")[0]
 		}
 		channel = &model.Channel{
