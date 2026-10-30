@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/antigravity/modelname"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -126,11 +127,24 @@ func (a *Adaptor) wrapGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo,
 	if err != nil {
 		return nil, err
 	}
-	body, err := buildRequestBody(info.UpstreamModelName, credential.ProjectID, geminiRequest)
+	upstreamModel := modelname.Resolve(info.UpstreamModelName, requestEffort(info, geminiRequest))
+	body, err := buildRequestBody(upstreamModel, credential.ProjectID, geminiRequest)
 	if err != nil {
 		return nil, err
 	}
 	return body, nil
+}
+
+// requestEffort 取客户端的 reasoning 档位：优先用 RelayInfo 里规整过的值，
+// 其次用 Gemini 请求体里的 thinkingLevel，都没有时由 resolveUpstreamModel 用缺省档位。
+func requestEffort(info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) string {
+	if effort := info.GetReasoningEffort(); effort != "" {
+		return effort
+	}
+	if request != nil && request.GenerationConfig.ThinkingConfig != nil {
+		return request.GenerationConfig.ThinkingConfig.ThinkingLevel
+	}
+	return ""
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {

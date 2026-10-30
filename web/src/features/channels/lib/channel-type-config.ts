@@ -184,7 +184,7 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
   [CHANNEL_TYPE_ANTIGRAVITY]: {
     id: CHANNEL_TYPE_ANTIGRAVITY,
     name: CHANNEL_TYPES[CHANNEL_TYPE_ANTIGRAVITY],
-    icon: 'google',
+    icon: 'Antigravity',
     hints: {
       baseUrl: 'Antigravity API endpoint, without /v1internal',
       key: 'Paste Antigravity OAuth JSON credential (refresh_token)',

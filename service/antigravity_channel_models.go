@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/antigravity/modelname"
 )
 
 const antigravityModelsTimeout = 30 * time.Second
@@ -63,8 +64,18 @@ func FetchAntigravityChannelModels(ch *model.Channel) ([]string, error) {
 	if err := common.Unmarshal(body, &payload); err != nil {
 		return nil, err
 	}
-	models := make([]string, 0, len(payload.Models))
-	for name := range payload.Models {
+	models := usableAntigravityModels(payload.Models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("antigravity fetchAvailableModels returned no usable model")
+	}
+	return models, nil
+}
+
+// usableAntigravityModels 过滤内部模型，并把带档位后缀的模型名折回基础名后去重排序。
+func usableAntigravityModels(raw map[string]any) []string {
+	seen := make(map[string]struct{}, len(raw))
+	models := make([]string, 0, len(raw))
+	for name := range raw {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
 			continue
@@ -72,11 +83,13 @@ func FetchAntigravityChannelModels(ch *model.Channel) ([]string, error) {
 		if _, internal := antigravityInternalModels[trimmed]; internal {
 			continue
 		}
-		models = append(models, trimmed)
-	}
-	if len(models) == 0 {
-		return nil, fmt.Errorf("antigravity fetchAvailableModels returned no usable model")
+		collapsed := modelname.Collapse(trimmed)
+		if _, duplicate := seen[collapsed]; duplicate {
+			continue
+		}
+		seen[collapsed] = struct{}{}
+		models = append(models, collapsed)
 	}
 	sort.Strings(models)
-	return models, nil
+	return models
 }

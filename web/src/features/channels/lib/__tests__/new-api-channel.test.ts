@@ -20,6 +20,7 @@ import { describe, expect, test } from 'vitest'
 
 import type { TaskPluginOption } from '../../api'
 import {
+  CHANNEL_TYPE_ANTIGRAVITY,
   CHANNEL_TYPE_NEW_API,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
@@ -101,6 +102,15 @@ describe('New API channel', () => {
     })
 
     expect(result.success).toBe(true)
+  })
+})
+
+describe('Google Antigravity channel', () => {
+  test('uses the Antigravity icon', () => {
+    expect(getChannelTypeIcon(CHANNEL_TYPE_ANTIGRAVITY)).toBe('Antigravity')
+    expect(getChannelTypeConfig(CHANNEL_TYPE_ANTIGRAVITY).icon).toBe(
+      'Antigravity'
+    )
   })
 })
 
