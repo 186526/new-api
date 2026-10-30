@@ -136,6 +136,10 @@ func main() {
 	// derived from usage logs.
 	go controller.StartCommandCodeBalanceRefresh(controller.CommandCodeBalanceRefreshInterval)
 
+	// Antigravity reports its quota as a remaining fraction per window instead of
+	// a currency amount, so it is refreshed on its own loop.
+	go controller.StartAntigravityQuotaRefresh(controller.AntigravityQuotaRefreshInterval)
+
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
 	service.StartCodexCredentialAutoRefreshTask()
 	service.StartAntigravityCredentialAutoRefreshTask()
