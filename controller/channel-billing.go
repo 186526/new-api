@@ -785,11 +785,20 @@ func UpdateAllChannelsBalance(c *gin.Context) {
 	return
 }
 
+// AutomaticallyUpdateChannels refreshes every channel balance once at startup
+// and then on the given minute interval. The startup pass keeps a restarted
+// process from publishing no balance gauge until the first tick.
 func AutomaticallyUpdateChannels(frequency int) {
-	for {
-		time.Sleep(time.Duration(frequency) * time.Minute)
-		common.SysLog(common.LogText("updating all channels"))
-		_ = updateAllChannelsBalance()
-		common.SysLog(common.LogText("channels update done"))
+	refreshAllChannelBalances()
+	ticker := time.NewTicker(time.Duration(frequency) * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		refreshAllChannelBalances()
 	}
+}
+
+func refreshAllChannelBalances() {
+	common.SysLog(common.LogText("updating all channels"))
+	_ = updateAllChannelsBalance()
+	common.SysLog(common.LogText("channels update done"))
 }
