@@ -1,4 +1,4 @@
-name: Publish metrics image
+name: Publish master image
 
 on:
   push:
@@ -11,12 +11,12 @@ permissions:
   packages: write
 
 concurrency:
-  group: metrics-image-${{ github.ref }}
+  group: master-image-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   image:
-    name: Build and publish metrics image
+    name: Build and publish master image
     if: github.repository == '186526/new-api'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -29,7 +29,7 @@ jobs:
       - name: Resolve image tag
         id: version
         run: |
-          echo "tag=metrics-$(date -u +%Y%m%d).${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${{ github.sha }}" >> "$GITHUB_OUTPUT"
           printf '%s\n' "sha-${{ github.sha }}" > VERSION
 
       - name: Set up Docker Buildx
@@ -54,9 +54,9 @@ jobs:
             org.opencontainers.image.source=https://github.com/186526/new-api
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.tag }}
-          cache-from: type=gha,scope=metrics-amd64
-          cache-to: type=gha,scope=metrics-amd64,mode=max
-          provenance: mode=max
+          cache-from: type=gha,scope=master-amd64
+          cache-to: type=gha,scope=master-amd64,mode=max
+          provenance: mode=min
           sbom: true
 
       - name: Image summary
