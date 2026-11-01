@@ -69,9 +69,18 @@ func poolOutstandingKey(subjectType string, subjectID string) string {
 	return fmt.Sprintf("pool:%s:%s:outstanding", subjectType, subjectID)
 }
 
-// RegionEnabled reports whether this process spends from region leases.
-func RegionEnabled() bool {
+// RegionConfigured reports whether this process takes part in region leases.
+// The admin answers lease requests and folds reported spend back; a relay
+// instance spends from its lease.
+func RegionConfigured() bool {
 	return common.Region != "" && common.RedisEnabled
+}
+
+// RegionEnabled reports whether this process spends from region leases, which
+// only a relay instance does. The admin must keep changing the central balance
+// directly: a top-up there is not a regional spend.
+func RegionEnabled() bool {
+	return common.RunsRelay() && RegionConfigured()
 }
 
 func regionTokenSubjectID(key string) string {

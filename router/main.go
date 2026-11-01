@@ -16,11 +16,11 @@ import (
 func SetRouter(router *gin.Engine, assets WebAssets) {
 	SetApiRouter(router)
 	SetDashboardRouter(router)
-	if common.RunsAdmin() {
-		SetPlaygroundRouter(router)
-	}
 	if common.RunsRelay() {
 		SetRelayRouter(router)
+		// The playground relays model requests too, so it lives with the relay
+		// routes instead of on the admin.
+		SetPlaygroundRouter(router)
 		SetTaskPluginProtocolRouter(router)
 		SetVideoRouter(router)
 		SetTaskRouter(router)

@@ -59,14 +59,29 @@ func RegionInternalToken() string {
 // StartRegionLeaseMaintenance starts the loops that keep region leases topped
 // up (admin) or reported (relay instance).
 func StartRegionLeaseMaintenance() {
-	if !model.RegionEnabled() {
+	if !model.RegionConfigured() {
 		return
 	}
 	region := common.Region
 	if common.RunsAdmin() {
 		go runRegionAdminLoop()
 	}
-	go runRegionReportLoop(region)
+	if common.RunsRelay() {
+		go runRegionReportLoop(region)
+	}
+	go runRegionMetricsLoop(region)
+}
+
+// runRegionMetricsLoop exports the lease totals of this region. Both roles
+// publish them: the numbers live in Redis, so whichever instance is up keeps
+// the dashboard and the alerts fed.
+func runRegionMetricsLoop(region string) {
+	ticker := time.NewTicker(regionReportInterval)
+	defer ticker.Stop()
+	for {
+		publishRegionPoolMetrics(region)
+		<-ticker.C
+	}
 }
 
 func runRegionReportLoop(region string) {
@@ -79,7 +94,6 @@ func runRegionReportLoop(region string) {
 	for {
 		reportRegionPending(region)
 		pendingReportSnapshot(region)
-		publishRegionPoolMetrics(region)
 		<-ticker.C
 	}
 }

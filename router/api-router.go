@@ -419,7 +419,7 @@ func SetApiRouter(router *gin.Engine) {
 // setRegionInternalRoutes registers the endpoints relay instances call. They
 // live under /api/internal, which the public ingress never forwards.
 func setRegionInternalRoutes(apiRouter *gin.RouterGroup) {
-	if !model.RegionEnabled() {
+	if !model.RegionConfigured() {
 		return
 	}
 	internal := apiRouter.Group("/internal", controller.RegionInternalAuth())
