@@ -116,6 +116,11 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatOpenAIAlphaSearch)
 		})
 
+		// TypeSafe decision model
+		httpRouter.POST("/systemone", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatSystemOne)
+		})
+
 		// DeepSeek Search and Fetch API routes
 		httpRouter.POST("/tools/search", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatDeepSeekTools)

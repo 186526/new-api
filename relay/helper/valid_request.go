@@ -43,6 +43,8 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		request, err = GetAndValidateAlphaSearchRequest(c)
 	case types.RelayFormatDeepSeekTools:
 		request, err = GetAndValidateDeepSeekToolsRequest(c)
+	case types.RelayFormatSystemOne:
+		request, err = GetAndValidateSystemOneRequest(c)
 
 	case types.RelayFormatOpenAIImage:
 		request, err = GetAndValidOpenAIImageRequest(c, relayMode)
@@ -154,6 +156,29 @@ func GetAndValidateResponsesRequest(c *gin.Context) (*dto.OpenAIResponsesRequest
 
 func GetAndValidateAlphaSearchRequest(c *gin.Context) (*dto.AlphaSearchRequest, error) {
 	request := &dto.AlphaSearchRequest{}
+	if err := common.UnmarshalBodyReusable(c, request); err != nil {
+		return nil, err
+	}
+	if request.Model == "" {
+		return nil, errors.New("model is required")
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, err
+	}
+	rawBody, err := storage.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	request.RawBody = rawBody
+	return request, nil
+}
+
+// GetAndValidateSystemOneRequest keeps the raw body for forwarding. The
+// upstream validates state, questions and criteria shapes; this layer only
+// needs the model for channel selection.
+func GetAndValidateSystemOneRequest(c *gin.Context) (*dto.SystemOneRequest, error) {
+	request := &dto.SystemOneRequest{}
 	if err := common.UnmarshalBodyReusable(c, request); err != nil {
 		return nil, err
 	}
