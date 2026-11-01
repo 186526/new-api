@@ -2,64 +2,63 @@ package mistral
 
 import (
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/types"
-
-	"github.com/gin-gonic/gin"
 )
 
-func TestConvertOpenAIResponsesRequestProducesMistralChatRequest(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+func TestConvertOpenAIResponsesRequestForwardsTheRequest(t *testing.T) {
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "deepseek-v4-1-flash-1017"}}
 
-	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(c, info, dto.OpenAIResponsesRequest{
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{
 		Model:        "deepseek-v4.1-flash",
 		Instructions: json.RawMessage(`"answer briefly"`),
-		Input:        []byte(`[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]`),
+		Input:        json.RawMessage(`[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]`),
 	})
 	if err != nil {
 		t.Fatalf("ConvertOpenAIResponsesRequest() error: %v", err)
 	}
-	chatRequest, ok := converted.(*dto.GeneralOpenAIRequest)
+	responsesRequest, ok := converted.(dto.OpenAIResponsesRequest)
 	if !ok {
-		t.Fatalf("converted request has type %T, want *dto.GeneralOpenAIRequest", converted)
+		t.Fatalf("converted request has type %T, want dto.OpenAIResponsesRequest", converted)
 	}
-	if chatRequest.Model != "deepseek-v4.1-flash" {
-		t.Errorf("model = %q, want %q", chatRequest.Model, "deepseek-v4.1-flash")
+	if responsesRequest.Model != "deepseek-v4-1-flash-1017" {
+		t.Errorf("model = %q, want the mapped upstream model", responsesRequest.Model)
 	}
-	for i, message := range chatRequest.Messages {
-		switch message.Role {
-		case "system", "user", "assistant", "tool":
-		default:
-			t.Errorf("message %d role = %q, which Mistral rejects", i, message.Role)
-		}
+	if string(responsesRequest.Instructions) != `"answer briefly"` {
+		t.Errorf("instructions = %s, want them forwarded unchanged", responsesRequest.Instructions)
+	}
+	if string(responsesRequest.Input) != `[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]` {
+		t.Errorf("input = %s, want the user item forwarded unchanged", responsesRequest.Input)
 	}
 }
 
-func TestDoResponseRoutesResponsesFormatThroughChatConversion(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       http.NoBody,
+func TestConvertOpenAIResponsesRequestMapsDeveloperRoleToSystem(t *testing.T) {
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, &relaycommon.RelayInfo{}, dto.OpenAIResponsesRequest{
+		Model: "deepseek-v4.1-flash",
+		Input: json.RawMessage(`[{"role":"developer","content":[{"type":"input_text","text":"rules"}]}]`),
+	})
+	if err != nil {
+		t.Fatalf("ConvertOpenAIResponsesRequest() error: %v", err)
 	}
-	info := &relaycommon.RelayInfo{
-		RelayFormat: types.RelayFormatOpenAIResponses,
-		ChannelMeta: &relaycommon.ChannelMeta{},
+	responsesRequest := converted.(dto.OpenAIResponsesRequest)
+
+	var items []struct {
+		Role string `json:"role"`
 	}
+	if err := json.Unmarshal(responsesRequest.Input, &items); err != nil {
+		t.Fatalf("unmarshal rewritten input: %v", err)
+	}
+	if len(items) != 1 || items[0].Role != "system" {
+		t.Errorf("input = %s, want the developer role rewritten to system", responsesRequest.Input)
+	}
+}
 
-	_, apiErr := (&Adaptor{}).DoResponse(c, resp, info)
+func TestMistralResponsesInputLeavesStringInputAlone(t *testing.T) {
+	input := json.RawMessage(`"hello"`)
 
-	if apiErr != nil && apiErr.Error() == "not implemented" {
-		t.Fatalf("DoResponse() still reports the Responses format as not implemented")
+	if got := mistralResponsesInput(input); string(got) != string(input) {
+		t.Errorf("input = %s, want %s", got, input)
 	}
 }

@@ -2,7 +2,6 @@ package mistral
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 
@@ -10,9 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -70,21 +67,15 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 	return nil, errors.New("not implemented")
 }
 
-// ConvertOpenAIResponsesRequest turns a Responses request into the Chat
-// Completions request Mistral accepts; DoResponse converts the reply back.
+// ConvertOpenAIResponsesRequest forwards the request to Mistral's own
+// Responses endpoint, which keeps every response field the client expects;
+// only the model name and the developer role differ from what Mistral accepts.
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	result, err := service.ConvertRequestByID(c, info, relayconvert.ConverterOpenAIResponsesToOpenAIChat, &request)
-	if err != nil {
-		return nil, err
+	if info.ChannelMeta != nil && info.UpstreamModelName != "" {
+		request.Model = info.UpstreamModelName
 	}
-	chatRequest, ok := result.Value.(*dto.GeneralOpenAIRequest)
-	if !ok {
-		return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
-	}
-	if info.SupportStreamOptions && info.IsStream {
-		chatRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
-	}
-	return requestOpenAI2Mistral(chatRequest), nil
+	request.Input = mistralResponsesInput(request.Input)
+	return request, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
@@ -94,9 +85,9 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
 	if info.RelayFormat == types.RelayFormatOpenAIResponses {
 		if info.IsStream {
-			return openai.OaiChatToResponsesStreamHandler(c, info, resp)
+			return openai.OaiResponsesStreamHandler(c, info, resp)
 		}
-		return openai.OaiChatToResponsesHandler(c, info, resp)
+		return openai.OaiResponsesHandler(c, info, resp)
 	}
 	if info.IsStream {
 		usage, err = openai.OaiStreamHandler(c, info, resp)

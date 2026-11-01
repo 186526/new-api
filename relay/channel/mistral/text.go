@@ -1,6 +1,7 @@
 package mistral
 
 import (
+	"encoding/json"
 	"regexp"
 
 	"github.com/QuantumNous/new-api/common"
@@ -89,4 +90,32 @@ func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAI
 		out.MaxTokens = &maxTokens
 	}
 	return out
+}
+
+// mistralResponsesInput rewrites the "developer" role in a Responses API input
+// to "system". Mistral accepts only system, user, assistant and tool roles on
+// both the Chat Completions and the Responses endpoint.
+func mistralResponsesInput(input json.RawMessage) json.RawMessage {
+	if len(input) == 0 {
+		return input
+	}
+	var items []map[string]any
+	if err := common.Unmarshal(input, &items); err != nil {
+		return input
+	}
+	changed := false
+	for _, item := range items {
+		if role, ok := item["role"].(string); ok && role == "developer" {
+			item["role"] = "system"
+			changed = true
+		}
+	}
+	if !changed {
+		return input
+	}
+	rewritten, err := common.Marshal(items)
+	if err != nil {
+		return input
+	}
+	return rewritten
 }
