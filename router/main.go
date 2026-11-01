@@ -26,16 +26,29 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 		common.SysLog(common.LogText("FRONTEND_BASE_URL is ignored on master node"))
 	}
 	if frontendBaseUrl == "" {
+		if len(assets.IndexPage) == 0 {
+			// A standalone web image serves the dashboard; this process only
+			// answers the API routes registered above.
+			router.NoRoute(
+				pluginDispatcher,
+				middleware.RouteTag("web"),
+				middleware.AccessTokenAudit(),
+				func(c *gin.Context) {
+					c.String(http.StatusNotFound, "404 page not found")
+				},
+			)
+			return
+		}
 		SetWebRouter(router, assets, pluginDispatcher)
-	} else {
-		frontendBaseUrl = strings.TrimSuffix(frontendBaseUrl, "/")
-		router.NoRoute(
-			pluginDispatcher,
-			middleware.RouteTag("web"),
-			middleware.AccessTokenAudit(),
-			func(c *gin.Context) {
-				c.Redirect(http.StatusMovedPermanently, fmt.Sprintf("%s%s", frontendBaseUrl, c.Request.RequestURI))
-			},
-		)
+		return
 	}
+	frontendBaseUrl = strings.TrimSuffix(frontendBaseUrl, "/")
+	router.NoRoute(
+		pluginDispatcher,
+		middleware.RouteTag("web"),
+		middleware.AccessTokenAudit(),
+		func(c *gin.Context) {
+			c.Redirect(http.StatusMovedPermanently, fmt.Sprintf("%s%s", frontendBaseUrl, c.Request.RequestURI))
+		},
+	)
 }

@@ -25,10 +25,11 @@ ADD tokenkit/go.mod ./tokenkit/go.mod
 RUN go mod download
 
 COPY . .
-COPY --from=builder /build/web/dist ./web/dist
-RUN go build -pgo="$(go list -m -f '{{.Dir}}' github.com/Calcium-Ion/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
+# The dashboard ships in the web image, so the backend build leaves the asset
+# tree out of the binary: no_web_assets drops the embedded web/dist.
+RUN go build -tags no_web_assets -pgo="$(go list -m -f '{{.Dir}}' github.com/Calcium-Ion/moejs)/default.pgo" -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
 
-FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
+FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a AS backend
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata libasan8 wget \
@@ -40,3 +41,11 @@ COPY LICENSE NOTICE THIRD-PARTY-LICENSES.md /licenses/
 EXPOSE 3000 9090
 WORKDIR /data
 ENTRYPOINT ["/new-api"]
+
+# The dashboard image: static files behind nginx. It needs no API code and no
+# database access, and the ingress sends only the API prefixes to the backend.
+FROM nginx:1.29-alpine@sha256:3bcf852aed06467cf075c6105892e4d5a6ebbbafa0ce22d35062db9e90ddef4c AS web
+
+COPY docker/web-nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /build/web/dist /usr/share/nginx/html
+EXPOSE 80
