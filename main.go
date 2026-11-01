@@ -225,6 +225,9 @@ func main() {
 	server.Use(middleware.RequestId())
 	server.Use(middleware.Version())
 	server.Use(middleware.I18n())
+	draining := middleware.NewDraining()
+	server.GET("/healthz", draining.Readiness)
+	server.Use(draining.RejectNewRequests())
 	middleware.SetUpLogger(server)
 	InjectUmamiAnalytics()
 	InjectGoogleAnalytics()
@@ -258,6 +261,11 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	common.SysLog(common.LogText("received signal: %v, shutting down...", sig))
+
+	// The readiness probe fails from here on, so the pod leaves the Service
+	// endpoints before the listener closes and no new request is routed to it.
+	draining.Begin()
+	time.Sleep(time.Duration(common.GetEnvOrDefault("SHUTDOWN_DRAIN_DELAY_SECONDS", 10)) * time.Second)
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
 	shutdownTimeout := time.Duration(common.GetEnvOrDefault("SHUTDOWN_TIMEOUT_SECONDS", 120)) * time.Second
