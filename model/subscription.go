@@ -1527,7 +1527,15 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 			First(&sub).Error; err != nil {
 			return err
 		}
-		newUsed := max(sub.AmountUsed+delta, 0)
+		newUsed := sub.AmountUsed + delta
+		if newUsed < 0 {
+			// 退还超过已用量说明账目已经失配，封顶到 0 并留日志，避免静默丢失退款
+			common.SysLog(common.LogText(
+				"subscription refund exceeds used amount, clamped to zero: subscription=%d used=%d delta=%d",
+				userSubscriptionId, sub.AmountUsed, delta,
+			))
+			newUsed = 0
+		}
 		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
 			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
 		}

@@ -257,6 +257,15 @@ func taskModelName(task *model.Task) string {
 	return task.Properties.OriginModelName
 }
 
+// claimTaskQuotaWriteBack 把任务额度从 fromQuota 改写为 task.Quota。
+// 任务尚未落库时直接返回成功，由调用方随任务一起写入。
+func claimTaskQuotaWriteBack(task *model.Task, fromQuota int) (bool, error) {
+	if task.ID == 0 {
+		return true, nil
+	}
+	return task.UpdateQuota(fromQuota)
+}
+
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
@@ -328,6 +337,19 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 		reason.Error(),
 	))
 
+	// 先以 CAS 抢占额度写回，失败说明另一个进程已经结算或退款，此时不能再动资金
+	task.Quota = actualQuota
+	claimed, err := claimTaskQuotaWriteBack(task, preConsumedQuota)
+	if err != nil {
+		logger.LogError(ctx, common.LogText("failed to write back the settled task quota, task %s: %s", task.TaskID, err.Error()))
+		return
+	}
+	if !claimed {
+		logger.LogWarn(ctx, common.LogText("task %s was settled or refunded by another caller, skipping the difference of %s",
+			task.TaskID, logger.LogQuota(quotaDelta)))
+		return
+	}
+
 	// 调整资金来源
 	if err := taskAdjustFunding(task, quotaDelta); err != nil {
 		logger.LogError(ctx, common.LogText("failed to adjust funding for the difference, task %s: %s", task.TaskID, err.Error()))
@@ -336,11 +358,6 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 
 	// 调整令牌额度
 	taskAdjustTokenQuota(ctx, task, quotaDelta)
-
-	task.Quota = actualQuota
-	if _, err := task.UpdateQuota(preConsumedQuota); err != nil {
-		logger.LogError(ctx, common.LogText("failed to write back the settled task quota, task %s: %s", task.TaskID, err.Error()))
-	}
 
 	// 提交阶段已经累计过一次请求；结算阶段只调整最终用量。
 	model.UpdateUserUsedQuota(task.UserId, quotaDelta)

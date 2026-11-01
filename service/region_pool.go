@@ -256,7 +256,7 @@ func topUpRegionLeases() {
 		regions = known
 	}
 	for _, region := range regions {
-		subjects, err := model.RegionSubjects(region)
+		subjects, err := model.RegionDirtySubjects(region)
 		if err != nil {
 			common.SysLog(common.LogText("failed to list subjects of region %s: %s", region, err.Error()))
 			continue

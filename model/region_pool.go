@@ -108,6 +108,7 @@ if delta > 0 then
 end
 redis.call('HINCRBY', KEYS[1], 'TotalSpent', delta)
 redis.call('SADD', KEYS[2], ARGV[2])
+redis.call('SADD', KEYS[3], ARGV[2])
 return 1`
 
 // regionReportScript snapshots the unreported spend under a fresh sequence
@@ -170,12 +171,16 @@ func cacheRegionReserve(subjectKey string, amount int64) (cacheQuotaResult, erro
 
 func cacheRegionSpend(subjectKey string, delta int64, member string) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), regionSpendScript,
-		[]string{subjectKey, regionDirtyKey(common.Region)}, delta, member).Int()
+		[]string{subjectKey, regionDirtyKey(common.Region), regionActiveKey(common.Region)}, delta, member).Int()
 	return quotaResultFromLua(result, err)
 }
 
 func regionDirtyKey(region string) string {
 	return fmt.Sprintf("region:%s:dirty", region)
+}
+
+func regionActiveKey(region string) string {
+	return fmt.Sprintf("region:%s:active", region)
 }
 
 func regionPendingKey(region string) string {
@@ -187,9 +192,19 @@ func regionMember(subjectType string, subjectID string) string {
 }
 
 // RegionSubjects returns the subjects that spent quota in this region, so the
-// admin can top up their leases before the next request runs dry.
+// region can report what it owes and the dashboard can aggregate its leases.
 func RegionSubjects(region string) ([][2]string, error) {
-	members, err := common.RDB.SMembers(context.Background(), regionDirtyKey(region)).Result()
+	return regionSubjectSet(regionActiveKey(region))
+}
+
+// RegionDirtySubjects returns the subjects whose lease needs a top-up. A grant
+// writes the member here; spending alone does not.
+func RegionDirtySubjects(region string) ([][2]string, error) {
+	return regionSubjectSet(regionDirtyKey(region))
+}
+
+func regionSubjectSet(key string) ([][2]string, error) {
+	members, err := common.RDB.SMembers(context.Background(), key).Result()
 	if err != nil {
 		return nil, err
 	}
