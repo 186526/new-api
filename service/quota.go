@@ -146,11 +146,14 @@ func PreWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usag
 		return fmt.Errorf("token quota is not enough, token remain quota: %s, need quota: %s", logger.FormatQuota(token.RemainQuota), logger.FormatQuota(quota))
 	}
 
-	err = PostConsumeQuota(relayInfo, quota, 0, false)
-	if err != nil {
-		return err
+	// Reserve the chunk instead of charging it: PostWssConsumeQuota settles the
+	// whole session once the connection ends, so charging here would bill every
+	// chunk twice.
+	target := relayInfo.FinalPreConsumedQuota + quota
+	if apiErr := PreConsumeBilling(ctx, target, relayInfo); apiErr != nil {
+		return apiErr
 	}
-	logger.LogInfo(ctx, common.LogText("realtime streaming consume quota success, quota: %d", quota))
+	logger.LogInfo(ctx, common.LogText("realtime streaming reserved quota, quota: %d", quota))
 	return nil
 }
 

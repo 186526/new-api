@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"gorm.io/gorm"
@@ -168,6 +169,9 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if quota == 0 {
 		return true, nil
 	}
+	if RegionEnabled() {
+		return reserveRegionQuota(RegionSubjectUser, strconv.Itoa(id), quota)
+	}
 	if !common.RedisEnabled {
 		return reserveUserQuotaDB(id, quota)
 	}
@@ -209,6 +213,9 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	if unlimited {
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
+	if RegionEnabled() {
+		return reserveRegionQuota(RegionSubjectToken, key, quota)
+	}
 	if !common.RedisEnabled {
 		return reserveTokenQuotaDB(id, quota)
 	}
@@ -236,4 +243,18 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return false, err
 	}
 	return true, nil
+}
+
+// reserveRegionQuota spends from the region lease. A region never falls back
+// to the database: that would bypass the lease and let every region spend the
+// whole central balance.
+func reserveRegionQuota(subjectType string, subjectID string, quota int) (bool, error) {
+	err := spendRegionLease(subjectType, subjectID, int64(quota))
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, ErrRegionLeaseUnavailable) {
+		return false, nil
+	}
+	return false, err
 }

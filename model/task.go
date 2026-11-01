@@ -541,8 +541,14 @@ func (Task *Task) Update() error {
 	return err
 }
 
-func (t *Task) UpdateQuota() error {
-	return DB.Model(t).Update("quota", t.Quota).Error
+// UpdateQuota writes the task quota only when the row still holds fromQuota,
+// so a concurrent refund or settlement cannot apply the same difference twice.
+func (t *Task) UpdateQuota(fromQuota int) (bool, error) {
+	result := DB.Model(t).Where("quota = ?", fromQuota).Update("quota", t.Quota)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // UpdateWithStatus performs a conditional UPDATE guarded by fromStatus (CAS).

@@ -89,6 +89,7 @@ func InitEnv() {
 	DebugEnabled = os.Getenv("DEBUG") == "true"
 	MemoryCacheEnabled = os.Getenv("MEMORY_CACHE_ENABLED") == "true"
 	IsMasterNode = os.Getenv("NODE_TYPE") != "slave"
+	initServerRole()
 	PasswordLoginEncryptionEnabled = GetEnvOrDefaultBool("PASSWORD_LOGIN_ENCRYPTION_ENABLED", false)
 	initNodeNameIdentity()
 	TLSInsecureSkipVerify = GetEnvOrDefaultBool("TLS_INSECURE_SKIP_VERIFY", false)
@@ -241,4 +242,23 @@ func initConstantEnv() {
 		}
 	}
 	constant.TrustedRedirectDomains = trustedDomains
+}
+
+// initServerRole resolves SERVER_ROLE into the role every runtime decision
+// reads, and REGION into the lease scope of a relay instance. A proxy without
+// a region would silently fall back to central quota accounting, so it fails
+// at startup instead.
+func initServerRole() {
+	switch role := strings.TrimSpace(os.Getenv("SERVER_ROLE")); role {
+	case "", ServerRoleAll:
+		ServerRole = ServerRoleAll
+	case ServerRoleAdmin, ServerRoleProxy:
+		ServerRole = role
+	default:
+		log.Fatalf("invalid SERVER_ROLE %q: want all, admin or proxy", role)
+	}
+	Region = strings.TrimSpace(os.Getenv("REGION"))
+	if ServerRole == ServerRoleProxy && Region == "" {
+		log.Fatal("SERVER_ROLE=proxy requires REGION")
+	}
 }

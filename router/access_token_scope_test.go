@@ -87,6 +87,7 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
 		SetDashboardRouter(engine)
+		SetPlaygroundRouter(engine)
 		SetRelayRouter(engine)
 		SetTaskPluginProtocolRouter(engine)
 		SetVideoRouter(engine)

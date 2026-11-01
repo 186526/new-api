@@ -146,6 +146,28 @@ var RetryTimes = 0
 
 var IsMasterNode bool
 
+// ServerRole splits a deployment into a management instance and relay
+// instances. "all" keeps the single-process behaviour.
+const (
+	ServerRoleAll   = "all"
+	ServerRoleAdmin = "admin"
+	ServerRoleProxy = "proxy"
+)
+
+var ServerRole = ServerRoleAll
+
+// Region names the relay instance's region when per-region quota leases are in
+// use. An empty value keeps every quota path on the central database.
+var Region = ""
+
+func RunsRelay() bool {
+	return ServerRole != ServerRoleAdmin
+}
+
+func RunsAdmin() bool {
+	return ServerRole != ServerRoleProxy
+}
+
 const (
 	NodeNameSourceManual   = "manual"
 	NodeNameSourceHostname = "hostname"

@@ -31,7 +31,9 @@ type SystemInstanceInfo struct {
 }
 
 type SystemInstanceRoleInfo struct {
-	IsMaster bool `json:"is_master"`
+	IsMaster   bool   `json:"is_master"`
+	ServerRole string `json:"server_role"`
+	Region     string `json:"region,omitempty"`
 }
 
 type SystemInstanceRuntimeInfo struct {
@@ -94,7 +96,9 @@ func ReportCurrentSystemInstance() error {
 		SchemaVersion: 1,
 		Node:          identity,
 		Role: SystemInstanceRoleInfo{
-			IsMaster: common.IsMasterNode,
+			IsMaster:   common.IsMasterNode,
+			ServerRole: common.ServerRole,
+			Region:     common.Region,
 		},
 		Runtime: SystemInstanceRuntimeInfo{
 			Version:   common.Version,

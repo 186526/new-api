@@ -3,8 +3,10 @@ package router
 import (
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/authz"
 
 	// Import oauth package to register providers via init()
@@ -21,28 +23,16 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.AccessTokenAudit())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
+	setPublicApiRoutes(apiRouter)
+	setRegionInternalRoutes(apiRouter)
+	if !common.RunsAdmin() {
+		return
+	}
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/setup", controller.GetSetup)
 		apiRouter.POST("/setup", anonymousRequestBodyLimit, controller.PostSetup)
-		apiRouter.GET("/status", controller.GetStatus)
-		apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
-		apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)
 		apiRouter.GET("/status/test", middleware.AdminAuth(), controller.TestStatus)
-		apiRouter.GET("/notice", controller.GetNotice)
-		apiRouter.GET("/user-agreement", controller.GetUserAgreement)
-		apiRouter.GET("/privacy-policy", controller.GetPrivacyPolicy)
-		apiRouter.GET("/about", controller.GetAbout)
-		//apiRouter.GET("/midjourney", controller.GetMidjourney)
-		apiRouter.GET("/home_page_content", controller.GetHomePageContent)
-		apiRouter.GET("/pricing", middleware.HeaderNavModuleAuth("pricing"), controller.GetPricing)
-		perfMetricsRoute := apiRouter.Group("/perf-metrics")
-		perfMetricsRoute.Use(middleware.HeaderNavModulePublicOrUserAuth("pricing"))
-		{
-			perfMetricsRoute.GET("/summary", controller.GetPerfMetricsSummary)
-			perfMetricsRoute.GET("", controller.GetPerfMetrics)
-		}
-		apiRouter.GET("/rankings", middleware.HeaderNavModuleAuth("rankings"), controller.GetRankings)
 		apiRouter.GET("/verification", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck(), controller.SendEmailVerification)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)
 		apiRouter.POST("/user/reset", middleware.CriticalRateLimit(), anonymousRequestBodyLimit, controller.ResetPassword)
@@ -295,16 +285,6 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetTokenKeysBatch)
 		}
 
-		usageRoute := apiRouter.Group("/usage")
-		usageRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
-		{
-			tokenUsageRoute := usageRoute.Group("/token")
-			tokenUsageRoute.Use(middleware.TokenAuthReadOnly())
-			{
-				tokenUsageRoute.GET("/", controller.GetTokenUsage)
-			}
-		}
-
 		redemptionRoute := apiRouter.Group("/redemption")
 		redemptionRoute.Use(middleware.AdminAuth())
 		{
@@ -354,10 +334,6 @@ func SetApiRouter(router *gin.Engine) {
 		dataRoute.GET("/flow", middleware.AdminAuth(), controller.GetAllFlowQuotaDates)
 		dataRoute.GET("/flow/self", middleware.UserAuth(), controller.GetUserFlowQuotaDates)
 
-		logRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
-		{
-			logRoute.GET("/token", middleware.TokenAuthReadOnly(), controller.GetLogByKey)
-		}
 		groupRoute := apiRouter.Group("/group")
 		groupRoute.Use(middleware.AdminAuth())
 		{
@@ -437,5 +413,54 @@ func SetApiRouter(router *gin.Engine) {
 			deploymentsRoute.POST("/:id/extend", controller.ExtendDeployment)
 			deploymentsRoute.DELETE("/:id", controller.DeleteDeployment)
 		}
+	}
+}
+
+// setRegionInternalRoutes registers the endpoints relay instances call. They
+// live under /api/internal, which the public ingress never forwards.
+func setRegionInternalRoutes(apiRouter *gin.RouterGroup) {
+	if !model.RegionEnabled() {
+		return
+	}
+	internal := apiRouter.Group("/internal", controller.RegionInternalAuth())
+	internal.POST("/region/lease", controller.RequestRegionLease)
+	internal.POST("/region/report", controller.ReportRegionSpend)
+}
+
+// setPublicApiRoutes registers the routes an API client or the dashboard needs
+// before it knows whether it talks to the admin or a relay instance. Relay
+// instances register only these, so management endpoints never exist there.
+func setPublicApiRoutes(apiRouter *gin.RouterGroup) {
+	apiRouter.GET("/status", controller.GetStatus)
+	apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
+	apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)
+	apiRouter.GET("/notice", controller.GetNotice)
+	apiRouter.GET("/user-agreement", controller.GetUserAgreement)
+	apiRouter.GET("/privacy-policy", controller.GetPrivacyPolicy)
+	apiRouter.GET("/about", controller.GetAbout)
+	apiRouter.GET("/home_page_content", controller.GetHomePageContent)
+	apiRouter.GET("/pricing", middleware.HeaderNavModuleAuth("pricing"), controller.GetPricing)
+	perfMetricsRoute := apiRouter.Group("/perf-metrics")
+	perfMetricsRoute.Use(middleware.HeaderNavModulePublicOrUserAuth("pricing"))
+	{
+		perfMetricsRoute.GET("/summary", controller.GetPerfMetricsSummary)
+		perfMetricsRoute.GET("", controller.GetPerfMetrics)
+	}
+	apiRouter.GET("/rankings", middleware.HeaderNavModuleAuth("rankings"), controller.GetRankings)
+
+	usageRoute := apiRouter.Group("/usage")
+	usageRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
+	{
+		tokenUsageRoute := usageRoute.Group("/token")
+		tokenUsageRoute.Use(middleware.TokenAuthReadOnly())
+		{
+			tokenUsageRoute.GET("/", controller.GetTokenUsage)
+		}
+	}
+
+	logRoute := apiRouter.Group("/log")
+	logRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
+	{
+		logRoute.GET("/token", middleware.TokenAuthReadOnly(), controller.GetLogByKey)
 	}
 }

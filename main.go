@@ -113,10 +113,12 @@ func main() {
 	// 周期性重载授权策略，保证多节点/多 master 部署下权限变更能传播到每个实例
 	go authz.StartPolicySync(common.SyncFrequency)
 
-	// 数据看板
-	go model.UpdateQuotaData()
+	// 数据看板：统计增量保存在进程内存里，只有跑 relay 的进程有数据
+	if common.RunsRelay() {
+		go model.UpdateQuotaData()
+	}
 
-	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" {
+	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" && common.RunsAdmin() {
 		frequency, err := strconv.Atoi(os.Getenv("CHANNEL_UPDATE_FREQUENCY"))
 		if err != nil {
 			common.FatalLog(common.LogText("failed to parse CHANNEL_UPDATE_FREQUENCY: %s", err.Error()))
@@ -127,17 +129,21 @@ func main() {
 	// Command Code reports its balance through an undocumented upstream route, so
 	// the figure the metrics endpoint publishes is refreshed here rather than
 	// derived from usage logs.
-	go controller.StartCommandCodeBalanceRefresh(controller.CommandCodeBalanceRefreshInterval)
+	if common.RunsAdmin() {
+		go controller.StartCommandCodeBalanceRefresh(controller.CommandCodeBalanceRefreshInterval)
+	}
 
 	// Antigravity reports its quota as a remaining fraction per window instead of
 	// a currency amount, so it is refreshed on its own loop.
-	go controller.StartAntigravityQuotaRefresh(controller.AntigravityQuotaRefreshInterval)
+	if common.RunsAdmin() {
+		go controller.StartAntigravityQuotaRefresh(controller.AntigravityQuotaRefreshInterval)
+	}
 
 	// Mistral Vibe exposes its monthly allowance only to the signed-in admin
 	// console, so it is refreshed from the configured session cookies.
-	if os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS") != "" ||
+	if common.RunsAdmin() && (os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS") != "" ||
 		os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE") != "" ||
-		os.Getenv("MISTRAL_VIBE_QUOTA_COOKIE") != "" {
+		os.Getenv("MISTRAL_VIBE_QUOTA_COOKIE") != "") {
 		frequency := controller.MistralVibeQuotaRefreshInterval
 		if raw := os.Getenv("MISTRAL_VIBE_QUOTA_FREQUENCY"); raw != "" {
 			minutes, err := strconv.Atoi(raw)
@@ -150,11 +156,19 @@ func main() {
 	}
 
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
-	service.StartCodexCredentialAutoRefreshTask()
-	service.StartAntigravityCredentialAutoRefreshTask()
+	if common.RunsAdmin() {
+		service.StartCodexCredentialAutoRefreshTask()
+		service.StartAntigravityCredentialAutoRefreshTask()
+	}
+
+	// Region quota leases: the admin tops leases up and folds reported spend
+	// back into the central balance, a relay instance reports what it spent.
+	service.StartRegionLeaseMaintenance()
 
 	// Subscription quota reset task (daily/weekly/monthly/custom)
-	service.StartSubscriptionQuotaResetTask()
+	if common.RunsAdmin() {
+		service.StartSubscriptionQuotaResetTask()
+	}
 
 	// Report this process as a system instance so the System Info page can show
 	// all currently alive nodes in multi-instance deployments.
@@ -382,7 +396,9 @@ func InitResources() error {
 		return err
 	}
 
-	perfmetrics.Init()
+	if common.RunsRelay() {
+		perfmetrics.Init()
+	}
 
 	// 启动系统监控
 	common.StartSystemMonitor()

@@ -331,6 +331,10 @@ func (s *BillingSession) shouldTrust(c *gin.Context) bool {
 	if s.relayInfo.ForcePreConsume {
 		return false
 	}
+	// 地域租约模式下所有请求都必须经过租约原子预扣，否则并发请求会打穿额度池
+	if model.RegionEnabled() {
+		return false
+	}
 
 	trustQuota := operation_setting.GetQuotaSetting().TrustQuotaUSD * common.QuotaPerUnit
 	if trustQuota <= 0 || math.IsNaN(trustQuota) || math.IsInf(trustQuota, 0) {

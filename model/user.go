@@ -1344,6 +1344,9 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	if err := common.ValidateWalletQuota(quota); err != nil {
 		return err
 	}
+	if RegionEnabled() {
+		return spendRegionLease(RegionSubjectUser, strconv.Itoa(id), -int64(quota))
+	}
 	if !db && common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
 		gopool.Go(func() {
@@ -1387,6 +1390,9 @@ func increaseUserQuota(id int, quota int) (err error) {
 func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota cannot be negative")
+	}
+	if RegionEnabled() {
+		return spendRegionLease(RegionSubjectUser, strconv.Itoa(id), int64(quota))
 	}
 	gopool.Go(func() {
 		err := cacheDecrUserQuota(id, int64(quota))

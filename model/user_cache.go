@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -174,6 +175,9 @@ func getUserGroupCache(userId int) (string, error) {
 }
 
 func getUserQuotaCache(userId int) (int, error) {
+	if RegionEnabled() {
+		return regionLeaseAvailable(RegionSubjectUser, strconv.Itoa(userId))
+	}
 	cache, err := GetUserCache(userId)
 	if err != nil {
 		return 0, err
