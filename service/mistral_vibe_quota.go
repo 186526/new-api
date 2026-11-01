@@ -37,6 +37,11 @@ const (
 type MistralVibeAccount struct {
 	Channel string `json:"channel"`
 	Cookie  string `json:"cookie"`
+	// MonthlyLimitUSD is the size of the Vibe Code allowance this account
+	// consumes. The web app reports only the used percentage, so the channel
+	// balance needs the plan amount to turn that percentage into dollars.
+	// Zero means the amount is unknown and the balance stays untouched.
+	MonthlyLimitUSD float64 `json:"monthlyLimitUsd"`
 }
 
 // MistralVibeQuota is the Vibe Code monthly allowance reported by the web app.
@@ -97,6 +102,9 @@ func LoadMistralVibeAccounts() ([]MistralVibeAccount, error) {
 		account.Cookie = strings.TrimSpace(account.Cookie)
 		if account.Channel == "" || account.Cookie == "" {
 			return nil, errors.New("Mistral Vibe account requires channel and cookie")
+		}
+		if account.MonthlyLimitUSD < 0 {
+			return nil, fmt.Errorf("Mistral Vibe account channel %q has a negative monthlyLimitUsd", account.Channel)
 		}
 		if _, exists := seen[account.Channel]; exists {
 			return nil, fmt.Errorf("duplicate Mistral Vibe account channel %q", account.Channel)
