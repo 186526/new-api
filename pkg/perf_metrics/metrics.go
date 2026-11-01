@@ -62,17 +62,18 @@ func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr 
 	latency := now.Sub(info.StartTime)
 	if !info.IsChannelTest {
 		appmetrics.ObserveRelay(appmetrics.RelayResult{
-			UserID:      info.UserId,
-			Username:    labels.Username,
-			ChannelID:   labels.ChannelID,
-			ChannelName: labels.ChannelName,
-			Model:       info.OriginModelName,
-			Group:       info.UsingGroup,
-			Stream:      info.IsStream,
-			Outcome:     string(outcome),
-			Latency:     latency,
-			Ttft:        ttft,
-			HasTtft:     hasTtft,
+			UserID:       info.UserId,
+			Username:     labels.Username,
+			ChannelID:    labels.ChannelID,
+			ChannelName:  labels.ChannelName,
+			Model:        info.OriginModelName,
+			Group:        info.UsingGroup,
+			Stream:       info.IsStream,
+			Outcome:      string(outcome),
+			Latency:      latency,
+			Ttft:         ttft,
+			HasTtft:      hasTtft,
+			OutputTokens: info.PerformanceOutputTokens,
 		})
 	}
 	if outcome == OutcomeIgnored {

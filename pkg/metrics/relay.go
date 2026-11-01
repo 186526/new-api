@@ -37,6 +37,16 @@ var (
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
 	}, []string{"channel", "model", "outcome"})
 
+	relayOutputTokensTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "newapi_relay_output_tokens_total",
+		Help: "Completion tokens of finished relay requests with a reported usage, by channel, model and stream mode.",
+	}, []string{"channel", "model", "stream"})
+
+	relayGenerationSecondsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "newapi_relay_generation_seconds_total",
+		Help: "Time spent streaming a finished relay request after its first token, by channel, model and stream mode.",
+	}, []string{"channel", "model", "stream"})
+
 	userRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "newapi_user_requests_total",
 		Help: "Finished relay requests by user and outcome.",
@@ -57,6 +67,10 @@ type RelayResult struct {
 	Latency     time.Duration
 	Ttft        time.Duration
 	HasTtft     bool
+	// OutputTokens is the completion token count the settlement recorded. It is
+	// zero when the upstream reported no usage, and such a request is left out
+	// of the token throughput.
+	OutputTokens int64
 }
 
 func ObserveRelay(result RelayResult) {
@@ -70,6 +84,16 @@ func ObserveRelay(result RelayResult) {
 	relayDurationSeconds.WithLabelValues(channel, model, stream).Observe(result.Latency.Seconds())
 	if result.HasTtft {
 		relayTtftSeconds.WithLabelValues(channel, model).Observe(result.Ttft.Seconds())
+	}
+	if result.OutputTokens > 0 {
+		relayOutputTokensTotal.WithLabelValues(channel, model, stream).Add(float64(result.OutputTokens))
+		generation := result.Latency
+		if result.HasTtft {
+			generation = result.Latency - result.Ttft
+		}
+		if generation > 0 {
+			relayGenerationSecondsTotal.WithLabelValues(channel, model, stream).Add(generation.Seconds())
+		}
 	}
 	if result.UserID > 0 || result.Username != "" {
 		userRequestsTotal.WithLabelValues(labelName(result.Username, result.UserID), result.Outcome).Inc()

@@ -116,6 +116,36 @@ func TestObserveRelayAttributesTheServingChannel(t *testing.T) {
 	assert.Equal(t, []string{"upstream-a"}, collectLabelValues(t, relayTtftSeconds, "channel"))
 }
 
+func TestObserveRelayCountsTokensAndGenerationTimeForThroughput(t *testing.T) {
+	ObserveRelay(RelayResult{
+		ChannelID:    21,
+		ChannelName:  "throughput-a",
+		Model:        "test-relay-throughput",
+		Stream:       true,
+		Outcome:      "success",
+		Latency:      3 * time.Second,
+		Ttft:         time.Second,
+		HasTtft:      true,
+		OutputTokens: 200,
+	})
+
+	assert.Equal(t, 200.0, testutil.ToFloat64(relayOutputTokensTotal.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
+	assert.Equal(t, 2.0, testutil.ToFloat64(relayGenerationSecondsTotal.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
+}
+
+func TestObserveRelayLeavesThroughputAloneWhenUsageIsMissing(t *testing.T) {
+	ObserveRelay(RelayResult{
+		ChannelID:   22,
+		ChannelName: "throughput-b",
+		Model:       "test-relay-no-usage",
+		Outcome:     "success",
+		Latency:     3 * time.Second,
+	})
+
+	assert.Equal(t, 0.0, testutil.ToFloat64(relayOutputTokensTotal.WithLabelValues("throughput-b", "test-relay-no-usage", "false")))
+	assert.Equal(t, 0.0, testutil.ToFloat64(relayGenerationSecondsTotal.WithLabelValues("throughput-b", "test-relay-no-usage", "false")))
+}
+
 func TestObserveUpstreamAttemptAttributesTheChannel(t *testing.T) {
 	ObserveUpstreamAttempt(UpstreamAttempt{
 		ChannelID:   21,
