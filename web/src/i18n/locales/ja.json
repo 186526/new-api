@@ -7375,6 +7375,16 @@
     "Models fetched from the Antigravity upstream": "Antigravity 上流から取得したモデル",
     "Antigravity usage": "Antigravity の使用量",
     "Click to view Antigravity usage": "クリックして Antigravity の使用量を表示",
-    "No usage data": "使用量データがありません"
+    "No usage data": "使用量データがありません",
+    "Mistral usage": "Mistral 使用量",
+    "Click to view Mistral usage": "クリックして Mistral の使用量を表示",
+    "Command Code usage": "Command Code 使用量",
+    "Click to view Command Code usage": "クリックして Command Code の使用量を表示",
+    "Remaining amount": "残り金額",
+    "Pay-as-you-go": "従量課金",
+    "Account {{index}}": "アカウント {{index}}",
+    "Monthly credits": "月間クレジット",
+    "Purchased credits": "購入クレジット",
+    "Free credits": "無料クレジット"
   }
 }

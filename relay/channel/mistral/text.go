@@ -9,6 +9,15 @@ import (
 
 var mistralToolCallIdRegexp = regexp.MustCompile("^[a-zA-Z0-9]{9}$")
 
+// mistralRole maps OpenAI's "developer" role onto Mistral's "system" role.
+// Mistral rejects any other role with HTTP 422.
+func mistralRole(role string) string {
+	if role == "developer" {
+		return "system"
+	}
+	return role
+}
+
 func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAIRequest {
 	messages := make([]dto.Message, 0, len(request.Messages))
 	idMap := make(map[string]string)
@@ -60,7 +69,7 @@ func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAI
 		}
 		message.SetMediaContent(mediaMessages)
 		messages = append(messages, dto.Message{
-			Role:       message.Role,
+			Role:       mistralRole(message.Role),
 			Content:    message.Content,
 			ToolCalls:  message.ToolCalls,
 			ToolCallId: message.ToolCallId,

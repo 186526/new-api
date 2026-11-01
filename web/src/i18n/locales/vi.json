@@ -7375,6 +7375,16 @@
     "Models fetched from the Antigravity upstream": "Mô hình lấy từ Antigravity",
     "Antigravity usage": "Mức sử dụng Antigravity",
     "Click to view Antigravity usage": "Nhấp để xem mức sử dụng Antigravity",
-    "No usage data": "Không có dữ liệu sử dụng"
+    "No usage data": "Không có dữ liệu sử dụng",
+    "Mistral usage": "Mức sử dụng Mistral",
+    "Click to view Mistral usage": "Nhấp để xem mức sử dụng Mistral",
+    "Command Code usage": "Mức sử dụng Command Code",
+    "Click to view Command Code usage": "Nhấp để xem mức sử dụng Command Code",
+    "Remaining amount": "Số tiền còn lại",
+    "Pay-as-you-go": "Thanh toán theo mức sử dụng",
+    "Account {{index}}": "Tài khoản {{index}}",
+    "Monthly credits": "Hạn mức hàng tháng",
+    "Purchased credits": "Hạn mức đã mua",
+    "Free credits": "Hạn mức miễn phí"
   }
 }

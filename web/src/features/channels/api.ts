@@ -140,6 +140,48 @@ export type AntigravityUsageResponse = {
   }
 }
 
+export type MistralUsageData = {
+  channel_name?: string
+  usage_percentage: number
+  remaining_ratio: number
+  monthly_limit_usd?: number
+  remaining_usd?: number
+  reset_at?: number
+  payg_enabled?: boolean
+  fetched_at?: number
+}
+
+export type MistralUsageResponse = {
+  success: boolean
+  message?: string
+  data?: MistralUsageData
+}
+
+export type CommandCodeUsageWindow = {
+  name: string
+  used_usd: number
+  cap_usd: number
+  reset_at?: number
+}
+
+export type CommandCodeUsageAccount = {
+  remaining_usd?: number
+  monthly_credits?: number
+  purchased_credits?: number
+  free_credits?: number
+  windows?: CommandCodeUsageWindow[]
+}
+
+export type CommandCodeUsageData = {
+  accounts: CommandCodeUsageAccount[]
+}
+
+export type CommandCodeUsageResponse = {
+  success: boolean
+  message?: string
+  data?: CommandCodeUsageData
+}
+
 export type CodexCredentialRefreshResponse = {
   success: boolean
   message?: string
@@ -453,6 +495,28 @@ export async function getAntigravityUsage(
 ): Promise<AntigravityUsageResponse> {
   const res = await api.get<AntigravityUsageResponse>(
     `/api/channel/${channelId}/antigravity/usage`,
+    { signal, disableDuplicate: true, ...channelActionConfig() }
+  )
+  return res.data
+}
+
+export async function getMistralUsage(
+  channelId: number,
+  signal?: AbortSignal
+): Promise<MistralUsageResponse> {
+  const res = await api.get<MistralUsageResponse>(
+    `/api/channel/${channelId}/mistral/usage`,
+    { signal, disableDuplicate: true, ...channelActionConfig() }
+  )
+  return res.data
+}
+
+export async function getCommandCodeUsage(
+  channelId: number,
+  signal?: AbortSignal
+): Promise<CommandCodeUsageResponse> {
+  const res = await api.get<CommandCodeUsageResponse>(
+    `/api/channel/${channelId}/commandcode/usage`,
     { signal, disableDuplicate: true, ...channelActionConfig() }
   )
   return res.data

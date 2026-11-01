@@ -7375,6 +7375,16 @@
     "Models fetched from the Antigravity upstream": "Models fetched from the Antigravity upstream",
     "Antigravity usage": "Antigravity usage",
     "Click to view Antigravity usage": "Click to view Antigravity usage",
-    "No usage data": "No usage data"
+    "No usage data": "No usage data",
+    "Mistral usage": "Mistral usage",
+    "Click to view Mistral usage": "Click to view Mistral usage",
+    "Command Code usage": "Command Code usage",
+    "Click to view Command Code usage": "Click to view Command Code usage",
+    "Remaining amount": "Remaining amount",
+    "Pay-as-you-go": "Pay-as-you-go",
+    "Account {{index}}": "Account {{index}}",
+    "Monthly credits": "Monthly credits",
+    "Purchased credits": "Purchased credits",
+    "Free credits": "Free credits"
   }
 }

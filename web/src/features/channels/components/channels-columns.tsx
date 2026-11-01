@@ -64,6 +64,7 @@ import { getCodexUsage, updateChannelBalance } from '../api'
 import {
   CHANNEL_STATUS_CONFIG,
   CHANNEL_TYPE_ANTIGRAVITY,
+  CHANNEL_TYPE_MISTRAL,
   CHANNEL_TYPE_TASK_PLUGIN,
   CHANNEL_TYPE_VLLM,
   CHANNEL_TYPE_SGLANG,
@@ -100,6 +101,8 @@ import {
   CodexUsageDialog,
   type CodexUsageDialogData,
 } from './dialogs/codex-usage-dialog'
+import { CommandCodeUsageDialog } from './dialogs/commandcode-usage-dialog'
+import { MistralUsageDialog } from './dialogs/mistral-usage-dialog'
 import { NumericSpinnerInput } from './numeric-spinner-input'
 
 function parseIonetMeta(otherInfo: string | null | undefined): null | {
@@ -354,8 +357,14 @@ export function BalanceCell({ channel }: { channel: Channel }) {
   )
   const [codexUsageOpen, setCodexUsageOpen] = useState(false)
   const [antigravityUsageOpen, setAntigravityUsageOpen] = useState(false)
+  const [mistralUsageOpen, setMistralUsageOpen] = useState(false)
+  const [commandCodeUsageOpen, setCommandCodeUsageOpen] = useState(false)
   const [codexUsageResponse, setCodexUsageResponse] =
     useState<CodexUsageDialogData | null>(null)
+  const isCommandCodeChannel =
+    channel.type === 1 &&
+    parseChannelSettings(channel.setting).balance_source === 'commandcode'
+  const isMistralChannel = channel.type === CHANNEL_TYPE_MISTRAL
   const currencyLabel = getCurrencyLabel()
   const tokenSuffix = currencyLabel === 'Tokens' ? ' Tokens' : ''
   const withSuffix = (value: string) =>
@@ -440,6 +449,10 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     channel.type === CHANNEL_TYPE_VLLM || channel.type === CHANNEL_TYPE_SGLANG
   const inferenceStatusLabel =
     channel.type === CHANNEL_TYPE_SGLANG ? t('SGLang status') : t('vLLM status')
+  const isUsageChannel =
+    channel.type === CHANNEL_TYPE_ANTIGRAVITY ||
+    isMistralChannel ||
+    isCommandCodeChannel
 
   const handleClickUpdate = async () => {
     if (isInferenceChannel) {
@@ -449,6 +462,14 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     }
     if (channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
       setAntigravityUsageOpen(true)
+      return
+    }
+    if (isMistralChannel) {
+      setMistralUsageOpen(true)
+      return
+    }
+    if (isCommandCodeChannel) {
+      setCommandCodeUsageOpen(true)
       return
     }
     if (isUpdating) {
@@ -504,7 +525,7 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     remainingBadgeLabel = t('Updating...')
   } else if (sensitiveVisible && channel.type === 57) {
     remainingBadgeLabel = t('Account Info')
-  } else if (sensitiveVisible && channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
+  } else if (sensitiveVisible && isUsageChannel) {
     remainingBadgeLabel = t('Usage')
   } else if (sensitiveVisible && isInferenceChannel) {
     remainingBadgeLabel = inferenceStatusLabel
@@ -516,15 +537,15 @@ export function BalanceCell({ channel }: { channel: Channel }) {
     remainingTooltipLabel = t('Click to view Codex usage')
   } else if (channel.type === CHANNEL_TYPE_ANTIGRAVITY) {
     remainingTooltipLabel = t('Click to view Antigravity usage')
+  } else if (isMistralChannel) {
+    remainingTooltipLabel = t('Click to view Mistral usage')
+  } else if (isCommandCodeChannel) {
+    remainingTooltipLabel = t('Click to view Command Code usage')
   } else if (isInferenceChannel) {
     remainingTooltipLabel = inferenceStatusLabel
   }
   let remainingBadgeVariant: StatusBadgeProps['variant'] = variant
-  if (
-    channel.type === 57 ||
-    channel.type === CHANNEL_TYPE_ANTIGRAVITY ||
-    isInferenceChannel
-  ) {
+  if (channel.type === 57 || isUsageChannel || isInferenceChannel) {
     remainingBadgeVariant = 'info'
   } else if (isUpdating) {
     remainingBadgeVariant = 'neutral'
@@ -581,9 +602,9 @@ export function BalanceCell({ channel }: { channel: Channel }) {
           />
           <TooltipContent>
             <p>{remainingTooltipLabel}</p>
-            {channel.type !== 57 &&
-              channel.type !== CHANNEL_TYPE_ANTIGRAVITY &&
-              !isInferenceChannel && <p>{t('Click to update balance')}</p>}
+            {channel.type !== 57 && !isUsageChannel && !isInferenceChannel && (
+              <p>{t('Click to update balance')}</p>
+            )}
           </TooltipContent>
         </Tooltip>
       </div>
@@ -591,6 +612,20 @@ export function BalanceCell({ channel }: { channel: Channel }) {
       <AntigravityUsageDialog
         open={antigravityUsageOpen}
         onOpenChange={setAntigravityUsageOpen}
+        channelId={channel.id}
+        channelName={channel.name}
+      />
+
+      <MistralUsageDialog
+        open={mistralUsageOpen}
+        onOpenChange={setMistralUsageOpen}
+        channelId={channel.id}
+        channelName={channel.name}
+      />
+
+      <CommandCodeUsageDialog
+        open={commandCodeUsageOpen}
+        onOpenChange={setCommandCodeUsageOpen}
         channelId={channel.id}
         channelName={channel.name}
       />

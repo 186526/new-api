@@ -18,6 +18,10 @@ func updateChannelMistralVibeBalance(channel *model.Channel) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if account.MonthlyLimitUSD <= 0 {
+		return 0, common.NewMessage(fmt.Sprintf(
+			"Mistral Vibe account %q has no monthlyLimitUsd", channel.Name))
+	}
 	quota, err := service.FetchMistralVibeQuota(context.Background(), account)
 	if err != nil {
 		return 0, err
@@ -27,20 +31,18 @@ func updateChannelMistralVibeBalance(channel *model.Channel) (float64, error) {
 	return balance, nil
 }
 
+// findMistralVibeAccount returns the account configured for a channel name. The
+// plan amount is left as configured, so a caller that only needs the percentage
+// still gets the account when monthlyLimitUsd is missing.
 func findMistralVibeAccount(name string) (service.MistralVibeAccount, error) {
 	accounts, err := service.LoadMistralVibeAccounts()
 	if err != nil {
 		return service.MistralVibeAccount{}, err
 	}
 	for _, account := range accounts {
-		if account.Channel != name {
-			continue
+		if account.Channel == name {
+			return account, nil
 		}
-		if account.MonthlyLimitUSD <= 0 {
-			return service.MistralVibeAccount{}, common.NewMessage(fmt.Sprintf(
-				"Mistral Vibe account %q has no monthlyLimitUsd", name))
-		}
-		return account, nil
 	}
 	return service.MistralVibeAccount{}, common.NewMessage(fmt.Sprintf(
 		"no Mistral Vibe account is configured for channel %q", name))

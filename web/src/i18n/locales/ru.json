@@ -7375,6 +7375,16 @@
     "Models fetched from the Antigravity upstream": "Модели, полученные от Antigravity",
     "Antigravity usage": "Использование Antigravity",
     "Click to view Antigravity usage": "Нажмите, чтобы посмотреть использование Antigravity",
-    "No usage data": "Нет данных об использовании"
+    "No usage data": "Нет данных об использовании",
+    "Mistral usage": "Использование Mistral",
+    "Click to view Mistral usage": "Нажмите, чтобы посмотреть использование Mistral",
+    "Command Code usage": "Использование Command Code",
+    "Click to view Command Code usage": "Нажмите, чтобы посмотреть использование Command Code",
+    "Remaining amount": "Остаток суммы",
+    "Pay-as-you-go": "Оплата по мере использования",
+    "Account {{index}}": "Аккаунт {{index}}",
+    "Monthly credits": "Месячные кредиты",
+    "Purchased credits": "Купленные кредиты",
+    "Free credits": "Бесплатные кредиты"
   }
 }

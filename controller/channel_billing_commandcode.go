@@ -91,15 +91,15 @@ func commandCodeCredentials(channel *model.Channel) []string {
 	return keys
 }
 
-func fetchCommandCodeCredits(channel *model.Channel, key string) (commandCodeCredits, error) {
+func fetchCommandCodeCredits(ctx context.Context, channel *model.Channel, key string) (commandCodeCredits, error) {
 	credits := commandCodeCredits{}
 	requestURL, err := commandCodeCreditsURL(channel.GetBaseURL())
 	if err != nil {
 		return credits, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), commandCodeRequestTTL)
+	requestCtx, cancel := context.WithTimeout(ctx, commandCodeRequestTTL)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return credits, err
 	}
@@ -134,7 +134,7 @@ func fetchCommandCodeCredits(channel *model.Channel, key string) (commandCodeCre
 // by other tools on the same account show up here too, because the upstream
 // reports the account rather than the channel.
 func updateChannelCommandCodeBalance(channel *model.Channel) (float64, error) {
-	accounts, err := fetchCommandCodeBalances(channel)
+	accounts, err := fetchCommandCodeBalances(context.Background(), channel)
 	if err != nil {
 		return 0, err
 	}
@@ -155,7 +155,7 @@ func updateChannelCommandCodeBalance(channel *model.Channel) (float64, error) {
 // fetchCommandCodeBalances queries every key of the channel. A key that fails is
 // skipped so the remaining accounts still produce a usable total; when every
 // key fails the first error is returned.
-func fetchCommandCodeBalances(channel *model.Channel) ([]commandCodeCredits, error) {
+func fetchCommandCodeBalances(ctx context.Context, channel *model.Channel) ([]commandCodeCredits, error) {
 	keys := commandCodeCredentials(channel)
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("channel has no key")
@@ -163,7 +163,7 @@ func fetchCommandCodeBalances(channel *model.Channel) ([]commandCodeCredits, err
 	accounts := make([]commandCodeCredits, 0, len(keys))
 	var firstErr error
 	for _, key := range keys {
-		credits, err := fetchCommandCodeCredits(channel, key)
+		credits, err := fetchCommandCodeCredits(ctx, channel, key)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err

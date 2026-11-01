@@ -7375,6 +7375,16 @@
     "Models fetched from the Antigravity upstream": "從 Antigravity 上游取得的模型",
     "Antigravity usage": "Antigravity 用量",
     "Click to view Antigravity usage": "點擊查看 Antigravity 用量",
-    "No usage data": "暫無用量資料"
+    "No usage data": "暫無用量資料",
+    "Mistral usage": "Mistral 用量",
+    "Click to view Mistral usage": "點擊查看 Mistral 用量",
+    "Command Code usage": "Command Code 用量",
+    "Click to view Command Code usage": "點擊查看 Command Code 用量",
+    "Remaining amount": "剩餘金額",
+    "Pay-as-you-go": "按量付費",
+    "Account {{index}}": "帳戶 {{index}}",
+    "Monthly credits": "每月額度",
+    "Purchased credits": "購買額度",
+    "Free credits": "贈送額度"
   }
 }
