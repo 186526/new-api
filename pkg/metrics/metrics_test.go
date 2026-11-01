@@ -131,6 +131,8 @@ func TestObserveRelayCountsTokensAndGenerationTimeForThroughput(t *testing.T) {
 
 	assert.Equal(t, 200.0, testutil.ToFloat64(relayOutputTokensTotal.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
 	assert.Equal(t, 2.0, testutil.ToFloat64(relayGenerationSecondsTotal.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
+	assert.Equal(t, uint64(1), histogramSampleCount(t, relayRequestTps.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
+	assert.Equal(t, 100.0, histogramSampleSum(t, relayRequestTps.WithLabelValues("throughput-a", "test-relay-throughput", "true")))
 }
 
 func TestObserveRelayLeavesThroughputAloneWhenUsageIsMissing(t *testing.T) {
@@ -178,6 +180,30 @@ func collectLabelValues(t *testing.T, collector prometheus.Collector, label stri
 		}
 	}
 	return values
+}
+
+// histogramSampleCount returns how many observations a histogram recorded for
+// one label combination.
+func histogramSampleCount(t *testing.T, observer prometheus.Observer) uint64 {
+	t.Helper()
+	return histogramSample(t, observer).GetSampleCount()
+}
+
+// histogramSampleSum returns the sum of the observations a histogram recorded
+// for one label combination.
+func histogramSampleSum(t *testing.T, observer prometheus.Observer) float64 {
+	t.Helper()
+	return histogramSample(t, observer).GetSampleSum()
+}
+
+func histogramSample(t *testing.T, observer prometheus.Observer) *dto.Histogram {
+	t.Helper()
+
+	metric, ok := observer.(prometheus.Metric)
+	require.True(t, ok, "observer does not implement prometheus.Metric")
+	written := &dto.Metric{}
+	require.NoError(t, metric.Write(written))
+	return written.GetHistogram()
 }
 
 func TestPriceCollectorReportsOnlyConfiguredModels(t *testing.T) {

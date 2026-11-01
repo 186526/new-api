@@ -31,7 +31,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		relayRequestsTotal, relayDurationSeconds, relayTtftSeconds,
 		upstreamAttemptsTotal, upstreamDurationSeconds, userRequestsTotal,
-		relayOutputTokensTotal, relayGenerationSecondsTotal,
+		relayOutputTokensTotal, relayGenerationSecondsTotal, relayRequestTps,
 		tokensTotal, promptCacheTokensTotal, quotaUsedTotal, costCnyTotal, refundCnyTotal,
 		userTokensTotal, userCostCnyTotal,
 		channelBalanceUSD, upstreamCreditsUsedUSD, upstreamCreditsCapUSD,

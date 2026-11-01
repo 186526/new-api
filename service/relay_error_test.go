@@ -278,3 +278,15 @@ func TestRequestPolicyEventsReachLogAdminInfo(t *testing.T) {
 	AppendRelayLogAdminInfo(untouched, nil, other)
 	assert.NotContains(t, other.Snapshot()["admin_info"], "request_policy", "requests without decisions do not carry an empty record")
 }
+
+func TestRetryBackoffWaitsOnlyForRecoverableUpstreamFailures(t *testing.T) {
+	upstream := func(status int) *types.NewAPIError {
+		return types.NewOpenAIError(errors.New("upstream"), types.ErrorCodeBadResponseStatusCode, status)
+	}
+	assert.Zero(t, RetryBackoff(upstream(http.StatusBadRequest), 0), "a deterministic rejection is not retried after a wait")
+	assert.Zero(t, RetryBackoff(nil, 0))
+
+	assert.InDelta(t, float64(retryBackoffBase), float64(RetryBackoff(upstream(http.StatusServiceUnavailable), 0)), float64(retryBackoffBase/4))
+	assert.InDelta(t, float64(2*retryBackoffBase), float64(RetryBackoff(upstream(http.StatusServiceUnavailable), 1)), float64(retryBackoffBase/2))
+	assert.InDelta(t, float64(retryBackoffMax), float64(RetryBackoff(upstream(http.StatusTooManyRequests), 8)), float64(retryBackoffMax/4), "the wait is capped")
+}

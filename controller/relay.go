@@ -179,6 +179,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
+relayAttempts:
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
@@ -244,6 +245,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if decision.Action != "retry" {
 			break
+		}
+		if delay := service.RetryBackoff(newAPIError, retryParam.GetRetry()); delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-c.Request.Context().Done():
+				break relayAttempts
+			}
 		}
 	}
 

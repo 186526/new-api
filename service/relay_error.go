@@ -1,6 +1,8 @@
 package service
 
 import (
+	"math/rand/v2"
+	"net/http"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -58,6 +60,36 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 
 func ShouldRetryRelayError(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
 	return DecideRelayRetry(c, openaiErr, retryTimes).Action == "retry"
+}
+
+const (
+	// Upstream 5xx replies arrive in bursts that last for seconds, so retrying
+	// an attempt immediately usually lands in the same burst. The wait starts
+	// under a second and doubles per attempt until it reaches the ceiling.
+	retryBackoffBase = 800 * time.Millisecond
+	retryBackoffMax  = 8 * time.Second
+)
+
+// RetryBackoff is the wait before the next attempt after a failed one. Only an
+// upstream overload or rate limit can recover on its own within a request, so
+// a deterministic 4xx gets no wait. The jitter keeps concurrent requests from
+// retrying in lockstep and rebuilding the burst they are waiting out.
+func RetryBackoff(err *types.NewAPIError, attempt int) time.Duration {
+	if err == nil || attempt < 0 {
+		return 0
+	}
+	status := err.StatusCode
+	if status != http.StatusTooManyRequests && status < 500 {
+		return 0
+	}
+	delay := retryBackoffBase
+	for i := 0; i < attempt && delay < retryBackoffMax; i++ {
+		delay *= 2
+	}
+	if delay > retryBackoffMax {
+		delay = retryBackoffMax
+	}
+	return delay + rand.N(delay/4)
 }
 
 func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {

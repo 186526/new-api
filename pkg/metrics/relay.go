@@ -47,6 +47,12 @@ var (
 		Help: "Time spent streaming a finished relay request after its first token, by channel, model and stream mode.",
 	}, []string{"channel", "model", "stream"})
 
+	relayRequestTps = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "newapi_relay_request_tps",
+		Help:    "Output tokens per generation second of one finished relay request, by channel, model and stream mode.",
+		Buckets: []float64{1, 2, 5, 10, 20, 30, 50, 80, 120, 200, 300, 500, 800},
+	}, []string{"channel", "model", "stream"})
+
 	userRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "newapi_user_requests_total",
 		Help: "Finished relay requests by user and outcome.",
@@ -93,6 +99,7 @@ func ObserveRelay(result RelayResult) {
 		}
 		if generation > 0 {
 			relayGenerationSecondsTotal.WithLabelValues(channel, model, stream).Add(generation.Seconds())
+			relayRequestTps.WithLabelValues(channel, model, stream).Observe(float64(result.OutputTokens) / generation.Seconds())
 		}
 	}
 	if result.UserID > 0 || result.Username != "" {
