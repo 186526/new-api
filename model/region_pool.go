@@ -51,6 +51,9 @@ func SetRegionLeaseRequest(fn func(subjectType string, subjectID string) error) 
 	regionLeaseRequest = fn
 }
 
+// regionLeaseRequestLocks coalesces concurrent top-up requests per subject.
+// Callers that lose the race wait for the in-flight request instead of
+// failing, because the winner's grant is exactly the quota they need.
 var regionLeaseRequestLocks sync.Map
 
 func regionSubjectKey(region string, subjectType string, subjectID string) string {
@@ -69,11 +72,11 @@ func poolOutstandingKey(subjectType string, subjectID string) string {
 	return fmt.Sprintf("pool:%s:%s:outstanding", subjectType, subjectID)
 }
 
-// RegionConfigured reports whether this process takes part in region leases.
+// RegionConfigured reports whether this process serves the region endpoints.
 // The admin answers lease requests and folds reported spend back; a relay
 // instance spends from its lease.
 func RegionConfigured() bool {
-	return common.Region != "" && common.RedisEnabled
+	return common.RegionLeaseEnabled && common.Region != "" && common.RedisEnabled
 }
 
 // RegionEnabled reports whether this process spends from region leases, which
@@ -338,10 +341,15 @@ func requestRegionLease(subjectType string, subjectID string) error {
 		return ErrRegionLeaseUnavailable
 	}
 	key := subjectType + ":" + subjectID
-	if _, loaded := regionLeaseRequestLocks.LoadOrStore(key, struct{}{}); loaded {
-		return ErrRegionLeaseUnavailable
+	done := make(chan struct{})
+	if actual, loaded := regionLeaseRequestLocks.LoadOrStore(key, done); loaded {
+		<-actual.(chan struct{})
+		return nil
 	}
-	defer regionLeaseRequestLocks.Delete(key)
+	defer func() {
+		regionLeaseRequestLocks.Delete(key)
+		close(done)
+	}()
 	return regionLeaseRequest(subjectType, subjectID)
 }
 
@@ -488,19 +496,6 @@ func applyRegionEvent(event RegionQuotaEvent) error {
 			}
 			return tx.Model(&User{}).Where("id = ?", id).
 				Update("quota", gorm.Expr("quota - ?", event.Delta)).Error
-		case RegionSubjectToken:
-			var token Token
-			if err := tx.Where("key = ?", event.SubjectID).First(&token).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return nil
-				}
-				return err
-			}
-			return tx.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
-				"remain_quota":  gorm.Expr("remain_quota - ?", event.Delta),
-				"used_quota":    gorm.Expr("used_quota + ?", event.Delta),
-				"accessed_time": common.GetTimestamp(),
-			}).Error
 		}
 		return nil
 	})
@@ -593,15 +588,6 @@ func regionSubjectCentralBalance(subjectType string, subjectID string) (int, err
 		var quota int
 		err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Scan(&quota).Error
 		return quota, err
-	case RegionSubjectToken:
-		var token Token
-		if err := DB.Where("key = ?", subjectID).First(&token).Error; err != nil {
-			return 0, err
-		}
-		if token.UnlimitedQuota {
-			return 0, nil
-		}
-		return token.RemainQuota, nil
 	}
 	return 0, fmt.Errorf("unknown region subject type %q", subjectType)
 }
@@ -675,8 +661,7 @@ type RegionPoolSnapshot struct {
 
 func RegionPoolStats(region string) (map[string]RegionPoolSnapshot, error) {
 	stats := map[string]RegionPoolSnapshot{
-		RegionSubjectUser:  {},
-		RegionSubjectToken: {},
+		RegionSubjectUser: {},
 	}
 	subjects, err := regionPoolSubjects(region)
 	if err != nil {

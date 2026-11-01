@@ -213,9 +213,6 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	if unlimited {
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
-	if RegionEnabled() {
-		return reserveRegionQuota(RegionSubjectToken, key, quota)
-	}
 	if !common.RedisEnabled {
 		return reserveTokenQuotaDB(id, quota)
 	}

@@ -258,6 +258,7 @@ func initServerRole() {
 		log.Fatalf("invalid SERVER_ROLE %q: want all, admin or proxy", role)
 	}
 	Region = strings.TrimSpace(os.Getenv("REGION"))
+	RegionLeaseEnabled = GetEnvOrDefaultBool("REGION_LEASE_ENABLED", false)
 	if ServerRole == ServerRoleProxy && Region == "" {
 		log.Fatal("SERVER_ROLE=proxy requires REGION")
 	}

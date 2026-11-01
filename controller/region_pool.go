@@ -47,7 +47,7 @@ func validRegionSubject(subjectType string, subjectID string) bool {
 	if strings.TrimSpace(subjectID) == "" {
 		return false
 	}
-	return subjectType == model.RegionSubjectUser || subjectType == model.RegionSubjectToken
+	return subjectType == model.RegionSubjectUser
 }
 
 // RequestRegionLease grants a region a chunk of a subject's central balance.

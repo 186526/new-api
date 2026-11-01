@@ -160,6 +160,11 @@ var ServerRole = ServerRoleAll
 // use. An empty value keeps every quota path on the central database.
 var Region = ""
 
+// RegionLeaseEnabled turns the lease accounting on. REGION alone only labels
+// the instance, so a deployment can stage the split before the lease model
+// carries traffic.
+var RegionLeaseEnabled = false
+
 func RunsRelay() bool {
 	return ServerRole != ServerRoleAdmin
 }
