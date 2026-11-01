@@ -217,6 +217,37 @@ func regionSubjectSet(key string) ([][2]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return splitRegionMembers(members), nil
+}
+
+// regionPoolSubjects unions the active and dirty sets: a subject that only
+// holds a lease has no spend to report but still counts towards the region's
+// available and outstanding totals.
+func regionPoolSubjects(region string) ([][2]string, error) {
+	ctx := context.Background()
+	active, err := common.RDB.SMembers(ctx, regionActiveKey(region)).Result()
+	if err != nil {
+		return nil, err
+	}
+	dirty, err := common.RDB.SMembers(ctx, regionDirtyKey(region)).Result()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(active)+len(dirty))
+	members := make([]string, 0, len(active)+len(dirty))
+	for _, set := range [][]string{active, dirty} {
+		for _, member := range set {
+			if _, ok := seen[member]; ok {
+				continue
+			}
+			seen[member] = struct{}{}
+			members = append(members, member)
+		}
+	}
+	return splitRegionMembers(members), nil
+}
+
+func splitRegionMembers(members []string) [][2]string {
 	subjects := make([][2]string, 0, len(members))
 	for _, member := range members {
 		subjectType, subjectID, ok := strings.Cut(member, ":")
@@ -225,7 +256,7 @@ func regionSubjectSet(key string) ([][2]string, error) {
 		}
 		subjects = append(subjects, [2]string{subjectType, subjectID})
 	}
-	return subjects, nil
+	return subjects
 }
 
 // regionLeaseAvailable returns the quota a region may still spend for a
@@ -647,7 +678,7 @@ func RegionPoolStats(region string) (map[string]RegionPoolSnapshot, error) {
 		RegionSubjectUser:  {},
 		RegionSubjectToken: {},
 	}
-	subjects, err := RegionSubjects(region)
+	subjects, err := regionPoolSubjects(region)
 	if err != nil {
 		return nil, err
 	}
