@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
+	mistralchannel "github.com/QuantumNous/new-api/relay/channel/mistral"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -291,6 +292,9 @@ func buildFetchModelsHeaders(channel *model.Channel, key string) (http.Header, e
 		headers = GetClaudeAuthHeader(key)
 	default:
 		headers = GetAuthHeader(key)
+	}
+	if channel.Type == constant.ChannelTypeMistral {
+		mistralchannel.ApplyUpstreamUserAgent(key, headers)
 	}
 
 	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
