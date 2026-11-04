@@ -32,6 +32,7 @@ func init() {
 		relayRequestsTotal, relayDurationSeconds, relayTtftSeconds,
 		upstreamAttemptsTotal, upstreamDurationSeconds, userRequestsTotal,
 		relayOutputTokensTotal, relayGenerationSecondsTotal, relayRequestTps,
+		relayRequestBodyBytes,
 		tokensTotal, promptCacheTokensTotal, quotaUsedTotal, costCnyTotal, refundCnyTotal,
 		userTokensTotal, userCostCnyTotal,
 		channelBalanceUSD, upstreamCreditsUsedUSD, upstreamCreditsCapUSD,

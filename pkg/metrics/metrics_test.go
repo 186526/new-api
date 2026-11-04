@@ -286,4 +286,14 @@ func TestObserveRelayRecordsRequestBodySize(t *testing.T) {
 	assert.Equal(t, uint64(0), counts["65536"])
 	assert.Equal(t, uint64(1), counts["1048576"])
 	assert.Equal(t, uint64(2), counts["67108864"])
+
+	gathered, err := registry.Gather()
+	require.NoError(t, err)
+	exposed := false
+	for _, family := range gathered {
+		if family.GetName() == "newapi_request_body_bytes" {
+			exposed = true
+		}
+	}
+	assert.True(t, exposed, "the histogram must be registered on the /metrics registry")
 }
