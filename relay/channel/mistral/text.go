@@ -57,8 +57,21 @@ func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAI
 			}
 		}
 
+		// Mistral accepts only a string as a tool result, so a tool message keeps
+		// its content as text. The empty result of a tool call is the common
+		// case: turned into content parts it becomes [{"type":"text"}] and the
+		// upstream rejects it with 422.
+		if message.Role == "tool" {
+			messages = append(messages, dto.Message{
+				Role:       "tool",
+				Content:    message.StringContent(),
+				ToolCallId: message.ToolCallId,
+			})
+			continue
+		}
+
 		mediaMessages := message.ParseContent()
-		if message.Role == "assistant" && message.ToolCalls != nil && message.Content == "" {
+		if message.Role == "assistant" && message.ToolCalls != nil && message.StringContent() == "" {
 			mediaMessages = []dto.MediaContent{}
 		}
 		for j, mediaMessage := range mediaMessages {
