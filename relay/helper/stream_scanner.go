@@ -26,7 +26,13 @@ import (
 const (
 	InitialScannerBufferSize    = 64 << 10  // 64KB (64*1024)
 	DefaultMaxScannerBufferSize = 128 << 20 // 64MB (64*1024*1024) default SSE buffer size
-	DefaultPingInterval         = 10 * time.Second
+	DefaultPingInterval         = 5 * time.Second
+	// keepAliveCommitDelay is how long the keepalive waits before its first
+	// heartbeat. The heartbeat commits the response headers, so the delay is the
+	// window in which an upstream that rejects the request outright still gets
+	// its status code to the client. It stays well below the 30-second timeout
+	// an edge proxy applies to a silent connection.
+	keepAliveCommitDelay = 2 * time.Second
 	// streamWriteTimeout bounds a write blocked on a client that stopped
 	// reading so the unconditional wg.Wait() in cleanup can always finish.
 	// Without it, a connected client with a full TCP buffer (no server
@@ -53,6 +59,12 @@ func NewStreamScanner(reader io.Reader, maxBytes ...int) *bufio.Scanner {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, min(InitialScannerBufferSize, limit)), limit)
 	return scanner
+}
+
+// CopyUpstreamStreamHeaders publishes the upstream headers the relay forwards to
+// the client. It must run before the keepalive commits the response headers.
+func CopyUpstreamStreamHeaders(c *gin.Context, resp *http.Response) {
+	copyCodexSSEHeaders(c, resp)
 }
 
 func copyCodexSSEHeaders(c *gin.Context, resp *http.Response) {

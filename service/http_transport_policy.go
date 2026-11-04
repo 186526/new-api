@@ -17,6 +17,8 @@ type HTTPTransportPolicy struct {
 	Protocol              string // dto.HTTPProtocolAuto or dto.HTTPProtocolHTTP1
 	Shards                int    // 1..dto.MaxHTTP2ConnectionShards
 	TLSInsecureSkipVerify bool
+	// ResponseHeaderTimeoutSeconds overrides the global header wait when set.
+	ResponseHeaderTimeoutSeconds int
 }
 
 var httpTransportPolicyWarnings sync.Map
@@ -33,6 +35,7 @@ func defaultHTTPTransportPolicy() HTTPTransportPolicy {
 func NormalizeHTTPTransportPolicy(settings dto.ChannelSettings) HTTPTransportPolicy {
 	policy := defaultHTTPTransportPolicy()
 	policy.TLSInsecureSkipVerify = settings.TLSInsecureSkipVerify
+	policy.ResponseHeaderTimeoutSeconds = settings.ResponseHeaderTimeoutSeconds
 
 	protocol := strings.ToLower(strings.TrimSpace(settings.HTTPProtocol))
 	switch protocol {
@@ -71,6 +74,14 @@ func NormalizeHTTPTransportPolicy(settings dto.ChannelSettings) HTTPTransportPol
 	if policy.Shards < 1 {
 		policy.Shards = 1
 	}
+	if policy.ResponseHeaderTimeoutSeconds < 0 {
+		warnHTTPTransportPolicyOnce("response_header_timeout_seconds", fmt.Sprintf("%d", policy.ResponseHeaderTimeoutSeconds))
+		policy.ResponseHeaderTimeoutSeconds = 0
+	}
+	if policy.ResponseHeaderTimeoutSeconds > dto.MaxResponseHeaderTimeoutSeconds {
+		warnHTTPTransportPolicyOnce("response_header_timeout_seconds", fmt.Sprintf("%d", policy.ResponseHeaderTimeoutSeconds))
+		policy.ResponseHeaderTimeoutSeconds = dto.MaxResponseHeaderTimeoutSeconds
+	}
 	return policy
 }
 
@@ -86,7 +97,7 @@ func warnHTTPTransportPolicyOnce(field, value string) {
 }
 
 func (p HTTPTransportPolicy) cacheKeyPart() string {
-	return fmt.Sprintf("%s|%d|%t", p.Protocol, p.Shards, p.TLSInsecureSkipVerify)
+	return fmt.Sprintf("%s|%d|%t|%d", p.Protocol, p.Shards, p.TLSInsecureSkipVerify, p.ResponseHeaderTimeoutSeconds)
 }
 
 func (p HTTPTransportPolicy) String() string {

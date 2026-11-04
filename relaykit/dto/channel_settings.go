@@ -32,6 +32,11 @@ type ChannelSettings struct {
 	// HTTP2ConnectionShards spreads HTTP/2 traffic across N independent transports
 	// (1-8). Zero/unset means 1. Ignored when HTTPProtocol is "http1".
 	HTTP2ConnectionShards int `json:"http2_connection_shards,omitempty"`
+	// ResponseHeaderTimeoutSeconds overrides the global upstream header wait for
+	// this channel. Zero keeps the global RELAY_RESPONSE_HEADER_TIMEOUT, which is
+	// far longer than an edge proxy's own timeout; a channel that stalls before
+	// sending headers should fail fast so the retry can reach another channel.
+	ResponseHeaderTimeoutSeconds int `json:"response_header_timeout_seconds,omitempty"`
 	// TLSInsecureSkipVerify accepts upstream certificates that fail
 	// verification, such as self-signed ones, for this channel only.
 	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
@@ -70,6 +75,9 @@ const (
 	HTTPProtocolAuto         = "auto"
 	HTTPProtocolHTTP1        = "http1"
 	MaxHTTP2ConnectionShards = 8
+	// MaxResponseHeaderTimeoutSeconds caps the per-channel upstream header wait
+	// at one hour, matching the largest useful value of the global setting.
+	MaxResponseHeaderTimeoutSeconds = 3600
 	// BalanceSourceCommandCode makes an OpenAI channel read its balance from
 	// Command Code instead of the OpenAI billing endpoints.
 	BalanceSourceCommandCode = "commandcode"
@@ -88,6 +96,9 @@ func (s *ChannelSettings) ValidateHTTPTransport() error {
 	}
 	if s.HTTP2ConnectionShards < 0 || s.HTTP2ConnectionShards > MaxHTTP2ConnectionShards {
 		return fmt.Errorf("invalid http2_connection_shards: %d", s.HTTP2ConnectionShards)
+	}
+	if s.ResponseHeaderTimeoutSeconds < 0 || s.ResponseHeaderTimeoutSeconds > MaxResponseHeaderTimeoutSeconds {
+		return fmt.Errorf("invalid response_header_timeout_seconds: %d", s.ResponseHeaderTimeoutSeconds)
 	}
 	if protocol == HTTPProtocolHTTP1 && s.HTTP2ConnectionShards > 1 {
 		return fmt.Errorf("http2_connection_shards must be 1 when http_protocol is http1")

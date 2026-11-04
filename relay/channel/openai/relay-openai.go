@@ -109,6 +109,10 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	defer service.CloseResponseBodyGracefully(resp)
 
+	// The keepalive commits the response headers before the scanner runs, so the
+	// upstream headers the scanner would copy must be in place first.
+	helper.CopyUpstreamStreamHeaders(c, resp)
+
 	model := info.UpstreamModelName
 	var responseId string
 	var createAt int64 = 0

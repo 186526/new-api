@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -115,6 +116,9 @@ func applyHTTP1Force(transport *http.Transport) {
 func applyHTTPTransportPolicy(transport *http.Transport, policy HTTPTransportPolicy) {
 	if transport == nil {
 		return
+	}
+	if policy.ResponseHeaderTimeoutSeconds > 0 {
+		transport.ResponseHeaderTimeout = time.Duration(policy.ResponseHeaderTimeoutSeconds) * time.Second
 	}
 	if policy.Protocol == dto.HTTPProtocolHTTP1 {
 		applyHTTP1Force(transport)

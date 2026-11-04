@@ -122,10 +122,21 @@ func (writer *streamKeepAliveWriter) keepAlive(ctx context.Context, interval tim
 	}()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// The first heartbeat is delayed by keepAliveCommitDelay instead of a full
+	// interval: an edge proxy times out on a silent connection from the request
+	// line, so the headers have to be committed early. The delay keeps an
+	// upstream that rejects the request immediately on the JSON error path,
+	// where the real status code still reaches the client.
+	firstPing := time.NewTimer(keepAliveCommitDelay)
+	defer firstPing.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-firstPing.C:
+			if ctx.Err() != nil || writer.ping() != nil {
+				return
+			}
 		case <-ticker.C:
 			if ctx.Err() != nil || writer.ping() != nil {
 				return

@@ -82,6 +82,7 @@ function isOptionalProxyURL(value: string | undefined): boolean {
 export const HTTP_PROTOCOL_AUTO = 'auto'
 export const HTTP_PROTOCOL_HTTP1 = 'http1'
 export const MAX_HTTP2_CONNECTION_SHARDS = 8
+export const MAX_RESPONSE_HEADER_TIMEOUT_SECONDS = 3600
 
 export function normalizeHttpProtocol(
   value: string | undefined | null
@@ -284,6 +285,7 @@ export const channelFormSchema = z
       .refine(isOptionalProxyURL, ERROR_MESSAGES.INVALID_PROXY),
     http_protocol: z.enum(['auto', 'http1']).optional(),
     http2_connection_shards: z.number().int().optional(),
+    response_header_timeout_seconds: z.number().int().optional(),
     tls_insecure_skip_verify: z.boolean().optional(),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
@@ -451,6 +453,19 @@ export const channelFormSchema = z
         ctx,
         'http2_connection_shards',
         ERROR_MESSAGES.INVALID_HTTP1_WITH_SHARDS
+      )
+    }
+    const headerTimeout = data.response_header_timeout_seconds
+    if (
+      headerTimeout !== undefined &&
+      (!Number.isInteger(headerTimeout) ||
+        headerTimeout < 0 ||
+        headerTimeout > MAX_RESPONSE_HEADER_TIMEOUT_SECONDS)
+    ) {
+      addRequiredIssue(
+        ctx,
+        'response_header_timeout_seconds',
+        ERROR_MESSAGES.INVALID_RESPONSE_HEADER_TIMEOUT
       )
     }
   })

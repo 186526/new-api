@@ -90,7 +90,12 @@ type RelayInfo struct {
 	TokenUnlimited    bool
 	StartTime         time.Time
 	FirstResponseTime time.Time
-	isFirstResponse   bool
+	// UpstreamHeaderTime is when the upstream response headers arrived. It stays
+	// zero when the request never got that far, which separates a client that
+	// timed out waiting for headers from one that timed out waiting for the
+	// first byte.
+	UpstreamHeaderTime time.Time
+	isFirstResponse    bool
 	//SendLastReasoningResponse bool
 	IsStream               bool
 	IsGeminiBatchEmbedding bool

@@ -108,6 +108,9 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	other.SetPublic("model_price", modelPrice)
 	other.SetPublic("user_group_ratio", userGroupRatio)
 	other.SetPublic("frt", float64(relayInfo.FirstResponseTime.UnixMilli()-relayInfo.StartTime.UnixMilli()))
+	if !relayInfo.UpstreamHeaderTime.IsZero() {
+		other.SetPublic("upstream_header_ms", float64(relayInfo.UpstreamHeaderTime.UnixMilli()-relayInfo.StartTime.UnixMilli()))
+	}
 	if relayInfo.ReasoningEffort != "" {
 		other.SetPublic("reasoning_effort", relayInfo.ReasoningEffort)
 	}

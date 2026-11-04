@@ -59,9 +59,11 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 			stop := StartStreamKeepAlive(c, test.interval)
 			defer stop()
 			if test.waitForPing {
+				// The first heartbeat is delayed so a fast upstream failure keeps
+				// its status code; wait past that window before streaming.
 				select {
 				case <-writer.headerStarted:
-				case <-time.After(time.Second):
+				case <-time.After(keepAliveCommitDelay + time.Second):
 					t.Fatal("keepalive did not start")
 				}
 			}
@@ -88,6 +90,8 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 			if test.waitForPing {
 				assert.True(t, strings.HasPrefix(writer.Body.String(), ": PING\n\n"))
 			} else {
+				// The stream finished inside the commit delay, so the headers were
+				// committed by the data and no heartbeat was written.
 				assert.Equal(t, "data: chunk\n\n", writer.Body.String())
 				assert.Equal(t, "true", writer.Result().Header.Get("X-Reasoning-Included"))
 				assert.Equal(t, "turn-state", writer.Result().Header.Get("X-Codex-Turn-State"))
