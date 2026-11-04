@@ -165,9 +165,15 @@ type RelayInfo struct {
 	IsChannelTest                         bool // channel test request
 	RetryIndex                            int
 	LastError                             *types.NewAPIError
-	RuntimeHeadersOverride                map[string]any
-	UseRuntimeHeadersOverride             bool
-	ParamOverrideAudit                    []string
+	// DeepSeekReasoningKey and DeepSeekReasoningHistory carry the conversation
+	// state the DeepSeek adapter read for this attempt, so the reply's reasoning
+	// can be stored for the next request of the same conversation.
+	DeepSeekReasoningKey      string
+	DeepSeekReasoningHistory  *DeepSeekReasoningState
+	upstreamReasoningContent  string
+	RuntimeHeadersOverride    map[string]any
+	UseRuntimeHeadersOverride bool
+	ParamOverrideAudit        []string
 
 	PriceData hosttypes.PriceData
 
@@ -1296,4 +1302,11 @@ func RemoveGeminiDisabledFields(jsonData []byte) ([]byte, error) {
 		return jsonData, nil
 	}
 	return jsonDataAfter, nil
+}
+
+// DeepSeekReasoningState is the reasoning history a DeepSeek attempt replayed
+// for its conversation. The adapter stores the reply's reasoning on top of it
+// so the next request of the same conversation can replay that turn too.
+type DeepSeekReasoningState struct {
+	Entries []string
 }

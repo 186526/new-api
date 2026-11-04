@@ -42,6 +42,8 @@ type RequestLabels struct {
 	Username    string
 	ChannelID   int
 	ChannelName string
+	// RequestBodyBytes is the size of the request body as the client sent it.
+	RequestBodyBytes int64
 }
 
 // RecordRelayResult samples one finished relay exactly once, at the request
@@ -74,6 +76,7 @@ func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr 
 			Ttft:         ttft,
 			HasTtft:      hasTtft,
 			OutputTokens: info.PerformanceOutputTokens,
+			RequestBodyBytes: labels.RequestBodyBytes,
 		})
 	}
 	if outcome == OutcomeIgnored {

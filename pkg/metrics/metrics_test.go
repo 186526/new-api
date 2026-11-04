@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -244,4 +245,45 @@ func TestObserveChannelBalanceUSDSkipsUnidentifiedChannel(t *testing.T) {
 	ObserveChannelBalanceUSD("", 0, 9)
 
 	assert.Equal(t, before, testutil.CollectAndCount(channelBalanceUSD))
+}
+
+func TestObserveRelayRecordsRequestBodySize(t *testing.T) {
+	ObserveRelay(RelayResult{
+		ChannelID:        31,
+		ChannelName:      "body-a",
+		Model:            "test-relay-body",
+		Stream:           true,
+		Outcome:          "success",
+		RequestBodyBytes: 300 << 10,
+	})
+	ObserveRelay(RelayResult{
+		ChannelID:        31,
+		ChannelName:      "body-a",
+		Model:            "test-relay-body",
+		Stream:           true,
+		Outcome:          "success",
+		RequestBodyBytes: 20 << 20,
+	})
+	ObserveRelay(RelayResult{
+		ChannelID:   31,
+		ChannelName: "body-a",
+		Model:       "test-relay-body",
+		Stream:      true,
+		Outcome:     "success",
+	})
+
+	counts := map[string]uint64{}
+	ch := make(chan prometheus.Metric, 64)
+	relayRequestBodyBytes.WithLabelValues("body-a", "true").(prometheus.Collector).Collect(ch)
+	close(ch)
+	for metric := range ch {
+		var dto dto.Metric
+		require.NoError(t, metric.Write(&dto))
+		for _, bucket := range dto.GetHistogram().GetBucket() {
+			counts[strconv.FormatFloat(bucket.GetUpperBound(), 'f', -1, 64)] = bucket.GetCumulativeCount()
+		}
+	}
+	assert.Equal(t, uint64(0), counts["65536"])
+	assert.Equal(t, uint64(1), counts["1048576"])
+	assert.Equal(t, uint64(2), counts["67108864"])
 }

@@ -108,6 +108,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	if claudeResponse.Type == "message_stop" {
 		info.StreamStatus.MarkCompleted()
 	}
+	if claudeInfo != nil && claudeResponse.Delta != nil && claudeResponse.Delta.Type == "thinking_delta" && claudeResponse.Delta.Thinking != nil {
+		claudeInfo.ReasoningContent.WriteString(*claudeResponse.Delta.Thinking)
+	}
 	if info.RelayFormat == types.RelayFormatClaude {
 		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
 
@@ -352,6 +355,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 
 	HandleStreamFinalResponse(c, info, claudeInfo)
+	info.SetUpstreamReasoningContent(claudeInfo.ReasoningContent.String())
 	return claudeInfo.Usage, nil
 }
 

@@ -148,9 +148,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		if relayFormat != types.RelayFormatOpenAIRealtime {
 			perfmetrics.RecordRelayResult(c.Request.Context(), relayInfo, resultErr, perfmetrics.RequestLabels{
-				Username:    c.GetString("username"),
-				ChannelID:   common.GetContextKeyInt(c, constant.ContextKeyChannelId),
-				ChannelName: common.GetContextKeyString(c, constant.ContextKeyChannelName),
+				Username:         c.GetString("username"),
+				ChannelID:        common.GetContextKeyInt(c, constant.ContextKeyChannelId),
+				ChannelName:      common.GetContextKeyString(c, constant.ContextKeyChannelName),
+				RequestBodyBytes: c.Request.ContentLength,
 			})
 		}
 		if recovered != nil {
@@ -194,6 +195,7 @@ relayAttempts:
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)
+		retryParam.AttemptedChannelIDs = append(retryParam.AttemptedChannelIDs, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
 			break
@@ -341,7 +343,15 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryGetChannelFailed, map[string]any{"Group": selectGroup, "Model": info.OriginModelName, "Error": err.Error()})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 	if channel == nil {
-		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryNoAvailableChannel, map[string]any{"Group": selectGroup, "Model": info.OriginModelName})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		messageID := i18n.MsgRelayRetryNoAvailableChannel
+		if len(retryParam.AttemptedChannelIDs) > 0 {
+			messageID = i18n.MsgRelayRetryAllChannelsFailed
+		}
+		message := i18n.T(c, messageID, map[string]any{"Group": selectGroup, "Model": info.OriginModelName})
+		if message == "" {
+			message = messageID
+		}
+		return nil, types.NewError(errors.New(message), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)

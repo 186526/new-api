@@ -252,9 +252,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr, perfmetrics.RequestLabels{
-			Username:    c.GetString("username"),
-			ChannelID:   common.GetContextKeyInt(c, appconstant.ContextKeyChannelId),
-			ChannelName: common.GetContextKeyString(c, appconstant.ContextKeyChannelName),
+			Username:         c.GetString("username"),
+			ChannelID:        common.GetContextKeyInt(c, appconstant.ContextKeyChannelId),
+			ChannelName:      common.GetContextKeyString(c, appconstant.ContextKeyChannelName),
+			RequestBodyBytes: int64(len(create.Body)),
 		})
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,

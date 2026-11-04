@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -42,12 +43,16 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 }
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	resetNextTry bool
+	Ctx         *gin.Context
+	TokenGroup  string
+	ModelName   string
+	RequestPath string
+	Retry       *int
+	// AttemptedChannelIDs lists the channels this request already tried. A
+	// retry skips them so it reaches the next candidate instead of repeating
+	// one that just failed.
+	AttemptedChannelIDs []int
+	resetNextTry        bool
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -64,6 +69,9 @@ func (p *RetryParam) SetRetry(retry int) {
 func (p *RetryParam) IncreaseRetry() {
 	if p.resetNextTry {
 		p.resetNextTry = false
+		// The next attempt starts a new group, so the channels tried in the
+		// previous one are eligible again.
+		p.AttemptedChannelIDs = nil
 		return
 	}
 	if p.Retry == nil {
@@ -117,6 +125,16 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
+	// The first attempt uses the channel the distributor already picked, so
+	// only a retry skips the channels this request tried.
+	if param.GetRetry() > 0 {
+		if attempted := param.AttemptedChannelIDs; len(attempted) > 0 {
+			filters = append(slices.Clone(filters), dto.ChannelFilter{
+				Kind:               dto.FilterExcludedChannels,
+				ExcludedChannelIDs: attempted,
+			})
+		}
+	}
 	affinityRetryOffset := param.Ctx.GetInt(ginKeyChannelAffinityRetryOffset)
 
 	if param.TokenGroup == "auto" {

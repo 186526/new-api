@@ -57,3 +57,22 @@ func (info *RelayInfo) ObserveResponseModel(model string) {
 	}
 	observation.ReturnedModel = model
 }
+
+// SetUpstreamReasoningContent keeps the reasoning the upstream streamed for
+// this reply, so an adapter can store it for the next request of the
+// conversation.
+func (info *RelayInfo) SetUpstreamReasoningContent(reasoning string) {
+	if info == nil {
+		return
+	}
+	info.upstreamReasoningContent = reasoning
+}
+
+// UpstreamReasoningContent returns the reasoning this reply streamed, or an
+// empty string when the upstream sent none.
+func (info *RelayInfo) UpstreamReasoningContent() string {
+	if info == nil {
+		return ""
+	}
+	return info.upstreamReasoningContent
+}

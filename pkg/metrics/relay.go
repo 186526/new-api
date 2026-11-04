@@ -57,6 +57,12 @@ var (
 		Name: "newapi_user_requests_total",
 		Help: "Finished relay requests by user and outcome.",
 	}, []string{"user", "outcome"})
+
+	relayRequestBodyBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "newapi_request_body_bytes",
+		Help:    "Uploaded request body size of one finished relay request, by the channel that served it.",
+		Buckets: []float64{64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20, 64 << 20},
+	}, []string{"channel", "stream"})
 )
 
 // RelayResult is one finished relay request, sampled once at the request
@@ -77,6 +83,10 @@ type RelayResult struct {
 	// zero when the upstream reported no usage, and such a request is left out
 	// of the token throughput.
 	OutputTokens int64
+	// RequestBodyBytes is the size of the request body as the client sent it.
+	// It is zero when the size is unknown, and such a request is left out of
+	// the body size distribution.
+	RequestBodyBytes int64
 }
 
 func ObserveRelay(result RelayResult) {
@@ -104,6 +114,9 @@ func ObserveRelay(result RelayResult) {
 	}
 	if result.UserID > 0 || result.Username != "" {
 		userRequestsTotal.WithLabelValues(labelName(result.Username, result.UserID), result.Outcome).Inc()
+	}
+	if result.RequestBodyBytes > 0 {
+		relayRequestBodyBytes.WithLabelValues(channel, stream).Observe(float64(result.RequestBodyBytes))
 	}
 }
 

@@ -1023,6 +1023,21 @@ func TestResponsesHTTPHealthCountsFinalResult(t *testing.T) {
 			}))
 			t.Cleanup(upstream.Close)
 			require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "responses-ws-upstream").Update("base_url", upstream.URL).Error)
+			// A retry now skips the channel that just failed, so the fixture
+			// needs a second channel to fail over to.
+			fallbackMapping := `{"ws-billing":"gpt-4o"}`
+			fallback := &model.Channel{
+				Name: "responses-ws-upstream-fallback", Type: constant.ChannelTypeOpenAI,
+				Key: "upstream-first", Status: common.ChannelStatusEnabled, Models: "ws-billing", Group: "default",
+				BaseURL: &upstream.URL, ModelMapping: &fallbackMapping,
+				Priority: common.GetPointer(int64(0)), Weight: common.GetPointer(uint(1)),
+			}
+			require.NoError(t, model.DB.Create(fallback).Error)
+			require.NoError(t, model.DB.Create(&model.Ability{ChannelId: fallback.Id, Model: "ws-billing", Group: "default", Enabled: true}).Error)
+			t.Cleanup(func() {
+				require.NoError(t, model.DB.Where("channel_id = ?", fallback.Id).Delete(&model.Ability{}).Error)
+				require.NoError(t, model.DB.Delete(fallback).Error)
+			})
 			request, err := http.NewRequest(http.MethodPost, fixture.gatewayURL+"/v1/responses", strings.NewReader(`{"model":"ws-billing","input":"hello"}`))
 			require.NoError(t, err)
 			request.Header.Set("Authorization", "Bearer sk-"+fixture.token.Key)

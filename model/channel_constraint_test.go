@@ -145,6 +145,21 @@ func TestFilterCandidateIDs(t *testing.T) {
 			wantKept:  []int{},
 			wantEmpty: dto.FilterRequestPath,
 		},
+		{
+			name:      "excluded channels drop attempted ids",
+			ids:       []int{900003, 900004},
+			modelName: "gpt-4",
+			filters:   []dto.ChannelFilter{{Kind: dto.FilterExcludedChannels, ExcludedChannelIDs: []int{900003}}},
+			wantKept:  []int{900004},
+		},
+		{
+			name:      "excluded channels attribute an empty set",
+			ids:       []int{900003},
+			modelName: "gpt-4",
+			filters:   []dto.ChannelFilter{{Kind: dto.FilterExcludedChannels, ExcludedChannelIDs: []int{900003}}},
+			wantKept:  []int{},
+			wantEmpty: dto.FilterExcludedChannels,
+		},
 	}
 
 	channelSyncLock.Lock()
@@ -215,4 +230,16 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	}})
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
+
+	excluded := []dto.ChannelFilter{{
+		Kind:               dto.FilterExcludedChannels,
+		ExcludedChannelIDs: []int{2},
+	}}
+	ok, kind = ChannelSatisfiesFilters(ordinary, "gpt-4", excluded)
+	assert.False(t, ok)
+	assert.Equal(t, dto.FilterExcludedChannels, kind)
+
+	ok, kind = ChannelSatisfiesFilters(alpha, "shared", excluded)
+	require.True(t, ok)
+	assert.Equal(t, dto.ChannelFilterKind(""), kind)
 }

@@ -2,6 +2,7 @@ package deepseek
 
 import (
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -267,4 +269,107 @@ func TestModelModifiersUpstreamFields(t *testing.T) {
 			}
 		})
 	}
+}
+
+// DeepSeek's thinking mode rejects assistant history that lost
+// reasoning_content. Chat history is filled with an empty value unless the
+// request explicitly turns thinking off.
+func TestMissingReasoningContentFilled(t *testing.T) {
+	kept := "kept"
+	history := func() []dto.Message {
+		return []dto.Message{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant"},
+			{Role: "tool", ToolCallId: "call_1", Content: "ok"},
+			{Role: "assistant", ReasoningContent: &kept},
+			{Role: "user", Content: "again"},
+		}
+	}
+	newInfo := func(model string) *relaycommon.RelayInfo {
+		return &relaycommon.RelayInfo{OriginModelName: model, ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: model}}
+	}
+
+	t.Run("default thinking fills missing values", func(t *testing.T) {
+		chat := &dto.GeneralOpenAIRequest{Model: "deepseek-flash", Messages: history()}
+		converted, err := (&Adaptor{}).ConvertOpenAIRequest(nil, newInfo("deepseek-flash"), chat)
+		require.NoError(t, err)
+		messages := converted.(*dto.GeneralOpenAIRequest).Messages
+		require.NotNil(t, messages[1].ReasoningContent)
+		assert.Equal(t, "", *messages[1].ReasoningContent)
+		assert.Equal(t, &kept, messages[3].ReasoningContent)
+		assert.Nil(t, messages[0].ReasoningContent)
+		assert.Nil(t, messages[2].ReasoningContent)
+	})
+
+	t.Run("thinking suffix off keeps history", func(t *testing.T) {
+		model := "deepseek-flash-none"
+		chat := &dto.GeneralOpenAIRequest{Model: model, Messages: history()}
+		converted, err := (&Adaptor{}).ConvertOpenAIRequest(nil, newInfo(model), chat)
+		require.NoError(t, err)
+		messages := converted.(*dto.GeneralOpenAIRequest).Messages
+		assert.Nil(t, messages[1].ReasoningContent)
+	})
+
+	t.Run("client thinking off keeps history", func(t *testing.T) {
+		chat := &dto.GeneralOpenAIRequest{
+			Model:    "deepseek-flash",
+			THINKING: []byte(`{"type":"disabled"}`),
+			Messages: history(),
+		}
+		converted, err := (&Adaptor{}).ConvertOpenAIRequest(nil, newInfo("deepseek-flash"), chat)
+		require.NoError(t, err)
+		messages := converted.(*dto.GeneralOpenAIRequest).Messages
+		assert.Nil(t, messages[1].ReasoningContent)
+	})
+}
+
+// A stored history restores the reasoning of the turns the client replayed and
+// leaves the turns it does not cover with the empty value.
+func TestReasoningHistoryReplay(t *testing.T) {
+	first, second := "first-reasoning", "second-reasoning"
+	stored := &reasoningHistory{Entries: []string{first, second}}
+	newMessages := func() []dto.Message {
+		return []dto.Message{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant"},
+			{Role: "tool", ToolCallId: "call_1", Content: "ok"},
+			{Role: "assistant"},
+			{Role: "user", Content: "again"},
+		}
+	}
+	messages := newMessages()
+	applyReasoningHistory(messages, stored)
+	require.NotNil(t, messages[1].ReasoningContent)
+	assert.Equal(t, first, *messages[1].ReasoningContent)
+	require.NotNil(t, messages[3].ReasoningContent)
+	assert.Equal(t, second, *messages[3].ReasoningContent)
+	assert.Nil(t, messages[0].ReasoningContent)
+	assert.Nil(t, messages[2].ReasoningContent)
+
+	short := &reasoningHistory{Entries: []string{first}}
+	messages = newMessages()
+	applyReasoningHistory(messages, short)
+	assert.Equal(t, first, *messages[1].ReasoningContent)
+	assert.Equal(t, "", *messages[3].ReasoningContent)
+}
+
+func TestConversationKeyFollowsPromptCacheKey(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	first := conversationKey(c, "deepseek-flash", "session-a")
+	assert.NotEmpty(t, first)
+	assert.Equal(t, first, conversationKey(c, "deepseek-flash", "session-a"))
+	assert.NotEqual(t, first, conversationKey(c, "deepseek-flash", "session-b"))
+	assert.NotEqual(t, first, conversationKey(c, "deepseek-v4-pro", "session-a"))
+	assert.Empty(t, conversationKey(c, "deepseek-flash", ""))
+}
+
+func TestStoreReasoningTurnSkipsWithoutConversation(t *testing.T) {
+	previous := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previous })
+
+	info := &relaycommon.RelayInfo{DeepSeekReasoningHistory: &relaycommon.DeepSeekReasoningState{Entries: []string{"first"}}}
+	storeReasoningTurn(nil, info, "second")
+	assert.Equal(t, []string{"first"}, info.DeepSeekReasoningHistory.Entries)
 }

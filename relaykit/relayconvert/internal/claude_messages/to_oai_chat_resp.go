@@ -23,6 +23,9 @@ type ClaudeResponseInfo struct {
 	ToolUseCount int
 	Usage        *dto.Usage
 	Done         bool
+	// ReasoningContent accumulates thinking deltas so a DeepSeek reply can be
+	// stored for replay in the next request of the conversation.
+	ReasoningContent strings.Builder
 
 	// Only snapshots synthesized from partial display usage may be refreshed by
 	// later display deltas. Serialized BillingUsage always remains authoritative.

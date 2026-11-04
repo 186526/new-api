@@ -1,6 +1,7 @@
 package deepseek
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -106,20 +107,23 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, request); err != nil {
+	if err := applyDeepSeekV4OpenAIThinkingSuffix(c, info, request); err != nil {
 		return nil, err
 	}
 
 	return request, nil
 }
 
-func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) error {
+func applyDeepSeekV4OpenAIThinkingSuffix(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) error {
 	modelName := request.Model
 	if info != nil && info.ChannelMeta != nil && info.UpstreamModelName != "" {
 		modelName = info.UpstreamModelName
 	}
 	baseModel, thinkingType, effort, ok := deepSeekThinking(info, modelName)
 	if !ok {
+		if !isThinkingDisabled(request.THINKING) {
+			replayReasoningHistory(c, info, request)
+		}
 		return nil
 	}
 	thinking, err := common.Marshal(map[string]string{
@@ -140,6 +144,9 @@ func applyDeepSeekV4OpenAIThinkingSuffix(info *relaycommon.RelayInfo, request *d
 			info.UpstreamModelName = baseModel
 		}
 		info.SetReasoningEffort(deepSeekRunEffort(thinkingType, effort))
+	}
+	if thinkingType != "disabled" {
+		replayReasoningHistory(c, info, request)
 	}
 	return nil
 }
@@ -286,7 +293,11 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return adaptor.DoResponse(c, resp, info)
 	default:
 		adaptor := openai.Adaptor{}
-		return adaptor.DoResponse(c, resp, info)
+		usage, err = adaptor.DoResponse(c, resp, info)
+		if err == nil && info.IsStream {
+			storeReasoningTurn(c, info, info.UpstreamReasoningContent())
+		}
+		return usage, err
 	}
 }
 
@@ -296,4 +307,42 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	return ChannelName
+}
+
+// replayReasoningHistory restores the reasoning of the assistant turns the
+// client replayed and marks the rest with an empty value, which DeepSeek
+// accepts in place of a missing reasoning_content.
+func replayReasoningHistory(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
+	if c == nil {
+		fillMissingReasoningContent(request.Messages)
+		return
+	}
+	key := conversationKey(c, request.Model, request.PromptCacheKey)
+	history := loadReasoningHistory(key)
+	applyReasoningHistory(request.Messages, history)
+	if info != nil {
+		info.DeepSeekReasoningKey = key
+		state := &relaycommon.DeepSeekReasoningState{}
+		if history != nil {
+			state.Entries = history.Entries
+		}
+		info.DeepSeekReasoningHistory = state
+	}
+}
+
+func fillMissingReasoningContent(messages []dto.Message) {
+	applyReasoningHistory(messages, nil)
+}
+
+func isThinkingDisabled(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var thinking struct {
+		Type string `json:"type"`
+	}
+	if err := common.Unmarshal(raw, &thinking); err != nil {
+		return false
+	}
+	return thinking.Type == "disabled"
 }
