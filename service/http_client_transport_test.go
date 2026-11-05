@@ -569,3 +569,32 @@ func TestNormalizeHTTPTransportPolicyClampsWithoutPanic(t *testing.T) {
 	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 1}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTP2ConnectionShards: -3}))
 	assert.Equal(t, HTTPTransportPolicy{Protocol: dto.HTTPProtocolAuto, Shards: 8}, NormalizeHTTPTransportPolicy(dto.ChannelSettings{HTTP2ConnectionShards: 99}))
 }
+
+func TestHTTPTransportPolicyRetryBudget(t *testing.T) {
+	settings := dto.ChannelSettings{ResponseHeaderTimeoutSeconds: 45, ResponseHeaderTimeoutRetrySeconds: 30}
+	policy := NormalizeHTTPTransportPolicy(settings)
+	assert.Equal(t, 45, policy.WithHeaderAttempt(0).ResponseHeaderTimeoutSeconds)
+	assert.Equal(t, 30, policy.WithHeaderAttempt(1).ResponseHeaderTimeoutSeconds)
+	assert.Equal(t, 30, policy.WithHeaderAttempt(2).ResponseHeaderTimeoutSeconds)
+
+	// Without a retry budget a later attempt keeps the first attempt's wait.
+	inherited := NormalizeHTTPTransportPolicy(dto.ChannelSettings{ResponseHeaderTimeoutSeconds: 45})
+	assert.Equal(t, 45, inherited.WithHeaderAttempt(1).ResponseHeaderTimeoutSeconds)
+
+	clamped := NormalizeHTTPTransportPolicy(dto.ChannelSettings{ResponseHeaderTimeoutRetrySeconds: dto.MaxResponseHeaderTimeoutSeconds + 1})
+	assert.Equal(t, dto.MaxResponseHeaderTimeoutSeconds, clamped.ResponseHeaderTimeoutRetrySeconds)
+	invalid := dto.ChannelSettings{ResponseHeaderTimeoutRetrySeconds: -1}
+	assert.Error(t, invalid.ValidateHTTPTransport())
+}
+
+func TestHTTP2TransportProbesIdleConnections(t *testing.T) {
+	transport := newRelayHTTPTransport()
+	applyHTTPTransportPolicy(transport, defaultHTTPTransportPolicy())
+	require.NotNil(t, transport.HTTP2)
+	assert.Equal(t, http2SendPingTimeout, transport.HTTP2.SendPingTimeout)
+	assert.Equal(t, http2PingTimeout, transport.HTTP2.PingTimeout)
+
+	http1 := newRelayHTTPTransport()
+	applyHTTPTransportPolicy(http1, HTTPTransportPolicy{Protocol: dto.HTTPProtocolHTTP1, Shards: 1})
+	assert.Zero(t, http1.HTTP2.SendPingTimeout, "an HTTP/1-only transport must not enable the HTTP/2 probe")
+}

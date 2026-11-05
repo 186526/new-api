@@ -390,7 +390,14 @@ func GetHttpClientWithProxy(rawProxyURL string) (*http.Client, error) {
 // channel transport settings. Default auto + 1 shard shares the same client pool as
 // GetHttpClientWithProxy / GetHttpClient for the empty-proxy case.
 func GetHttpClientWithProxySettings(rawProxyURL string, settings dto.ChannelSettings) (*http.Client, error) {
-	policy := NormalizeHTTPTransportPolicy(settings)
+	return GetHttpClientWithProxySettingsAttempt(rawProxyURL, settings, 0)
+}
+
+// GetHttpClientWithProxySettingsAttempt returns the cached client of one relay
+// attempt. A retry attempt narrows the upstream header wait to the retry budget
+// so the total silence stays inside the edge proxy's timeout.
+func GetHttpClientWithProxySettingsAttempt(rawProxyURL string, settings dto.ChannelSettings, retryIndex int) (*http.Client, error) {
+	policy := NormalizeHTTPTransportPolicy(settings).WithHeaderAttempt(retryIndex)
 	trimmedProxyURL := strings.TrimSpace(rawProxyURL)
 
 	if trimmedProxyURL == "" {

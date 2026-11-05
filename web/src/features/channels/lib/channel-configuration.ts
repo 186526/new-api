@@ -86,6 +86,7 @@ const CONFIGURATION_BLOCKS = {
       'http_protocol',
       'http2_connection_shards',
       'response_header_timeout_seconds',
+      'response_header_timeout_retry_seconds',
       'tls_insecure_skip_verify',
       'disable_task_polling_sleep',
     ],
@@ -180,6 +181,7 @@ export function getChannelConfigurationState(
       (values.http_protocol && values.http_protocol !== 'auto') ||
       (values.http2_connection_shards ?? 1) > 1 ||
       Boolean(values.response_header_timeout_seconds) ||
+      Boolean(values.response_header_timeout_retry_seconds) ||
       values.tls_insecure_skip_verify ||
       values.disable_task_polling_sleep
     ),

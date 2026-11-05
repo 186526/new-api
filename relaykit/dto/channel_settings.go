@@ -37,6 +37,10 @@ type ChannelSettings struct {
 	// far longer than an edge proxy's own timeout; a channel that stalls before
 	// sending headers should fail fast so the retry can reach another channel.
 	ResponseHeaderTimeoutSeconds int `json:"response_header_timeout_seconds,omitempty"`
+	// ResponseHeaderTimeoutRetrySeconds overrides the header wait of a second and
+	// later attempt. Zero keeps the global RELAY_RESPONSE_HEADER_TIMEOUT_RETRY,
+	// which falls back to the first attempt's budget when unset.
+	ResponseHeaderTimeoutRetrySeconds int `json:"response_header_timeout_retry_seconds,omitempty"`
 	// TLSInsecureSkipVerify accepts upstream certificates that fail
 	// verification, such as self-signed ones, for this channel only.
 	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
@@ -99,6 +103,9 @@ func (s *ChannelSettings) ValidateHTTPTransport() error {
 	}
 	if s.ResponseHeaderTimeoutSeconds < 0 || s.ResponseHeaderTimeoutSeconds > MaxResponseHeaderTimeoutSeconds {
 		return fmt.Errorf("invalid response_header_timeout_seconds: %d", s.ResponseHeaderTimeoutSeconds)
+	}
+	if s.ResponseHeaderTimeoutRetrySeconds < 0 || s.ResponseHeaderTimeoutRetrySeconds > MaxResponseHeaderTimeoutSeconds {
+		return fmt.Errorf("invalid response_header_timeout_retry_seconds: %d", s.ResponseHeaderTimeoutRetrySeconds)
 	}
 	if protocol == HTTPProtocolHTTP1 && s.HTTP2ConnectionShards > 1 {
 		return fmt.Errorf("http2_connection_shards must be 1 when http_protocol is http1")

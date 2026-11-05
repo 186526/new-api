@@ -13,6 +13,15 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
 
+const (
+	// http2SendPingTimeout is how long an idle HTTP/2 connection may stay silent
+	// before the client sends a PING.
+	http2SendPingTimeout = 15 * time.Second
+	// http2PingTimeout is how long the client waits for the PING ACK before it
+	// closes the connection.
+	http2PingTimeout = 5 * time.Second
+)
+
 // shardedRoundTripper fans requests for each origin across N independent
 // transports so each origin can keep N reusable HTTP/2 connections.
 type shardedRoundTripper struct {
@@ -126,4 +135,19 @@ func applyHTTPTransportPolicy(transport *http.Transport, policy HTTPTransportPol
 	}
 	transport.ForceAttemptHTTP2 = true
 	transport.DisableKeepAlives = false
+	applyHTTP2HealthCheck(transport)
+}
+
+// applyHTTP2HealthCheck makes the HTTP/2 client probe an idle connection.
+// Without it a connection the upstream or a middlebox dropped without a FIN
+// stays in the pool, and every request multiplexed onto it waits for the full
+// header timeout instead of failing over to a new connection.
+func applyHTTP2HealthCheck(transport *http.Transport) {
+	// net/http builds its own HTTP/2 transport from Transport.HTTP2 when that
+	// field is set, so the probe settings have to live there.
+	if transport.HTTP2 == nil {
+		transport.HTTP2 = &http.HTTP2Config{}
+	}
+	transport.HTTP2.SendPingTimeout = http2SendPingTimeout
+	transport.HTTP2.PingTimeout = http2PingTimeout
 }

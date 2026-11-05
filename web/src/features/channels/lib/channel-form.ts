@@ -286,6 +286,7 @@ export const channelFormSchema = z
     http_protocol: z.enum(['auto', 'http1']).optional(),
     http2_connection_shards: z.number().int().optional(),
     response_header_timeout_seconds: z.number().int().optional(),
+    response_header_timeout_retry_seconds: z.number().int().optional(),
     tls_insecure_skip_verify: z.boolean().optional(),
     pass_through_body_enabled: z.boolean().optional(),
     responses_websocket_enabled: z.boolean().optional(),
@@ -465,6 +466,19 @@ export const channelFormSchema = z
       addRequiredIssue(
         ctx,
         'response_header_timeout_seconds',
+        ERROR_MESSAGES.INVALID_RESPONSE_HEADER_TIMEOUT
+      )
+    }
+    const retryHeaderTimeout = data.response_header_timeout_retry_seconds
+    if (
+      retryHeaderTimeout !== undefined &&
+      (!Number.isInteger(retryHeaderTimeout) ||
+        retryHeaderTimeout < 0 ||
+        retryHeaderTimeout > MAX_RESPONSE_HEADER_TIMEOUT_SECONDS)
+    ) {
+      addRequiredIssue(
+        ctx,
+        'response_header_timeout_retry_seconds',
         ERROR_MESSAGES.INVALID_RESPONSE_HEADER_TIMEOUT
       )
     }

@@ -19,6 +19,9 @@ type HTTPTransportPolicy struct {
 	TLSInsecureSkipVerify bool
 	// ResponseHeaderTimeoutSeconds overrides the global header wait when set.
 	ResponseHeaderTimeoutSeconds int
+	// ResponseHeaderTimeoutRetrySeconds overrides the header wait of a second
+	// and later attempt when set; 0 falls back to the global retry budget.
+	ResponseHeaderTimeoutRetrySeconds int
 }
 
 var httpTransportPolicyWarnings sync.Map
@@ -36,6 +39,7 @@ func NormalizeHTTPTransportPolicy(settings dto.ChannelSettings) HTTPTransportPol
 	policy := defaultHTTPTransportPolicy()
 	policy.TLSInsecureSkipVerify = settings.TLSInsecureSkipVerify
 	policy.ResponseHeaderTimeoutSeconds = settings.ResponseHeaderTimeoutSeconds
+	policy.ResponseHeaderTimeoutRetrySeconds = settings.ResponseHeaderTimeoutRetrySeconds
 
 	protocol := strings.ToLower(strings.TrimSpace(settings.HTTPProtocol))
 	switch protocol {
@@ -82,7 +86,27 @@ func NormalizeHTTPTransportPolicy(settings dto.ChannelSettings) HTTPTransportPol
 		warnHTTPTransportPolicyOnce("response_header_timeout_seconds", fmt.Sprintf("%d", policy.ResponseHeaderTimeoutSeconds))
 		policy.ResponseHeaderTimeoutSeconds = dto.MaxResponseHeaderTimeoutSeconds
 	}
+	if policy.ResponseHeaderTimeoutRetrySeconds < 0 {
+		warnHTTPTransportPolicyOnce("response_header_timeout_retry_seconds", fmt.Sprintf("%d", policy.ResponseHeaderTimeoutRetrySeconds))
+		policy.ResponseHeaderTimeoutRetrySeconds = 0
+	}
+	if policy.ResponseHeaderTimeoutRetrySeconds > dto.MaxResponseHeaderTimeoutSeconds {
+		warnHTTPTransportPolicyOnce("response_header_timeout_retry_seconds", fmt.Sprintf("%d", policy.ResponseHeaderTimeoutRetrySeconds))
+		policy.ResponseHeaderTimeoutRetrySeconds = dto.MaxResponseHeaderTimeoutSeconds
+	}
 	return policy
+}
+
+// WithHeaderAttempt returns the policy of one relay attempt: the first attempt
+// keeps the configured header wait, later attempts use the retry budget.
+func (p HTTPTransportPolicy) WithHeaderAttempt(retryIndex int) HTTPTransportPolicy {
+	if retryIndex <= 0 {
+		return p
+	}
+	if p.ResponseHeaderTimeoutRetrySeconds > 0 {
+		p.ResponseHeaderTimeoutSeconds = p.ResponseHeaderTimeoutRetrySeconds
+	}
+	return p
 }
 
 func warnHTTPTransportPolicyOnce(field, value string) {

@@ -43,6 +43,7 @@ const ADVANCED_SETTINGS_FIELDS = new Set<FieldPath<ChannelFormValues>>([
   'http_protocol',
   'http2_connection_shards',
   'response_header_timeout_seconds',
+  'response_header_timeout_retry_seconds',
   'tls_insecure_skip_verify',
   'system_prompt',
   'system_prompt_override',

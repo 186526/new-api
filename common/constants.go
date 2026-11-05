@@ -209,6 +209,13 @@ var RelayIdleConnTimeout int // unit is second
 // ResponseHeaderTimeout only bounds the wait for the response headers; once the
 // headers arrive, streaming is unaffected.
 var RelayResponseHeaderTimeout int // unit is second
+
+// RelayResponseHeaderTimeoutRetry is the header wait of a second and later
+// attempt. The client has already waited RelayResponseHeaderTimeout by then, so
+// the retry gets a shorter budget that still covers the p99 of a successful
+// attempt. 0 reuses RelayResponseHeaderTimeout.
+var RelayResponseHeaderTimeoutRetry int // unit is second
+
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 

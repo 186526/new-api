@@ -48,6 +48,20 @@ func ApplyUpstreamBodyMetadata(req *http.Request, body io.Reader) {
 	}
 }
 
+// StartRelayStreamKeepAlive commits the stream response headers and keeps the
+// connection alive until the relay writes its first byte. Callers invoke it
+// only after the upstream accepted the request, so an attempt that fails
+// before that point still reaches the client as its real status code.
+func StartRelayStreamKeepAlive(c *gin.Context, info *common.RelayInfo) {
+	helper.SetEventStreamHeaders(c)
+	generalSettings := operation_setting.GetGeneralSetting()
+	if !generalSettings.PingIntervalEnabled || info.DisablePing {
+		return
+	}
+	pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
+	helper.StartStreamKeepAlive(c, pingInterval)
+}
+
 func SetupApiRequestHeader(info *common.RelayInfo, c *gin.Context, req *http.Header) {
 	if info.RelayMode == constant.RelayModeAudioTranscription || info.RelayMode == constant.RelayModeAudioTranslation {
 		// multipart/form-data
@@ -455,7 +469,7 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
-	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
+	client, err := service.GetHttpClientWithProxySettingsAttempt(info.ChannelSetting.Proxy, info.ChannelSetting, info.RetryIndex)
 	if err != nil {
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
@@ -474,17 +488,6 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			policy.String())
 	}
 
-	if info.IsStream {
-		helper.SetEventStreamHeaders(c)
-		// 处理流式请求的 ping 保活
-		generalSettings := operation_setting.GetGeneralSetting()
-		if generalSettings.PingIntervalEnabled && !info.DisablePing {
-			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-			stopPinger := helper.StartStreamKeepAlive(c, pingInterval)
-			defer stopPinger()
-		}
-	}
-
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
 	resp, err := relayClient.Do(req)
 	if err != nil {
@@ -495,6 +498,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, errors.New("resp is nil")
 	}
 	info.UpstreamHeaderTime = time.Now()
+	// The response headers are still uncommitted here, so a rejected attempt
+	// reaches the client as its real status code. Only an accepted stream
+	// starts the keepalive, and it is started before the first byte of the body
+	// is read, so a slow prefill cannot leave the connection silent.
+	if info.IsStream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		StartRelayStreamKeepAlive(c, info)
+	}
 	if common2.DebugEnabled {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
 		logger.LogDebug(c, "http transport negotiated: host=%s protocol=%s shards=%d policy=%s negotiated=%s",

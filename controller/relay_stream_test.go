@@ -28,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRelayKeepAliveDuringImagePreparation(t *testing.T) {
+func TestRelayKeepsStatusForImagePreparationFailure(t *testing.T) {
 	settings := operation_setting.GetGeneralSetting()
 	previousEnabled, previousInterval := settings.PingIntervalEnabled, settings.PingIntervalSeconds
 	previousCount, previousMedia := constant.CountToken, constant.GetMediaToken
@@ -45,12 +45,7 @@ func TestRelayKeepAliveDuringImagePreparation(t *testing.T) {
 	})
 	service.InitHttpClient()
 
-	imageRequested := make(chan struct{})
-	releaseImage := make(chan struct{})
-	var releaseOnce sync.Once
 	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(imageRequested)
-		<-releaseImage
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer imageServer.Close()
@@ -61,35 +56,19 @@ func TestRelayKeepAliveDuringImagePreparation(t *testing.T) {
 	})
 	gateway := httptest.NewServer(engine)
 	defer gateway.Close()
-	defer releaseOnce.Do(func() { close(releaseImage) })
 
 	body := `{"model":"claude-sonnet-4-20250514","max_tokens":16,"stream":true,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"` + imageServer.URL + `"}}]}]}`
 	client := &http.Client{Timeout: 4 * time.Second}
 	response, err := client.Post(gateway.URL+"/v1/messages", "application/json", strings.NewReader(body))
-	require.NoError(t, err, "the gateway must send keepalive while its image download is blocked")
-	defer response.Body.Close()
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	require.Equal(t, "text/event-stream", response.Header.Get("Content-Type"))
-	reader := bufio.NewReader(response.Body)
-	for range 2 {
-		line, readErr := reader.ReadString('\n')
-		require.NoError(t, readErr)
-		require.Equal(t, ": PING\n", line)
-		line, readErr = reader.ReadString('\n')
-		require.NoError(t, readErr)
-		require.Equal(t, "\n", line)
-	}
-	select {
-	case <-imageRequested:
-	default:
-		t.Fatal("the request never reached image preparation")
-	}
-	releaseOnce.Do(func() { close(releaseImage) })
-	remaining, err := io.ReadAll(reader)
 	require.NoError(t, err)
-	require.Contains(t, string(remaining), "event: error\n")
-	require.Contains(t, string(remaining), `"type":"error"`)
-	require.Contains(t, string(remaining), "data: ")
+	defer response.Body.Close()
+	// The image download fails before any upstream accepted the request, so the
+	// headers stay uncommitted and the client sees the real status.
+	require.NotEqual(t, http.StatusOK, response.StatusCode)
+	require.Contains(t, response.Header.Get("Content-Type"), "application/json")
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(payload), `"type":"error"`)
 }
 
 func TestRelayKeepAliveAcrossUpstreamRetries(t *testing.T) {
@@ -118,8 +97,6 @@ func TestRelayKeepAliveAcrossUpstreamRetries(t *testing.T) {
 	defer upstream.Close()
 	engine := gin.New()
 	engine.POST("/v1/messages", func(c *gin.Context) {
-		stop := helper.StartStreamKeepAlive(c, 10*time.Millisecond)
-		defer stop()
 		if !assert.NoError(t, http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(5*time.Second))) {
 			return
 		}
@@ -144,25 +121,31 @@ func TestRelayKeepAliveAcrossUpstreamRetries(t *testing.T) {
 	gateway := httptest.NewServer(engine)
 	defer gateway.Close()
 	defer releaseOnce.Do(func() { close(release) })
-	client := &http.Client{Timeout: 4 * time.Second}
-	response, err := client.Post(gateway.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
-	require.NoError(t, err)
-	defer response.Body.Close()
+	// The headers stay uncommitted until the upstream accepts the request, so
+	// the client receives no response at all before the second attempt starts.
+	responseCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		response, err := (&http.Client{Timeout: 4 * time.Second}).Post(gateway.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		responseCh <- response
+	}()
 	select {
 	case <-retryStarted:
+	case err := <-errCh:
+		t.Fatalf("the gateway responded before the retry: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("the upstream retry did not start")
 	}
-	reader := bufio.NewReader(response.Body)
-	for range 2 {
-		line, readErr := reader.ReadString('\n')
-		require.NoError(t, readErr)
-		require.Equal(t, ": PING\n", line)
-		line, readErr = reader.ReadString('\n')
-		require.NoError(t, readErr)
-		require.Equal(t, "\n", line)
-	}
 	releaseOnce.Do(func() { close(release) })
+	response := <-responseCh
+	defer response.Body.Close()
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, "text/event-stream", response.Header.Get("Content-Type"))
+	reader := bufio.NewReader(response.Body)
 	body, err := io.ReadAll(reader)
 	require.NoError(t, err)
 	require.Contains(t, string(body), "data: ok\n\n")
@@ -202,8 +185,6 @@ func TestStreamKeepAlivePreservesFastHTTPFailures(t *testing.T) {
 			defer upstream.Close()
 			engine := gin.New()
 			engine.POST("/v1/messages", func(c *gin.Context) {
-				stop := helper.StartStreamKeepAlive(c, time.Minute)
-				defer stop()
 				request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstream.URL, strings.NewReader("{}"))
 				if !assert.NoError(t, err) {
 					return
@@ -322,4 +303,21 @@ func TestStreamKeepAliveCancellation(t *testing.T) {
 	_, err := c.Writer.WriteString("data: done\n\n")
 	require.NoError(t, err)
 	require.True(t, strings.HasSuffix(recorder.Body.String(), "data: done\n\n"))
+}
+
+func TestStreamKeepAliveKeepsStatusBeforeFirstPing(t *testing.T) {
+	settings := operation_setting.GetGeneralSetting()
+	previousEnabled := settings.PingIntervalEnabled
+	settings.PingIntervalEnabled = false
+	t.Cleanup(func() { settings.PingIntervalEnabled = previousEnabled })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	stop := helper.StartStreamKeepAlive(c, time.Hour)
+	defer stop()
+	require.True(t, strings.HasPrefix(recorder.Body.String(), ": PING\n\n"), "the keepalive commits the headers immediately")
+	// A status written after the heartbeat cannot replace the committed 200.
+	c.Status(http.StatusTooManyRequests)
+	require.Equal(t, http.StatusOK, recorder.Code)
 }

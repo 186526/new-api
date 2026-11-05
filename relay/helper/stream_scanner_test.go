@@ -42,12 +42,11 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 	})
 
 	for _, test := range []struct {
-		name        string
-		interval    time.Duration
-		waitForPing bool
+		name     string
+		interval time.Duration
 	}{
 		{name: "before first keepalive", interval: time.Hour},
-		{name: "during header commit", interval: time.Millisecond, waitForPing: true},
+		{name: "during header commit", interval: time.Millisecond},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			writer := &headerCommitWriter{
@@ -58,14 +57,12 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 			stop := StartStreamKeepAlive(c, test.interval)
 			defer stop()
-			if test.waitForPing {
-				// The first heartbeat is delayed so a fast upstream failure keeps
-				// its status code; wait past that window before streaming.
-				select {
-				case <-writer.headerStarted:
-				case <-time.After(keepAliveCommitDelay + time.Second):
-					t.Fatal("keepalive did not start")
-				}
+			// The keepalive commits the headers as soon as it starts, because the
+			// caller only starts it after the upstream accepted the request.
+			select {
+			case <-writer.headerStarted:
+			case <-time.After(time.Second):
+				t.Fatal("keepalive did not commit the headers")
 			}
 
 			resp := &http.Response{
@@ -87,15 +84,7 @@ func TestStreamScannerHandler_RequestKeepAliveHandoff(t *testing.T) {
 			assert.True(t, info.StreamStatus.IsNormalEnd())
 			assert.Equal(t, []string{"chunk"}, received)
 			assert.True(t, strings.HasSuffix(writer.Body.String(), "data: chunk\n\n"))
-			if test.waitForPing {
-				assert.True(t, strings.HasPrefix(writer.Body.String(), ": PING\n\n"))
-			} else {
-				// The stream finished inside the commit delay, so the headers were
-				// committed by the data and no heartbeat was written.
-				assert.Equal(t, "data: chunk\n\n", writer.Body.String())
-				assert.Equal(t, "true", writer.Result().Header.Get("X-Reasoning-Included"))
-				assert.Equal(t, "turn-state", writer.Result().Header.Get("X-Codex-Turn-State"))
-			}
+			assert.True(t, strings.HasPrefix(writer.Body.String(), ": PING\n\n"))
 		})
 	}
 }

@@ -20,7 +20,10 @@ import (
 // streamKeepAliveWriter 在业务写入前保活，写入开始时等待心跳退出。
 type streamKeepAliveWriter struct {
 	gin.ResponseWriter
-	mutex       sync.Mutex
+	mutex sync.Mutex
+	// pinged records whether a heartbeat already committed the response, so a
+	// later WriteHeader can still choose the status code.
+	pinged      bool
 	cancel      context.CancelFunc
 	done        chan struct{}
 	pingContext *gin.Context
@@ -47,7 +50,18 @@ func (writer *streamKeepAliveWriter) WriteString(data string) (int, error) {
 
 func (writer *streamKeepAliveWriter) WriteHeader(status int) {
 	writer.stop()
-	writer.ResponseWriter.WriteHeader(status)
+	writer.mutex.Lock()
+	pinged := writer.pinged
+	writer.mutex.Unlock()
+	if !pinged {
+		// No heartbeat yet, so the headers are uncommitted and the caller's
+		// status is still the one the client sees.
+		writer.ResponseWriter.WriteHeader(status)
+		return
+	}
+	// A heartbeat already sent 200; the status can no longer change, and the
+	// caller's body (an error payload) follows the heartbeat.
+	writer.ResponseWriter.WriteHeaderNow()
 }
 
 func (writer *streamKeepAliveWriter) WriteHeaderNow() {
@@ -81,10 +95,18 @@ func (writer *streamKeepAliveWriter) Written() bool {
 func (writer *streamKeepAliveWriter) ping() error {
 	writer.mutex.Lock()
 	defer writer.mutex.Unlock()
-	return PingData(writer.pingContext)
+	if err := PingData(writer.pingContext); err != nil {
+		return err
+	}
+	writer.pinged = true
+	return nil
 }
 
-// StartStreamKeepAlive 按 interval 发送心跳，覆盖请求准备和重试；业务写入开始后交给流处理器。
+// StartStreamKeepAlive commits the stream response headers and keeps the
+// connection alive until the relay writes its first byte. Callers invoke it
+// only after the upstream accepted the request: before that point the headers
+// stay uncommitted so a failed attempt reaches the client as its real status
+// code.
 // 内层请求复用外层的保活，内层清理不会提前结束它。
 func StartStreamKeepAlive(c *gin.Context, interval time.Duration) func() {
 	if previous, ok := c.Writer.(*streamKeepAliveWriter); ok {
@@ -108,6 +130,17 @@ func StartStreamKeepAlive(c *gin.Context, interval time.Duration) func() {
 	pingContext.Writer = c.Writer
 	writer := &streamKeepAliveWriter{ResponseWriter: c.Writer, cancel: cancel, done: make(chan struct{}), pingContext: pingContext}
 	c.Writer = writer
+	// The first heartbeat goes out immediately: the caller knows the upstream
+	// accepted the request, so committing the headers now tells the client the
+	// status while the upstream prepares its first token.
+	if err := writer.ping(); err != nil {
+		writer.mutex.Lock()
+		writer.pinged = false
+		writer.mutex.Unlock()
+		cancel()
+		c.Writer = writer.ResponseWriter
+		return func() {}
+	}
 	go writer.keepAlive(ctx, interval)
 	return writer.stop
 }
@@ -122,21 +155,10 @@ func (writer *streamKeepAliveWriter) keepAlive(ctx context.Context, interval tim
 	}()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	// The first heartbeat is delayed by keepAliveCommitDelay instead of a full
-	// interval: an edge proxy times out on a silent connection from the request
-	// line, so the headers have to be committed early. The delay keeps an
-	// upstream that rejects the request immediately on the JSON error path,
-	// where the real status code still reaches the client.
-	firstPing := time.NewTimer(keepAliveCommitDelay)
-	defer firstPing.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-firstPing.C:
-			if ctx.Err() != nil || writer.ping() != nil {
-				return
-			}
 		case <-ticker.C:
 			if ctx.Err() != nil || writer.ping() != nil {
 				return

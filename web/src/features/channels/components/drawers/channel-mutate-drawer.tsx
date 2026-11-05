@@ -306,6 +306,7 @@ const SENSITIVE_FORM_FIELDS = [
   'http_protocol',
   'http2_connection_shards',
   'response_header_timeout_seconds',
+  'response_header_timeout_retry_seconds',
   'tls_insecure_skip_verify',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
@@ -2195,6 +2196,38 @@ export function ChannelMutateDrawer({
           <FormDescription>
             {t(
               'Seconds to wait for upstream response headers before failing the request so it can retry on another channel. Leave empty to use the global timeout.'
+            )}
+          </FormDescription>
+          <FormMessage />
+        </FormItem>
+      )}
+    />
+  )
+
+  const responseHeaderTimeoutRetryFields = (
+    <FormField
+      control={form.control}
+      name='response_header_timeout_retry_seconds'
+      render={({ field }) => (
+        <FormItem>
+          <FormLabel>{t('Retry Header Timeout')}</FormLabel>
+          <FormControl>
+            <Input
+              type='number'
+              min={0}
+              max={3600}
+              placeholder={t('Use the first attempt timeout')}
+              disabled={sensitiveLocked}
+              value={field.value ?? ''}
+              onChange={(event) => {
+                const raw = event.target.value
+                field.onChange(raw === '' ? undefined : Number(raw))
+              }}
+            />
+          </FormControl>
+          <FormDescription>
+            {t(
+              'Seconds to wait for upstream response headers on a retry. Leave empty to reuse the first attempt timeout.'
             )}
           </FormDescription>
           <FormMessage />
@@ -4842,6 +4875,7 @@ export function ChannelMutateDrawer({
                 {httpProtocolFields}
                 {httpShardsFields}
                 {responseHeaderTimeoutFields}
+                {responseHeaderTimeoutRetryFields}
                 {tlsInsecureSkipVerifyFields}
               </fieldset>
             </div>
