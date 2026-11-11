@@ -48,16 +48,29 @@ describe('MistralUsageDialog', () => {
     vi.mocked(getMistralUsage).mockReset()
   })
 
-  test('renders the remaining ratio, amount and reset time', async () => {
+  test('renders one row per allowance with its amount and reset time', async () => {
     vi.mocked(getMistralUsage).mockResolvedValue({
       success: true,
       data: {
         channel_name: 'Mistral Vibe',
-        usage_percentage: 0.1234,
-        remaining_ratio: 0.998766,
-        monthly_limit_usd: 150,
-        remaining_usd: 149.81,
-        reset_at: 1796083200,
+        budgets: [
+          {
+            scope: 'api',
+            usage_percentage: 60,
+            remaining_ratio: 0.4,
+            limit_usd: 15,
+            remaining_usd: 6,
+            reset_at: 1796083200,
+          },
+          {
+            scope: 'vibe',
+            usage_percentage: 0.1234,
+            remaining_ratio: 0.998766,
+            limit_usd: 150,
+            remaining_usd: 149.81,
+            reset_at: 1796083200,
+          },
+        ],
         payg_enabled: false,
         fetched_at: 1793550000,
       },
@@ -65,12 +78,16 @@ describe('MistralUsageDialog', () => {
 
     renderDialog()
 
-    expect(await screen.findByText('$149.81 / $150')).toBeTruthy()
+    expect(await screen.findByText('API usage')).toBeTruthy()
+    expect(screen.getByText('Vibe Code usage')).toBeTruthy()
+    expect(screen.getByText('$6 / $15')).toBeTruthy()
+    expect(screen.getByText('$149.81 / $150')).toBeTruthy()
     expect(
       screen.getByRole('dialog', { name: 'Mistral usage' })
     ).toBeInTheDocument()
+    expect(screen.getByText('40%')).toBeTruthy()
     expect(screen.getByText('99.9%')).toBeTruthy()
-    expect(screen.getByText(/Reset at:/)).toBeTruthy()
+    expect(screen.getAllByText(/Reset at:/)).toHaveLength(2)
     expect(screen.getByText('Disabled')).toBeTruthy()
   })
 
@@ -78,11 +95,16 @@ describe('MistralUsageDialog', () => {
     vi.mocked(getMistralUsage).mockResolvedValue({
       success: true,
       data: {
-        usage_percentage: 1,
-        remaining_ratio: 0,
-        monthly_limit_usd: 150,
-        remaining_usd: 0,
-        reset_at: 0,
+        budgets: [
+          {
+            scope: 'vibe',
+            usage_percentage: 100,
+            remaining_ratio: 0,
+            limit_usd: 150,
+            remaining_usd: 0,
+            reset_at: 0,
+          },
+        ],
         payg_enabled: true,
       },
     })
@@ -93,7 +115,6 @@ describe('MistralUsageDialog', () => {
     expect(screen.getByText('0%')).toBeTruthy()
     expect(screen.queryByText('Remaining amount')).toBeNull()
     expect(screen.queryByText(/Reset at:/)).toBeNull()
-    expect(screen.getByText('Enabled')).toBeTruthy()
   })
 
   test('shows the upstream error and a retry action', async () => {

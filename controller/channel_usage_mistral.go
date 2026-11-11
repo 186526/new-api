@@ -18,35 +18,48 @@ import (
 
 const channelUsageFetchTimeout = 30 * time.Second
 
-// mistralVibeUsage is the usage dialog payload. Amounts are derived from the
-// plan amount, which is zero when the account entry omits monthlyLimitUsd.
-type mistralVibeUsage struct {
-	ChannelName     string  `json:"channel_name"`
+// mistralUsageBudget is one monthly allowance of the usage dialog. A Mistral
+// plan carries an API/Studio budget and a Vibe Code budget separately.
+type mistralUsageBudget struct {
+	Scope           string  `json:"scope"`
 	UsagePercentage float64 `json:"usage_percentage"`
 	RemainingRatio  float64 `json:"remaining_ratio"`
-	MonthlyLimitUSD float64 `json:"monthly_limit_usd"`
+	LimitUSD        float64 `json:"limit_usd"`
 	RemainingUSD    float64 `json:"remaining_usd"`
 	ResetAt         int64   `json:"reset_at"`
-	PaygEnabled     bool    `json:"payg_enabled"`
-	FetchedAt       int64   `json:"fetched_at"`
 }
 
-// newMistralVibeUsage turns the Vibe allowance into the usage dialog payload.
-func newMistralVibeUsage(account service.MistralVibeAccount, quota *service.MistralVibeQuota) mistralVibeUsage {
-	remainingRatio := clampRatio(1 - quota.UsagePercentage/100)
-	remainingUSD := 0.0
-	if account.MonthlyLimitUSD > 0 {
-		remainingUSD = account.MonthlyLimitUSD * remainingRatio
+// mistralUsage is the usage dialog payload. Amounts are derived from the plan
+// amount the console reports, and stay zero when the console omitted it.
+type mistralUsage struct {
+	ChannelName string               `json:"channel_name"`
+	Budgets     []mistralUsageBudget `json:"budgets"`
+	PaygEnabled bool                 `json:"payg_enabled"`
+	FetchedAt   int64                `json:"fetched_at"`
+}
+
+// newMistralUsage turns the monthly allowances into the usage dialog payload.
+func newMistralUsage(account service.MistralQuotaAccount, quota *service.MistralQuota) mistralUsage {
+	budgets := make([]mistralUsageBudget, 0, 2)
+	for _, budget := range []*service.MistralBudget{quota.API, quota.Vibe} {
+		if budget == nil {
+			continue
+		}
+		remainingRatio := clampRatio(1 - budget.UsagePercentage/100)
+		budgets = append(budgets, mistralUsageBudget{
+			Scope:           budget.Scope,
+			UsagePercentage: budget.UsagePercentage,
+			RemainingRatio:  remainingRatio,
+			LimitUSD:        budget.LimitUSD,
+			RemainingUSD:    budget.LimitUSD * remainingRatio,
+			ResetAt:         unixSeconds(budget.ResetAt),
+		})
 	}
-	return mistralVibeUsage{
-		ChannelName:     account.Channel,
-		UsagePercentage: quota.UsagePercentage,
-		RemainingRatio:  remainingRatio,
-		MonthlyLimitUSD: account.MonthlyLimitUSD,
-		RemainingUSD:    remainingUSD,
-		ResetAt:         unixSeconds(quota.ResetAt),
-		PaygEnabled:     quota.PaygEnabled,
-		FetchedAt:       quota.FetchedAt.Unix(),
+	return mistralUsage{
+		ChannelName: account.Channel,
+		Budgets:     budgets,
+		PaygEnabled: quota.PaygEnabled,
+		FetchedAt:   quota.FetchedAt.Unix(),
 	}
 }
 
@@ -70,7 +83,7 @@ func unixSeconds(at time.Time) int64 {
 	return at.Unix()
 }
 
-// GetMistralChannelUsage 返回 Vibe 账号的月度额度；数据来自 Vibe 网页接口，不落库。
+// GetMistralChannelUsage 返回账号的月度额度；数据来自控制台页面，不落库。
 func GetMistralChannelUsage(c *gin.Context) {
 	channelId, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -92,26 +105,26 @@ func GetMistralChannelUsage(c *gin.Context) {
 		return
 	}
 
-	account, err := findMistralVibeAccount(ch.Name)
+	account, err := findMistralQuotaAccount(ch.Name)
 	if err != nil {
-		common.SysError(common.LogText("failed to find mistral vibe account: channel_id=%d, error=%s", ch.Id, err.Error()))
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": fmt.Sprintf("no Mistral Vibe account is configured for channel %q", ch.Name)})
+		common.SysError(common.LogText("failed to find mistral quota account: channel_id=%d, error=%s", ch.Id, err.Error()))
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": fmt.Sprintf("no Mistral quota account is configured for channel %q", ch.Name)})
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), channelUsageFetchTimeout)
 	defer cancel()
 
-	quota, err := service.FetchMistralVibeQuota(ctx, account)
+	quota, err := service.FetchMistralQuota(ctx, account)
 	if err != nil {
-		common.SysError(common.LogText("failed to fetch mistral vibe usage: channel_id=%d, error=%s", ch.Id, err.Error()))
-		var authErr *service.MistralVibeAuthError
+		common.SysError(common.LogText("failed to fetch mistral usage: channel_id=%d, error=%s", ch.Id, err.Error()))
+		var authErr *service.MistralQuotaAuthError
 		if errors.As(err, &authErr) {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": "Mistral Vibe session was rejected; update the cookie in the quota account configuration"})
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "Mistral console session was rejected; update the cookie in the quota account configuration"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "Failed to fetch usage. Please try again later"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": newMistralVibeUsage(account, quota)})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": newMistralUsage(account, quota)})
 }

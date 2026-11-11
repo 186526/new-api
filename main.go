@@ -139,12 +139,12 @@ func main() {
 		go controller.StartAntigravityQuotaRefresh(controller.AntigravityQuotaRefreshInterval)
 	}
 
-	// Mistral Vibe exposes its monthly allowance only to the signed-in admin
-	// console, so it is refreshed from the configured session cookies.
+	// Mistral exposes its monthly allowances only to the signed-in admin
+	// console, so they are refreshed from the configured session cookies.
 	if common.RunsAdmin() && (os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS") != "" ||
 		os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE") != "" ||
 		os.Getenv("MISTRAL_VIBE_QUOTA_COOKIE") != "") {
-		frequency := controller.MistralVibeQuotaRefreshInterval
+		frequency := controller.MistralQuotaRefreshInterval
 		if raw := os.Getenv("MISTRAL_VIBE_QUOTA_FREQUENCY"); raw != "" {
 			minutes, err := strconv.Atoi(raw)
 			if err != nil || minutes <= 0 {
@@ -152,7 +152,7 @@ func main() {
 			}
 			frequency = time.Duration(minutes) * time.Minute
 		}
-		go controller.StartMistralVibeQuotaRefresh(frequency)
+		go controller.StartMistralQuotaRefresh(frequency)
 	}
 
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day

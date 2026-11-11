@@ -16,7 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 )
 
-func setupMistralVibeBalanceTest(t *testing.T) {
+func setupMistralBalanceTest(t *testing.T) {
 	t.Helper()
 	originalDB := model.DB
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
@@ -33,55 +33,70 @@ func setupMistralVibeBalanceTest(t *testing.T) {
 	})
 }
 
-func newMistralVibeUsageServer(t *testing.T, percentage string) *httptest.Server {
+// newMistralSubscriptionServer serves the console page with an API budget used
+// at apiPercentage percent of apiLimit and a Vibe budget used at
+// vibePercentage percent of vibeLimit.
+func newMistralSubscriptionServer(t *testing.T, apiPercentage float64, apiLimit float64, vibePercentage float64, vibeLimit float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/api/code-trpc/apiKey.getUsage", r.URL.Path)
+		assert.Equal(t, "/subscription", r.URL.Path)
 		assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
 		assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla/5.0")
-		_, _ = fmt.Fprintf(w, `[{"result":{"data":{"json":{"usagePercentage":%s,"paygEnabled":false,"resetAt":"2026-12-01T00:00:00Z"}}}}]`, percentage)
+		_, _ = fmt.Fprintf(w, `<script>self.__next_f.push([1,"\"budget\":{\"usage_percentage\":0,\"initial_budget\":0,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\",\"api_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"},\"vibe_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"}}"])</script>`,
+			apiPercentage, apiLimit, vibePercentage, vibeLimit)
 	}))
 	t.Cleanup(server.Close)
 	return server
 }
 
-func TestMistralVibeBalanceUsesTheMatchingAccount(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
-	server := newMistralVibeUsageServer(t, "25")
+func setMistralQuotaEnv(t *testing.T, serverURL string, accounts string) {
+	t.Helper()
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", "")
-	t.Setenv("MISTRAL_VIBE_QUOTA_BASE_URL", server.URL)
-	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", `[{"channel":"Mistral Vibe (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":100}]`)
+	t.Setenv("MISTRAL_QUOTA_ADMIN_BASE_URL", serverURL)
+	t.Setenv("MISTRAL_VIBE_QUOTA_BASE_URL", serverURL)
+	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", accounts)
+}
 
-	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral Vibe (pro)"}
+func TestMistralBalanceUsesTheAllowanceOfTheChannelKey(t *testing.T) {
+	setupMistralBalanceTest(t)
+	server := newMistralSubscriptionServer(t, 60, 15, 25, 150)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio"}]`)
+
+	studio := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_studio", Name: "Mistral (pro)"}
+	require.NoError(t, model.DB.Create(studio).Error)
+	result, err := updateChannelBalance(studio)
+	require.NoError(t, err)
+	assert.InDelta(t, 6.0, result.Balance, 1e-9)
+	assert.InDelta(t, 6.0, studio.Balance, 1e-9)
+
+	vibe := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_vibe", Name: "Mistral (pro)"}
+	require.NoError(t, model.DB.Create(vibe).Error)
+	result, err = updateChannelBalance(vibe)
+	require.NoError(t, err)
+	assert.InDelta(t, 112.5, result.Balance, 1e-9)
+}
+
+func TestMistralBalanceFallsBackToTheVibeAllowance(t *testing.T) {
+	setupMistralBalanceTest(t)
+	server := newMistralSubscriptionServer(t, 60, 15, 25, 150)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio"}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_unlisted", Name: "Mistral (pro)"}
 	require.NoError(t, model.DB.Create(channel).Error)
 
 	result, err := updateChannelBalance(channel)
 
 	require.NoError(t, err)
-	assert.InDelta(t, 75.0, result.Balance, 1e-9)
-	assert.InDelta(t, 75.0, channel.Balance, 1e-9)
+	assert.InDelta(t, 112.5, result.Balance, 1e-9)
 }
 
-func TestMistralVibeBalanceRejectsUnknownChannel(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
-	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", "")
-	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", `[{"channel":"Mistral Vibe (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":100}]`)
+func TestMistralBalanceRejectsUnknownChannel(t *testing.T) {
+	setupMistralBalanceTest(t)
+	setMistralQuotaEnv(t, "http://127.0.0.1:1", `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":150}]`)
 
-	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral Vibe (other)"}
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral (other)"}
 
 	_, err := updateChannelBalance(channel)
 
-	require.ErrorContains(t, err, `no Mistral Vibe account is configured for channel "Mistral Vibe (other)"`)
-}
-
-func TestMistralVibeBalanceRequiresMonthlyLimit(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
-	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", "")
-	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", `[{"channel":"Mistral Vibe (pro)","cookie":"ory_session_x=1"}]`)
-
-	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral Vibe (pro)"}
-
-	_, err := updateChannelBalance(channel)
-
-	require.ErrorContains(t, err, "has no monthlyLimitUsd")
+	require.ErrorContains(t, err, `no Mistral quota account is configured for channel "Mistral (other)"`)
 }

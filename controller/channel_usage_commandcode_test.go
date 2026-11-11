@@ -83,7 +83,7 @@ func newCommandCodeUsageChannel(t *testing.T, server *httptest.Server, keys stri
 }
 
 func TestGetCommandCodeChannelUsageListsEveryKeyWithoutLeakingIt(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
+	setupMistralBalanceTest(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/alpha/billing/credits", r.URL.Path)
 		assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "))
@@ -112,7 +112,7 @@ func TestGetCommandCodeChannelUsageListsEveryKeyWithoutLeakingIt(t *testing.T) {
 }
 
 func TestGetCommandCodeChannelUsageSkipsAFailingKey(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
+	setupMistralBalanceTest(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.Header.Get("Authorization"), "bad-key") {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -132,7 +132,7 @@ func TestGetCommandCodeChannelUsageSkipsAFailingKey(t *testing.T) {
 }
 
 func TestGetCommandCodeChannelUsageReportsUpstreamFailure(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
+	setupMistralBalanceTest(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -146,7 +146,7 @@ func TestGetCommandCodeChannelUsageReportsUpstreamFailure(t *testing.T) {
 }
 
 func TestGetCommandCodeChannelUsageRejectsOtherBalanceSources(t *testing.T) {
-	setupMistralVibeBalanceTest(t)
+	setupMistralBalanceTest(t)
 	channel := &model.Channel{Type: constant.ChannelTypeOpenAI, Name: "openai", Key: "sk-test"}
 	require.NoError(t, model.DB.Create(channel).Error)
 

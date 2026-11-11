@@ -671,7 +671,7 @@ func updateStandardChannelBalance(channel *model.Channel) (float64, error) {
 	case constant.ChannelTypeNewAPI:
 		return updateChannelNewAPIBalance(channel)
 	case constant.ChannelTypeMistral:
-		return updateChannelMistralVibeBalance(channel)
+		return updateChannelMistralBalance(channel)
 	default:
 		return 0, common.NewMessage("Not implemented yet")
 	}

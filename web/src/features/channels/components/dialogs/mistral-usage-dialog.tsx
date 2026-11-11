@@ -30,7 +30,11 @@ import { formatCurrencyFromUSD } from '@/lib/currency'
 import { formatTimestampToDate } from '@/lib/format'
 import { getServerErrorMessage } from '@/lib/server-error-message'
 
-import { getMistralUsage, type MistralUsageData } from '../../api'
+import {
+  getMistralUsage,
+  type MistralUsageBudget,
+  type MistralUsageData,
+} from '../../api'
 
 type MistralUsageDialogProps = {
   open: boolean
@@ -48,11 +52,66 @@ function hasAmount(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0
 }
 
+function formatAmount(value: number): string {
+  return formatCurrencyFromUSD(value, {
+    digitsLarge: 2,
+    digitsSmall: 4,
+    showSymbol: true,
+  })
+}
+
+function budgetLabelKey(scope: MistralUsageBudget['scope']): string {
+  return scope === 'api' ? 'API usage' : 'Vibe Code usage'
+}
+
 function UsageRow(props: { label: string; value: string }) {
   return (
     <div className='flex items-baseline justify-between gap-2 text-sm'>
       <span className='text-muted-foreground'>{props.label}</span>
       <span className='font-medium'>{props.value}</span>
+    </div>
+  )
+}
+
+function BudgetSection(props: {
+  budget: MistralUsageBudget
+  percent: Intl.NumberFormat
+}) {
+  const { t } = useTranslation()
+  const remaining = clampRatio(props.budget.remaining_ratio)
+  const remainingLabel = props.percent.format(remaining)
+  const label = t(budgetLabelKey(props.budget.scope))
+  const remainingAmount = hasAmount(props.budget.remaining_usd)
+    ? formatAmount(props.budget.remaining_usd)
+    : null
+  const limitAmount = hasAmount(props.budget.limit_usd)
+    ? formatAmount(props.budget.limit_usd)
+    : null
+  const amountLabel =
+    remainingAmount && limitAmount
+      ? `${remainingAmount} / ${limitAmount}`
+      : remainingAmount
+
+  return (
+    <div className='space-y-2'>
+      <div className='flex items-baseline justify-between gap-2'>
+        <span className='text-sm font-medium'>{label}</span>
+        <span className='text-sm font-medium'>{remainingLabel}</span>
+      </div>
+      <Progress
+        value={remaining * 100}
+        aria-label={`${label}: ${remainingLabel}`}
+        className='mt-1'
+      />
+      {amountLabel && (
+        <UsageRow label={t('Remaining amount')} value={amountLabel} />
+      )}
+      {props.budget.reset_at ? (
+        <UsageRow
+          label={t('Reset at:')}
+          value={formatTimestampToDate(props.budget.reset_at)}
+        />
+      ) : null}
     </div>
   )
 }
@@ -66,53 +125,23 @@ function MistralUsageDetails(props: {
     style: 'percent',
     maximumFractionDigits: 1,
   })
-  const remaining = clampRatio(props.usage.remaining_ratio)
-  const remainingLabel = percent.format(remaining)
-  const remainingAmount = hasAmount(props.usage.remaining_usd)
-    ? formatCurrencyFromUSD(props.usage.remaining_usd, {
-        digitsLarge: 2,
-        digitsSmall: 4,
-        showSymbol: true,
-      })
-    : null
-  const limitAmount = hasAmount(props.usage.monthly_limit_usd)
-    ? formatCurrencyFromUSD(props.usage.monthly_limit_usd, {
-        digitsLarge: 2,
-        digitsSmall: 4,
-        showSymbol: true,
-      })
-    : null
 
   return (
-    <div className='space-y-4'>
-      <div>
-        <div className='flex items-baseline justify-between gap-2'>
-          <span className='text-sm'>{t('Remaining')}</span>
-          <span className='text-sm font-medium'>{remainingLabel}</span>
+    <div className='space-y-5'>
+      {props.usage.budgets.length === 0 ? (
+        <div className='text-muted-foreground text-sm'>
+          {t('No usage data')}
         </div>
-        <Progress
-          value={remaining * 100}
-          aria-label={`${t('Remaining')}: ${remainingLabel}`}
-          className='mt-1'
-        />
-      </div>
+      ) : (
+        props.usage.budgets.map((budget) => (
+          <BudgetSection
+            key={budget.scope}
+            budget={budget}
+            percent={percent}
+          />
+        ))
+      )}
       <div className='space-y-2'>
-        {remainingAmount && (
-          <UsageRow
-            label={t('Remaining amount')}
-            value={
-              limitAmount
-                ? `${remainingAmount} / ${limitAmount}`
-                : remainingAmount
-            }
-          />
-        )}
-        {props.usage.reset_at ? (
-          <UsageRow
-            label={t('Reset at:')}
-            value={formatTimestampToDate(props.usage.reset_at)}
-          />
-        ) : null}
         <UsageRow
           label={t('Pay-as-you-go')}
           value={props.usage.payg_enabled ? t('Enabled') : t('Disabled')}

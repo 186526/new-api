@@ -140,13 +140,18 @@ export type AntigravityUsageResponse = {
   }
 }
 
-export type MistralUsageData = {
-  channel_name?: string
+export type MistralUsageBudget = {
+  scope: 'api' | 'vibe'
   usage_percentage: number
   remaining_ratio: number
-  monthly_limit_usd?: number
+  limit_usd?: number
   remaining_usd?: number
   reset_at?: number
+}
+
+export type MistralUsageData = {
+  channel_name?: string
+  budgets: MistralUsageBudget[]
   payg_enabled?: boolean
   fetched_at?: number
 }

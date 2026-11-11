@@ -59,7 +59,7 @@ function renderCell(item: Channel) {
 test('opens the Mistral usage dialog from the balance cell of a Mistral channel', async () => {
   const get = vi
     .spyOn(api, 'get')
-    .mockResolvedValue({ data: { success: true, data: { accounts: [] } } })
+    .mockResolvedValue({ data: { success: true, data: { budgets: [] } } })
   const user = userEvent.setup()
   renderCell(channel({ type: CHANNEL_TYPE_MISTRAL, name: 'Mistral Vibe' }))
 
