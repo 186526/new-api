@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	"github.com/QuantumNous/new-api/service"
 )
 
@@ -23,6 +25,30 @@ func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return applyMistralChannelBalance(channel, account, quota)
+}
+
+// refreshMistralChannelBalance stores the allowance of a channel whose quota was
+// already fetched by the quota refresh, so the balance does not depend on the
+// channel balance sweep, which only visits enabled channels.
+func refreshMistralChannelBalance(account service.MistralQuotaAccount, quota *service.MistralQuota) error {
+	channels, err := model.GetAllChannels(0, 0, true, true)
+	if err != nil {
+		return err
+	}
+	for _, channel := range channels {
+		if channel.Type != constant.ChannelTypeMistral || channel.Name != account.Channel {
+			continue
+		}
+		_, err = applyMistralChannelBalance(channel, account, quota)
+		return err
+	}
+	return common.NewMessage(fmt.Sprintf("no Mistral channel is named %q", account.Channel))
+}
+
+// applyMistralChannelBalance picks the allowance the channel key consumes and
+// stores the remaining dollars as the channel balance.
+func applyMistralChannelBalance(channel *model.Channel, account service.MistralQuotaAccount, quota *service.MistralQuota) (float64, error) {
 	budget := quota.Budget(account.BudgetScopeForKey(channel.Key))
 	if budget == nil {
 		// An unlisted key keeps reporting the Vibe allowance, which is what a
@@ -42,6 +68,7 @@ func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 	}
 	balance := budget.LimitUSD * (1 - budget.UsagePercentage/100)
 	channel.UpdateBalance(balance)
+	appmetrics.ObserveChannelBalanceUSD(channel.Name, channel.Id, balance)
 	return balance, nil
 }
 

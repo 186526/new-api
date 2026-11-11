@@ -52,6 +52,12 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 			Windows:     mistralQuotaWindows(quota),
 			RefreshedAt: quota.FetchedAt,
 		})
+		// The channel balance shows the allowance the channel key consumes, and
+		// the balance sweep skips a disabled channel, so it is refreshed here for
+		// every configured channel instead.
+		if err := refreshMistralChannelBalance(account, quota); err != nil {
+			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, err))
+		}
 		time.Sleep(common.RequestInterval)
 	}
 	return result
