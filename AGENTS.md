@@ -51,7 +51,7 @@ This tree is a self-hosted fork of `QuantumNous/new-api` (remote `upstream`). It
 | `model/channel_cache.go` | publishes enabled models for the price collector |
 | `model/log_other.go` | `publicInt` helper for consume-log fields |
 | `pkg/perf_metrics/metrics.go` | `RecordRelayResult` takes the username label |
-| `controller/relay.go` | relay and upstream-attempt metrics |
+| `controller/relay.go`, `common/gin.go`, `pkg/metrics/relay.go` | relay and upstream-attempt metrics; the request body size comes from the bytes `GetBodyStorage` recorded (`common.GetRequestBodyBytes`), because a streamed request reports `Content-Length: -1` and would be sized from nothing, and the histogram buckets are whole kilobytes so the `le` label reads as an exact size |
 | `relay/responses_websocket.go` | username label for WebSocket relays |
 | `Dockerfile` | exposes port 9090 |
 | `web/src/routes/__root.tsx`, `web/src/routes/_authenticated/route.tsx`, `web/src/routes/(auth)/sign-in.tsx`, `web/src/features/auth/auth-layout.tsx` | sign-in gate for anonymous visitors |
