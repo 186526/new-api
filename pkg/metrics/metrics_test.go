@@ -283,8 +283,8 @@ func TestObserveRelayRecordsRequestBodySize(t *testing.T) {
 			counts[strconv.FormatFloat(bucket.GetUpperBound(), 'f', -1, 64)] = bucket.GetCumulativeCount()
 		}
 	}
-	assert.Equal(t, uint64(0), counts["65536"])
-	assert.Equal(t, uint64(1), counts["1048576"])
+	assert.Equal(t, uint64(0), counts["32768"])
+	assert.Equal(t, uint64(1), counts["524288"])
 	assert.Equal(t, uint64(2), counts["67108864"])
 
 	gathered, err := registry.Gather()

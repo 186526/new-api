@@ -61,9 +61,26 @@ var (
 	relayRequestBodyBytes = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "newapi_request_body_bytes",
 		Help:    "Uploaded request body size of one finished relay request, by the channel that served it.",
-		Buckets: []float64{64 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20, 64 << 20},
+		Buckets: requestBodyBuckets(),
 	}, []string{"channel", "stream"})
 )
+
+// requestBodyBuckets returns whole-kilobyte upper bounds, so the le label reads
+// as an exact size instead of a float such as 1.048576e+06. The range covers a
+// long agent conversation (tens of megabytes) and keeps enough steps under 4 MB,
+// where most requests land, to show where a large body starts. The bucketer
+// turns every bound into a float on its own, so an integer list stays exact.
+func requestBodyBuckets() []float64 {
+	bounds := []int{
+		32 << 10, 64 << 10, 128 << 10, 256 << 10, 512 << 10,
+		1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20, 32 << 20, 64 << 20,
+	}
+	buckets := make([]float64, len(bounds))
+	for index, bound := range bounds {
+		buckets[index] = float64(bound)
+	}
+	return buckets
+}
 
 // RelayResult is one finished relay request, sampled once at the request
 // boundary: a retried request is still one result.
