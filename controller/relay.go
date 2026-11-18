@@ -151,7 +151,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				Username:         c.GetString("username"),
 				ChannelID:        common.GetContextKeyInt(c, constant.ContextKeyChannelId),
 				ChannelName:      common.GetContextKeyString(c, constant.ContextKeyChannelName),
-				RequestBodyBytes: c.Request.ContentLength,
+				RequestBodyBytes: common.GetRequestBodyBytes(c),
 			})
 		}
 		if recovered != nil {

@@ -43,6 +43,8 @@ type RequestLabels struct {
 	ChannelID   int
 	ChannelName string
 	// RequestBodyBytes is the size of the request body as the client sent it.
+	// A streamed request carries no Content-Length, so it is read from the body
+	// the relay recorded rather than from the request headers.
 	RequestBodyBytes int64
 }
 

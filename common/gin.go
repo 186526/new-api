@@ -23,6 +23,7 @@ import (
 
 const KeyRequestBody = "key_request_body"
 const KeyBodyStorage = "key_body_storage"
+const KeyRequestBodyBytes = "key_request_body_bytes"
 const keyBodyReadError = "key_body_read_error"
 
 var ErrRequestBodyTooLarge = errors.New("request body too large")
@@ -90,8 +91,22 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 
 	// 缓存存储对象
 	c.Set(KeyBodyStorage, storage)
+	c.Set(KeyRequestBodyBytes, storage.Size())
 
 	return storage, nil
+}
+
+// GetRequestBodyBytes returns the number of bytes read from the client, or zero
+// when the body has not been read yet. http.Request.ContentLength cannot be
+// used for this: a streaming request is read chunked, so it reports -1 even
+// though the payload was fully recorded.
+func GetRequestBodyBytes(c *gin.Context) int64 {
+	if size, exists := c.Get(KeyRequestBodyBytes); exists {
+		if bytesRead, ok := size.(int64); ok {
+			return bytesRead
+		}
+	}
+	return 0
 }
 
 // GetBodyStorage 获取请求体存储对象（用于需要多次读取的场景）

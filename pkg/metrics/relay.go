@@ -102,7 +102,8 @@ type RelayResult struct {
 	OutputTokens int64
 	// RequestBodyBytes is the size of the request body as the client sent it.
 	// It is zero when the size is unknown, and such a request is left out of
-	// the body size distribution.
+	// the body size distribution. A streamed request has no Content-Length, so
+	// the caller reads the size from the body the relay recorded.
 	RequestBodyBytes int64
 }
 
