@@ -39,7 +39,12 @@ func setupMistralBalanceTest(t *testing.T) {
 func newMistralSubscriptionServer(t *testing.T, apiPercentage float64, apiLimit float64, vibePercentage float64, vibeLimit float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/subscription", r.URL.Path)
+		// The account's keys are strings only, so the billing endpoint rejects
+		// them and the console page answers, which is what these tests cover.
+		if r.URL.Path == "/v1/billing/budget" {
+			http.Error(w, "no key", http.StatusUnauthorized)
+			return
+		}
 		assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
 		assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla/5.0")
 		_, _ = fmt.Fprintf(w, `<script>self.__next_f.push([1,"\"budget\":{\"usage_percentage\":0,\"initial_budget\":0,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\",\"api_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"},\"vibe_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"}}"])</script>`,
@@ -52,6 +57,7 @@ func newMistralSubscriptionServer(t *testing.T, apiPercentage float64, apiLimit 
 func setMistralQuotaEnv(t *testing.T, serverURL string, accounts string) {
 	t.Helper()
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", "")
+	t.Setenv("MISTRAL_QUOTA_API_BASE_URL", serverURL)
 	t.Setenv("MISTRAL_QUOTA_ADMIN_BASE_URL", serverURL)
 	t.Setenv("MISTRAL_VIBE_QUOTA_BASE_URL", serverURL)
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", accounts)

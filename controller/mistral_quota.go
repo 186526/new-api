@@ -12,10 +12,11 @@ import (
 )
 
 // MistralQuotaRefreshInterval is how often the configured Mistral accounts
-// publish their monthly allowances to the metrics endpoint. The console sits
-// behind a Cloudflare managed challenge, so the interval stays coarse and each
-// tick adds jitter instead of polling on an exact schedule.
-const MistralQuotaRefreshInterval = 30 * time.Minute
+// publish their monthly allowances to the metrics endpoint. The billing endpoint
+// answers an API key directly, so a coarse interval reserved for the Cloudflare
+// protected console is no longer needed; each tick still adds jitter so the
+// accounts do not poll on an exact schedule.
+const MistralQuotaRefreshInterval = time.Minute
 
 const mistralQuotaMaxBackoff = time.Hour
 

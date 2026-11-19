@@ -117,6 +117,8 @@ func (q *MistralQuota) Budget(scope string) *MistralBudget {
 	}
 }
 
+var errMistralAccountWithoutKey = errors.New("Mistral quota account has no API key for the billing endpoint")
+
 // MistralQuotaAuthError reports an expired or rejected console session. The
 // refresh loop treats it as an expected condition that needs a new cookie.
 type MistralQuotaAuthError struct {
@@ -225,10 +227,9 @@ func (c *MistralQuotaClient) Fetch(ctx context.Context, account MistralQuotaAcco
 	if billingErr == nil {
 		quota.API, quota.Vibe, quota.PaygEnabled = api, vibe, payg
 	} else {
-		var authErr *MistralQuotaAuthError
-		if errors.As(billingErr, &authErr) {
-			return nil, billingErr
-		}
+		// A key the billing endpoint rejects says nothing about the console
+		// session, so a configured cookie still gets its turn; only an account
+		// without one reports the rejection.
 		if account.Cookie == "" {
 			return nil, billingErr
 		}
@@ -265,12 +266,14 @@ func (c *MistralQuotaClient) fetchAllowancesFromConsole(ctx context.Context, acc
 // endpoint reports them to either key of the account, so the Vibe plan key
 // answers when the account has no Studio key.
 func (c *MistralQuotaClient) fetchBudget(ctx context.Context, account MistralQuotaAccount) (*MistralBudget, *MistralBudget, bool, error) {
+	// The console page reports both allowances as well, so an account without a
+	// key is the caller's fallback case, not an authentication failure.
 	apiKey := strings.TrimSpace(account.StudioKey)
 	if apiKey == "" {
 		apiKey = strings.TrimSpace(account.VibeKey)
 	}
 	if apiKey == "" {
-		return nil, nil, false, errors.New("Mistral quota account has no API key for the billing endpoint")
+		return nil, nil, false, errMistralAccountWithoutKey
 	}
 	baseURL := strings.TrimRight(c.billingBaseURL(), "/")
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+mistralBillingBudgetPath, nil)

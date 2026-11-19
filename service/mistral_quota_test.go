@@ -58,13 +58,36 @@ func TestFetchMistralQuotaReadsBothAllowances(t *testing.T) {
 	}
 }
 
+func TestFetchMistralQuotaFallsBackWhenTheKeyIsRejected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == mistralBillingBudgetPath {
+			http.Error(w, "invalid key", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(subscriptionPage))
+	}))
+	defer server.Close()
+
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	quota, err := client.Fetch(context.Background(), MistralQuotaAccount{
+		Channel: "studio", Cookie: "ory_session_test=abc", StudioKey: "mstrl_studio",
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if quota.API == nil || quota.API.UsagePercentage != 60.06123824 {
+		t.Fatalf("API budget = %#v, want the console page's 60.06%%", quota.API)
+	}
+}
+
 func TestFetchMistralQuotaRejectsExpiredSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Just a moment...", http.StatusForbidden)
 	}))
 	defer server.Close()
 
-	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
 	_, err := client.Fetch(context.Background(), MistralQuotaAccount{Channel: "vibe", Cookie: "ory_session_test=abc"})
 	if err == nil {
 		t.Fatal("Fetch() error = nil, want a rejected-session error")
@@ -81,7 +104,7 @@ func TestFetchMistralQuotaRejectsRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
 	_, err := client.Fetch(context.Background(), MistralQuotaAccount{Channel: "vibe", Cookie: "ory_session_test=abc"})
 	var authErr *MistralQuotaAuthError
 	if !errors.As(err, &authErr) || authErr.Status != http.StatusFound {
@@ -103,7 +126,7 @@ func TestFetchMistralQuotaFallsBackToTheVibeEndpoint(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
 	quota, err := client.Fetch(context.Background(), MistralQuotaAccount{
 		Channel: "vibe", Cookie: "ory_session_test=abc", VibeLimitUSD: 150,
 	})
