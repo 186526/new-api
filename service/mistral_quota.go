@@ -29,6 +29,11 @@ const (
 	mistralVibeUsagePath      = "/api/code-trpc/apiKey.getUsage"
 	mistralVibeUsageInput     = `{"0":{"json":null,"meta":{"values":["undefined"],"v":1}}}`
 
+	// The billing endpoint reports both monthly allowances to the API key itself,
+	// so it is the first source and the console page the fallback.
+	defaultMistralAPIBaseURL  = "https://api.mistral.ai"
+	mistralBillingBudgetPath  = "/v1/billing/budget"
+
 	mistralQuotaTimeout   = 30 * time.Second
 	mistralQuotaBodyLimit = 4 << 20
 
@@ -185,6 +190,7 @@ func LoadMistralQuotaAccounts() ([]MistralQuotaAccount, error) {
 type MistralQuotaClient struct {
 	AdminBaseURL string
 	VibeBaseURL  string
+	APIBaseURL   string
 	HTTPClient   *http.Client
 }
 
@@ -192,6 +198,7 @@ func NewMistralQuotaClient() *MistralQuotaClient {
 	return &MistralQuotaClient{
 		AdminBaseURL: mistralEnvOrDefault("MISTRAL_QUOTA_ADMIN_BASE_URL", defaultMistralAdminBaseURL),
 		VibeBaseURL:  mistralEnvOrDefault("MISTRAL_VIBE_QUOTA_BASE_URL", defaultMistralVibeBaseURL),
+		APIBaseURL:   mistralEnvOrDefault("MISTRAL_QUOTA_API_BASE_URL", defaultMistralAPIBaseURL),
 		HTTPClient:   newMistralHTTPClient(),
 	}
 }
@@ -205,34 +212,105 @@ func (c *MistralQuotaClient) Fetch(ctx context.Context, account MistralQuotaAcco
 		return nil, errors.New("Mistral quota client is nil")
 	}
 	channel := strings.TrimSpace(account.Channel)
-	cookie := normalizeMistralCookie(account.Cookie)
-	if channel == "" || cookie == "" {
+	if channel == "" {
 		return nil, errors.New("Mistral quota account requires channel and cookie")
 	}
 
 	quota := &MistralQuota{Channel: channel, FetchedAt: time.Now()}
-	api, vibe, payg, pageErr := c.fetchSubscription(ctx, cookie)
-	if pageErr == nil {
+	account.Cookie = normalizeMistralCookie(account.Cookie)
+	// The billing endpoint answers the API key itself, so it needs neither the
+	// console session nor a browser-like client. It reports both allowances,
+	// which keeps the page and the Vibe app as fallbacks for keys it rejects.
+	api, vibe, payg, billingErr := c.fetchBudget(ctx, account)
+	if billingErr == nil {
 		quota.API, quota.Vibe, quota.PaygEnabled = api, vibe, payg
 	} else {
 		var authErr *MistralQuotaAuthError
-		if errors.As(pageErr, &authErr) {
-			return nil, pageErr
+		if errors.As(billingErr, &authErr) {
+			return nil, billingErr
 		}
-		// The Vibe endpoint still answers when the console page has no billing
-		// section, and it is the only source for a plan-only account.
-		vibeQuota, vibePayg, err := c.fetchVibeUsage(ctx, cookie)
-		if err != nil {
-			return nil, pageErr
+		if account.Cookie == "" {
+			return nil, billingErr
 		}
-		quota.Vibe, quota.PaygEnabled = vibeQuota, vibePayg
+		var consoleErr error
+		quota.API, quota.Vibe, quota.PaygEnabled, consoleErr = c.fetchAllowancesFromConsole(ctx, account)
+		if consoleErr != nil {
+			return nil, consoleErr
+		}
 	}
-	if quota.Vibe == nil && quota.API == nil {
-		return nil, errors.New("Mistral console reported no monthly allowance")
+	if quota.API == nil && quota.Vibe == nil {
+		return nil, billingErr
 	}
 	applyMistralAccountLimits(account, quota)
 	return quota, nil
 }
+
+// fetchAllowancesFromConsole reads the allowances the billing endpoint refused
+// to report: first from the server-rendered subscription page, then, for a plan
+// without a billing section, from the Vibe app.
+func (c *MistralQuotaClient) fetchAllowancesFromConsole(ctx context.Context, account MistralQuotaAccount) (*MistralBudget, *MistralBudget, bool, error) {
+	cookie := account.Cookie
+	api, vibe, payg, pageErr := c.fetchSubscription(ctx, cookie)
+	if pageErr == nil {
+		return api, vibe, payg, nil
+	}
+	vibeQuota, vibePayg, vibeErr := c.fetchVibeUsage(ctx, cookie)
+	if vibeErr != nil {
+		return nil, nil, false, pageErr
+	}
+	return nil, vibeQuota, vibePayg, nil
+}
+
+// fetchBudget reads both monthly allowances from the billing endpoint. The
+// endpoint reports them to either key of the account, so the Vibe plan key
+// answers when the account has no Studio key.
+func (c *MistralQuotaClient) fetchBudget(ctx context.Context, account MistralQuotaAccount) (*MistralBudget, *MistralBudget, bool, error) {
+	apiKey := strings.TrimSpace(account.StudioKey)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(account.VibeKey)
+	}
+	if apiKey == "" {
+		return nil, nil, false, errors.New("Mistral quota account has no API key for the billing endpoint")
+	}
+	baseURL := strings.TrimRight(c.billingBaseURL(), "/")
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+mistralBillingBudgetPath, nil)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("build Mistral billing request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Accept", "application/json")
+
+	response, err := c.httpClient().Do(request)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("request Mistral billing allowance: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, mistralQuotaBodyLimit))
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("read Mistral billing allowance: %w", err)
+	}
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return nil, nil, false, &MistralQuotaAuthError{Status: response.StatusCode}
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, nil, false, fmt.Errorf("Mistral billing allowance returned status %d", response.StatusCode)
+	}
+	return parseMistralBillingBudget(body)
+}
+
+// fillMistralAllowances keeps the page's pay-as-you-go flag when the billing
+// endpoint does not report one, so a console page remains the source for it.
+func fillMistralAllowances(api, vibe *MistralBudget, payg bool, account MistralQuotaAccount) (*MistralBudget, *MistralBudget, bool) {
+	if payg {
+		return api, vibe, payg
+	}
+	cookie := normalizeMistralCookie(account.Cookie)
+	if _, _, pagePayg, err := (&MistralQuotaClient{}).fetchSubscription(context.Background(), cookie); err == nil && pagePayg {
+		return api, vibe, true
+	}
+	return api, vibe, payg
+}
+
 
 // fetchSubscription reads both allowances from the server-rendered
 // subscription page. The page reports the Vibe allowance too when the plan has
@@ -323,6 +401,13 @@ func (c *MistralQuotaClient) vibeBaseURL() string {
 		return defaultMistralVibeBaseURL
 	}
 	return c.VibeBaseURL
+}
+
+func (c *MistralQuotaClient) billingBaseURL() string {
+	if strings.TrimSpace(c.APIBaseURL) == "" {
+		return mistralEnvOrDefault("MISTRAL_QUOTA_API_BASE_URL", defaultMistralAPIBaseURL)
+	}
+	return c.APIBaseURL
 }
 
 func (c *MistralQuotaClient) httpClient() *http.Client {
@@ -511,6 +596,33 @@ func mistralResetTime(value any) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// parseMistralBillingBudget reads both allowances out of the billing endpoint's
+// answer. The endpoint reports one percentage per allowance and no plan amount,
+// which the account entry supplies.
+func parseMistralBillingBudget(body []byte) (*MistralBudget, *MistralBudget, bool, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, nil, false, fmt.Errorf("decode Mistral billing allowance: %w", err)
+	}
+	api := newMistralBudget(MistralBudgetScopeAPI, raw["api_budget"])
+	vibe := newMistralBudget(MistralBudgetScopeVibe, raw["vibe_budget"])
+	if api == nil && vibe == nil {
+		return nil, nil, false, errors.New("Mistral billing endpoint reported no monthly allowance")
+	}
+	payg := false
+	for _, budget := range []map[string]any{mistralObject(raw["vibe_budget"]), mistralObject(raw["api_budget"])} {
+		if enabled, ok := budget["payg_enabled"].(bool); ok && enabled {
+			payg = true
+		}
+	}
+	return api, vibe, payg, nil
+}
+
+func mistralObject(value any) map[string]any {
+	object, _ := value.(map[string]any)
+	return object
 }
 
 func normalizeMistralCookie(raw string) string {

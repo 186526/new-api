@@ -97,6 +97,8 @@ func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAI
 		TopP:        request.TopP,
 		Tools:       request.Tools,
 		ToolChoice:  request.ToolChoice,
+		// The metadata carries the allowance tag, so the rebuilt request keeps it.
+		Metadata: request.Metadata,
 	}
 	if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
 		maxTokens := request.GetMaxTokens()

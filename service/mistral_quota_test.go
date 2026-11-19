@@ -219,3 +219,56 @@ func TestNormalizeMistralCookie(t *testing.T) {
 		t.Error("normalizeMistralCookie() kept the Cookie prefix")
 	}
 }
+
+func TestFetchMistralQuotaPrefersTheBillingEndpoint(t *testing.T) {
+	var consoleHits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case mistralBillingBudgetPath:
+			if got := r.Header.Get("Authorization"); got != "Bearer mstrl_studio" {
+				t.Errorf("authorization = %q, want the Studio key", got)
+			}
+			_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":1.3,"initial_budget":150.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},"api_budget":{"usage_percentage":100.0,"initial_budget":15.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`))
+		default:
+			consoleHits++
+			http.Error(w, "the console must not be read", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	quota, err := client.Fetch(context.Background(), MistralQuotaAccount{
+		Channel: "studio", Cookie: "ory_session_test=abc", StudioKey: "mstrl_studio", APILimitUSD: 15, VibeLimitUSD: 150,
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if consoleHits != 0 {
+		t.Errorf("console requests = %d, want the billing endpoint to answer alone", consoleHits)
+	}
+	if quota.API == nil || quota.API.UsagePercentage != 100 || quota.API.LimitUSD != 15 {
+		t.Fatalf("API budget = %#v, want 100%% of the configured 15", quota.API)
+	}
+	if quota.Vibe == nil || quota.Vibe.UsagePercentage != 1.3 || quota.Vibe.LimitUSD != 150 {
+		t.Fatalf("Vibe budget = %#v, want 1.3%% of 150", quota.Vibe)
+	}
+}
+
+func TestFetchMistralQuotaTakesTheBillingEndpointWithTheVibeKeyOnly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer mstrl_vibe" {
+			t.Errorf("authorization = %q, want the Vibe key when the account has no Studio key", got)
+		}
+		_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":42.5,"initial_budget":150.0},"api_budget":{"usage_percentage":100.0,"initial_budget":15.0}}`))
+	}))
+	defer server.Close()
+
+	client := &MistralQuotaClient{AdminBaseURL: server.URL, VibeBaseURL: server.URL, APIBaseURL: server.URL, HTTPClient: newMistralHTTPClient()}
+	quota, err := client.Fetch(context.Background(), MistralQuotaAccount{Channel: "vibe", VibeKey: "mstrl_vibe"})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if quota.Vibe == nil || quota.Vibe.UsagePercentage != 42.5 {
+		t.Fatalf("Vibe budget = %#v, want 42.5%%", quota.Vibe)
+	}
+}
