@@ -2,9 +2,14 @@ package mistral
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestRequestOpenAI2MistralMapsDeveloperRoleToSystem(t *testing.T) {
@@ -16,7 +21,7 @@ func TestRequestOpenAI2MistralMapsDeveloperRoleToSystem(t *testing.T) {
 		},
 	}
 
-	converted := requestOpenAI2Mistral(request)
+	converted := conversionForTest(t, request)
 
 	wantRoles := []string{"system", "user"}
 	if len(converted.Messages) != len(wantRoles) {
@@ -39,13 +44,24 @@ func TestRequestOpenAI2MistralKeepsSupportedRoles(t *testing.T) {
 		messages = append(messages, dto.Message{Role: role, Content: role})
 	}
 
-	converted := requestOpenAI2Mistral(&dto.GeneralOpenAIRequest{Model: "m", Messages: messages})
+	converted := conversionForTest(t, &dto.GeneralOpenAIRequest{Model: "m", Messages: messages})
 
 	for i, want := range roles {
 		if got := converted.Messages[i].Role; got != want {
 			t.Errorf("message %d role = %q, want %q", i, got, want)
 		}
 	}
+}
+
+// conversionForTest runs the chat conversion without a stored request body, so
+// it covers only the typed fields.
+func conversionForTest(t *testing.T, request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAIRequest {
+	t.Helper()
+	converted, ok := requestOpenAI2Mistral(&gin.Context{}, request).(*dto.GeneralOpenAIRequest)
+	if !ok {
+		t.Fatalf("conversion returned %T, want the typed request", requestOpenAI2Mistral(&gin.Context{}, request))
+	}
+	return converted
 }
 
 func messageText(t *testing.T, message dto.Message) string {
@@ -71,7 +87,7 @@ func TestRequestOpenAI2MistralKeepsToolContentAsString(t *testing.T) {
 		},
 	}
 
-	converted := requestOpenAI2Mistral(request)
+	converted := conversionForTest(t, request)
 
 	for _, index := range []int{2, 3} {
 		message := converted.Messages[index]
@@ -101,9 +117,42 @@ func TestRequestOpenAI2MistralKeepsTextToolResultAsString(t *testing.T) {
 		},
 	}
 
-	converted := requestOpenAI2Mistral(request)
+	converted := conversionForTest(t, request)
 
 	if got := converted.Messages[0].Content; got != "line one" {
 		t.Errorf("tool result content = %#v, want %q", got, "line one")
+	}
+}
+
+// A client field the request struct does not declare used to be dropped on the
+// way to Mistral, so a sampler extension never reached the upstream.
+func TestRequestOpenAI2MistralCarriesFieldsItDoesNotModel(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"top_k":5,"chat_template_kwargs":{"thinking":true}}`)
+	storage, err := common.CreateBodyStorage(body)
+	if err != nil {
+		t.Fatalf("create body storage: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Set(common.KeyBodyStorage, storage)
+
+	request := &dto.GeneralOpenAIRequest{Model: "m", Messages: []dto.Message{{Role: "user", Content: "hi"}}}
+	encoded, err := common.Marshal(requestOpenAI2Mistral(c, request))
+	if err != nil {
+		t.Fatalf("marshal converted request: %v", err)
+	}
+	var members map[string]json.RawMessage
+	if err := common.Unmarshal(encoded, &members); err != nil {
+		t.Fatalf("unmarshal converted request: %v", err)
+	}
+	if string(members["top_k"]) != "5" {
+		t.Errorf("top_k = %s, want 5", members["top_k"])
+	}
+	if string(members["chat_template_kwargs"]) != `{"thinking":true}` {
+		t.Errorf("chat_template_kwargs = %s, want the client value", members["chat_template_kwargs"])
+	}
+	if string(members["model"]) != `"m"` {
+		t.Errorf("model = %s, want the converted value to win", members["model"])
 	}
 }

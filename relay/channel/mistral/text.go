@@ -6,6 +6,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+
+	"github.com/gin-gonic/gin"
 )
 
 var mistralToolCallIdRegexp = regexp.MustCompile("^[a-zA-Z0-9]{9}$")
@@ -19,7 +21,7 @@ func mistralRole(role string) string {
 	return role
 }
 
-func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAIRequest {
+func requestOpenAI2Mistral(c *gin.Context, request *dto.GeneralOpenAIRequest) any {
 	messages := make([]dto.Message, 0, len(request.Messages))
 	idMap := make(map[string]string)
 	for _, message := range request.Messages {
@@ -104,7 +106,72 @@ func requestOpenAI2Mistral(request *dto.GeneralOpenAIRequest) *dto.GeneralOpenAI
 		maxTokens := request.GetMaxTokens()
 		out.MaxTokens = &maxTokens
 	}
-	return out
+	return carryUnmodelledFields(c, request, out)
+}
+
+// carryUnmodelledFields copies every top-level member the conversion above
+// does not rebuild, so a field the client sends but this struct does not
+// declare (a sampler extension, for example) still reaches Mistral. Both are
+// marshalled through their JSON tags, so the typed fields and the raw ones
+// share one member list and a carried member never duplicates a typed one.
+func carryUnmodelledFields(c *gin.Context, request *dto.GeneralOpenAIRequest, out *dto.GeneralOpenAIRequest) any {
+	if c == nil || c.Request == nil {
+		return out
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return out
+	}
+	raw, err := storage.Bytes()
+	if err != nil {
+		return out
+	}
+	var original map[string]json.RawMessage
+	if err := common.Unmarshal(raw, &original); err != nil {
+		return out
+	}
+	converted, err := common.Marshal(request)
+	if err != nil {
+		return out
+	}
+	var modelled map[string]json.RawMessage
+	if err := common.Unmarshal(converted, &modelled); err != nil {
+		return out
+	}
+	unmodelled := make(map[string]json.RawMessage)
+	for name, value := range original {
+		if _, ok := modelled[name]; !ok {
+			unmodelled[name] = value
+		}
+	}
+	if len(unmodelled) == 0 {
+		return out
+	}
+	return &carriedRequest{GeneralOpenAIRequest: out, extra: unmodelled}
+}
+
+// carriedRequest marshals the converted request together with the members the
+// conversion did not model.
+type carriedRequest struct {
+	*dto.GeneralOpenAIRequest
+	extra map[string]json.RawMessage
+}
+
+func (r *carriedRequest) MarshalJSON() ([]byte, error) {
+	modelled, err := common.Marshal(r.GeneralOpenAIRequest)
+	if err != nil {
+		return nil, err
+	}
+	var members map[string]json.RawMessage
+	if err := common.Unmarshal(modelled, &members); err != nil {
+		return nil, err
+	}
+	for name, value := range r.extra {
+		if _, exists := members[name]; !exists {
+			members[name] = value
+		}
+	}
+	return common.Marshal(members)
 }
 
 // mistralResponsesInput rewrites the "developer" role in a Responses API input
