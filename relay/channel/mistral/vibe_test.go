@@ -73,6 +73,24 @@ func vibeRelayInfo(apiKey string) *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: apiKey}}
 }
 
+func TestConvertOpenAIRequestSkipsAttributionWhenTheChannelDisablesIt(t *testing.T) {
+	off := false
+	info := vibeRelayInfo("mstrl_vibe_key")
+	info.ChannelSetting.MistralVibeAttribution = &off
+
+	converted, err := (&Adaptor{}).ConvertOpenAIRequest(nil, info, &dto.GeneralOpenAIRequest{
+		Model:    "deepseek-v4.1-flash",
+		Messages: []dto.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ConvertOpenAIRequest() error: %v", err)
+	}
+	request := converted.(*dto.GeneralOpenAIRequest)
+	if len(request.Metadata) != 0 {
+		t.Errorf("metadata = %s, want none for a channel that keeps the API allowance", request.Metadata)
+	}
+}
+
 func requestMetadata(t *testing.T, converted any) map[string]any {
 	t.Helper()
 	request, ok := converted.(*dto.GeneralOpenAIRequest)

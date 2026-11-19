@@ -55,15 +55,15 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	apiKey := ""
-	if info != nil && info.ChannelMeta != nil {
-		apiKey = info.ApiKey
+	if info != nil && info.ChannelMeta != nil &&
+		info.ChannelSetting.UsesMistralVibeAttribution() {
+		converted, err := ApplyVibeAttribution(request, info.ApiKey)
+		if err != nil {
+			return nil, err
+		}
+		request = converted
 	}
-	converted, err := ApplyVibeAttribution(request, apiKey)
-	if err != nil {
-		return nil, err
-	}
-	return requestOpenAI2Mistral(converted), nil
+	return requestOpenAI2Mistral(request), nil
 }
 
 func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {

@@ -140,6 +140,7 @@ import {
 import {
   ADD_MODE_OPTIONS,
   CHANNEL_TYPE_ANTIGRAVITY,
+  CHANNEL_TYPE_MISTRAL,
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_STATUS_LABELS,
   CHANNEL_TYPE_NEW_API,
@@ -308,6 +309,7 @@ const SENSITIVE_FORM_FIELDS = [
   'response_header_timeout_seconds',
   'response_header_timeout_retry_seconds',
   'tls_insecure_skip_verify',
+  'mistral_vibe_attribution',
   'pass_through_body_enabled',
   'responses_websocket_enabled',
   'system_prompt',
@@ -2254,6 +2256,33 @@ export function ChannelMutateDrawer({
             <Switch
               disabled={sensitiveLocked}
               checked={field.value}
+              onCheckedChange={field.onChange}
+            />
+          </FormControl>
+        </FormItem>
+      )}
+    />
+  )
+
+  const mistralVibeAttributionFields = currentType ===
+    CHANNEL_TYPE_MISTRAL && (
+    <FormField
+      control={form.control}
+      name='mistral_vibe_attribution'
+      render={({ field }) => (
+        <FormItem className='flex items-center justify-between px-4 py-3'>
+          <div className='space-y-0.5'>
+            <FormLabel>{t('Bill to the Vibe allowance')}</FormLabel>
+            <FormDescription>
+              {t(
+                'Tag requests so Mistral bills them to the Vibe Code allowance instead of the API allowance.'
+              )}
+            </FormDescription>
+          </div>
+          <FormControl>
+            <Switch
+              disabled={sensitiveLocked}
+              checked={field.value !== false}
               onCheckedChange={field.onChange}
             />
           </FormControl>
@@ -4877,6 +4906,7 @@ export function ChannelMutateDrawer({
                 {responseHeaderTimeoutFields}
                 {responseHeaderTimeoutRetryFields}
                 {tlsInsecureSkipVerifyFields}
+                {mistralVibeAttributionFields}
               </fieldset>
             </div>
             {upstreamModelDetectionFields}

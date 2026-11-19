@@ -48,6 +48,17 @@ type ChannelSettings struct {
 	// An empty value keeps the OpenAI billing endpoints; BalanceSourceCommandCode
 	// reads Command Code's /alpha/billing/credits.
 	BalanceSource string `json:"balance_source,omitempty"`
+	// MistralVibeAttribution tags a Mistral plan key's requests so the upstream
+	// bills them to the Vibe Code allowance. A missing value means on, which is
+	// how the channels behaved before the setting existed; turning it off keeps
+	// the requests on the API allowance.
+	MistralVibeAttribution *bool `json:"mistral_vibe_attribution,omitempty"`
+}
+
+// UsesMistralVibeAttribution reports whether a Mistral channel tags its requests
+// for the Vibe allowance. An unset value means on.
+func (s ChannelSettings) UsesMistralVibeAttribution() bool {
+	return s.MistralVibeAttribution == nil || *s.MistralVibeAttribution
 }
 
 // BindsTaskPlugin reports whether the channel is bound to the task plugin,

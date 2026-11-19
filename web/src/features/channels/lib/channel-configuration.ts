@@ -88,6 +88,7 @@ const CONFIGURATION_BLOCKS = {
       'response_header_timeout_seconds',
       'response_header_timeout_retry_seconds',
       'tls_insecure_skip_verify',
+      'mistral_vibe_attribution',
       'disable_task_polling_sleep',
     ],
   },
@@ -183,6 +184,7 @@ export function getChannelConfigurationState(
       Boolean(values.response_header_timeout_seconds) ||
       Boolean(values.response_header_timeout_retry_seconds) ||
       values.tls_insecure_skip_verify ||
+      values.mistral_vibe_attribution === false ||
       values.disable_task_polling_sleep
     ),
     upstreamModelDetection:
