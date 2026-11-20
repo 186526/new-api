@@ -5,12 +5,12 @@
 package modelname
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 )
 
-// 上游档位后缀。LevelXHigh 只出现在部分模型的上游 id 里，effortLevels 不产出它：
-// Resolve 不会请求 xhigh，Collapse 把带该后缀的 id 折回基础名。
+// 上游档位后缀。只有部分模型提供 xhigh，见 models 表。
 const (
 	LevelLow    = "low"
 	LevelMedium = "medium"
@@ -39,23 +39,54 @@ var models = []Model{
 	{Name: "gemini-3.8-flash", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh}},
 	{Name: "gemini-3.8-flash-tiered"},
 	{Name: "gemini-4-argon", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh}},
-	{Name: "gemini-4-hydrogen", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh}},
+	{Name: "gemini-4-hydrogen", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh, LevelXHigh}},
 	{Name: "gemini-4-hydrogen-sonar"},
-	{Name: "gemini-4-hydrogen-tiered", DefaultLevel: LevelHigh, Levels: []string{LevelHigh}},
-	{Name: "gemini-4-neon", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh}},
+	{Name: "gemini-4-hydrogen-tiered", DefaultLevel: LevelHigh, Levels: []string{LevelHigh, LevelXHigh}},
+	{Name: "gemini-4-neon", DefaultLevel: LevelMedium, Levels: []string{LevelLow, LevelMedium, LevelHigh, LevelXHigh}},
 	{Name: "gpt-oss-120b", DefaultLevel: LevelMedium, Levels: []string{LevelMedium}},
 }
 
-// effortLevels 把客户端的 effort 收敛到上游的档位。
-// 模型没有收敛后的这一档时不再降级：Resolve 会改用该模型的缺省档位。
+// effortLevels 把客户端的 effort 换算成档位。xhigh 与 max 都表示最高档：
+// 模型声明了 xhigh 就请求 xhigh，否则退回 high。
 var effortLevels = map[string]string{
 	"none":    LevelLow,
 	"minimal": LevelLow,
 	"low":     LevelLow,
 	"medium":  LevelMedium,
 	"high":    LevelHigh,
-	"xhigh":   LevelHigh,
-	"max":     LevelHigh,
+	"xhigh":   LevelXHigh,
+	"max":     LevelXHigh,
+}
+
+// xhighFallback 是模型没有声明 xhigh 时用的档位。
+const xhighFallback = LevelHigh
+
+func init() {
+	for _, model := range models {
+		if len(model.Levels) == 0 {
+			continue
+		}
+		if !slices.Contains(model.Levels, model.DefaultLevel) {
+			panic(fmt.Sprintf("modelname: %s declares levels %v but defaults to %q", model.Name, model.Levels, model.DefaultLevel))
+		}
+	}
+}
+
+// levelFor 把 effort 换算成该模型声明的档位。
+// 认不出的 effort 和模型没声明的档位都用缺省档位（init 保证它在 Levels 里）；
+// 只有 xhigh 特殊，没声明时退回 high。
+func (model Model) levelFor(effort string) string {
+	level, known := effortLevels[strings.ToLower(strings.TrimSpace(effort))]
+	if !known {
+		return model.DefaultLevel
+	}
+	if slices.Contains(model.Levels, level) {
+		return level
+	}
+	if level == LevelXHigh && slices.Contains(model.Levels, xhighFallback) {
+		return xhighFallback
+	}
+	return model.DefaultLevel
 }
 
 // List 返回对外暴露的模型名，即上表中的基础名。
@@ -68,18 +99,14 @@ func List() []string {
 }
 
 // Resolve 把基础名与客户端 effort 还原成上游模型 id。
-// effort 不在 effortLevels 里、或该模型没有这一档时，用该模型的缺省档位。
+// 返回的档位一定在该模型声明的 Levels 里；不带档位的名字原样返回。
 // 不在上表里的名字（包括带后缀的旧名字）原样返回。
 func Resolve(name, effort string) string {
 	model, ok := lookup(name)
 	if !ok || len(model.Levels) == 0 {
 		return name
 	}
-	level, known := effortLevels[strings.ToLower(strings.TrimSpace(effort))]
-	if !known || !slices.Contains(model.Levels, level) {
-		level = model.DefaultLevel
-	}
-	return name + "-" + level
+	return name + "-" + model.levelFor(effort)
 }
 
 // Collapse 把上游带档位后缀的模型名折回基础名，只折叠上表该模型声明过的档位；
