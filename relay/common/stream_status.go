@@ -1,6 +1,8 @@
 package common
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -41,13 +43,14 @@ type StreamErrorEntry struct {
 }
 
 type StreamStatus struct {
-	EndReason StreamEndReason
-	EndError  error
-	endOnce   sync.Once
+	endOnce sync.Once
 
 	mu         sync.Mutex
-	Errors     []StreamErrorEntry
 	ErrorCount int
+
+	endReason StreamEndReason
+	endError  error
+	Errors    []StreamErrorEntry
 
 	response         ResponseOutcome
 	errorCode        string
@@ -74,14 +77,59 @@ func NewStreamStatus() *StreamStatus {
 	return &StreamStatus{}
 }
 
+// SetEndReason records the first reason the stream ended. endOnce keeps the
+// first writer, and the fields it sets live under mu so a reader on another
+// goroutine, such as a stream handler asking whether the client left, sees
+// either the zero value or the recorded one rather than a torn state.
 func (s *StreamStatus) SetEndReason(reason StreamEndReason, err error) {
 	if s == nil {
 		return
 	}
 	s.endOnce.Do(func() {
-		s.EndReason = reason
-		s.EndError = err
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.endReason = reason
+		s.endError = err
 	})
+}
+
+// EndReason returns the recorded end reason, or StreamEndReasonNone while the
+// stream is still running.
+func (s *StreamStatus) EndReason() StreamEndReason {
+	if s == nil {
+		return StreamEndReasonNone
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endReason
+}
+
+// EndError returns the error recorded with the end reason.
+func (s *StreamStatus) EndError() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endError
+}
+
+// ResolveClientCancelAsDone turns a client cancellation that raced the
+// delivered completion into a normal end, so it neither logs nor bills as a
+// failure. It only touches a cancellation still recorded after every stream
+// goroutine joined, and reports whether it did.
+func (s *StreamStatus) ResolveClientCancelAsDone() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.endReason != StreamEndReasonClientGone || !errors.Is(s.endError, context.Canceled) || s.ErrorCount > 0 {
+		return false
+	}
+	s.endReason = StreamEndReasonDone
+	s.endError = nil
+	return true
 }
 
 func (s *StreamStatus) RecordError(msg string) {
@@ -177,7 +225,7 @@ func (s *StreamStatus) OutcomeSnapshot() StreamOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return StreamOutcome{
-		EndReason:        s.EndReason,
+		EndReason:        s.endReason,
 		HasErrors:        s.ErrorCount > 0,
 		ExpectsTerminal:  s.expectsTerminal,
 		Response:         s.response,
@@ -206,28 +254,33 @@ func (s *StreamStatus) TotalErrorCount() int {
 	return s.ErrorCount
 }
 
+// IsNormalEnd reports whether the recorded end reason is one a delivered
+// stream can end with.
 func (s *StreamStatus) IsNormalEnd() bool {
 	if s == nil {
 		return true
 	}
-	return s.EndReason == StreamEndReasonDone ||
-		s.EndReason == StreamEndReasonEOF ||
-		s.EndReason == StreamEndReasonHandlerStop
+	switch s.EndReason() {
+	case StreamEndReasonDone, StreamEndReasonEOF, StreamEndReasonHandlerStop:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *StreamStatus) Summary() string {
 	if s == nil {
 		return "StreamStatus<nil>"
 	}
-	b := &strings.Builder{}
-	fmt.Fprintf(b, "reason=%s", s.EndReason)
-	if s.EndError != nil {
-		fmt.Fprintf(b, " end_error=%q", s.EndError.Error())
-	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := &strings.Builder{}
+	fmt.Fprintf(b, "reason=%s", s.endReason)
+	if s.endError != nil {
+		fmt.Fprintf(b, " end_error=%q", s.endError.Error())
+	}
 	if s.ErrorCount > 0 {
 		fmt.Fprintf(b, " soft_errors=%d", s.ErrorCount)
 	}
-	s.mu.Unlock()
 	return b.String()
 }

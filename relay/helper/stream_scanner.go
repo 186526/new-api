@@ -3,7 +3,6 @@ package helper
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -362,11 +361,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// All stream goroutines have joined. Done from a successfully delivered
 	// protocol completion can now correct a cancellation that won while its
 	// callback was still running. Bare EOF and failed writes never qualify.
-	if sr.done && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) &&
-		info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone &&
-		errors.Is(info.StreamStatus.EndError, context.Canceled) && !info.StreamStatus.HasErrors() {
-		info.StreamStatus.EndReason = relaycommon.StreamEndReasonDone
-		info.StreamStatus.EndError = nil
+	if sr.done && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) {
+		info.StreamStatus.ResolveClientCancelAsDone()
 	}
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, common.LogText("stream ended: %s", info.StreamStatus.Summary()))
