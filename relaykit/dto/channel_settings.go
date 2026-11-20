@@ -53,6 +53,12 @@ type ChannelSettings struct {
 	// how the channels behaved before the setting existed; turning it off keeps
 	// the requests on the API allowance.
 	MistralVibeAttribution *bool `json:"mistral_vibe_attribution,omitempty"`
+	// MaxImagesPerRequest holds the upstream's per-request image limit, which is
+	// how many images one request may carry. A request with more distinct images
+	// is refused locally with context_length_exceeded, so the client compacts
+	// the conversation instead of the upstream rejecting the request. Zero keeps
+	// the channel unlimited.
+	MaxImagesPerRequest int `json:"max_images_per_request,omitempty"`
 }
 
 // UsesMistralVibeAttribution reports whether a Mistral channel tags its requests
@@ -98,7 +104,8 @@ const (
 	BalanceSourceCommandCode = "commandcode"
 )
 
-// ValidateHTTPTransport validates save-time HTTP transport channel settings.
+// ValidateHTTPTransport validates save-time HTTP transport channel settings
+// and the per-request image limit.
 func (s *ChannelSettings) ValidateHTTPTransport() error {
 	if s == nil {
 		return nil
@@ -117,6 +124,9 @@ func (s *ChannelSettings) ValidateHTTPTransport() error {
 	}
 	if s.ResponseHeaderTimeoutRetrySeconds < 0 || s.ResponseHeaderTimeoutRetrySeconds > MaxResponseHeaderTimeoutSeconds {
 		return fmt.Errorf("invalid response_header_timeout_retry_seconds: %d", s.ResponseHeaderTimeoutRetrySeconds)
+	}
+	if s.MaxImagesPerRequest < 0 {
+		return fmt.Errorf("invalid max_images_per_request: %d", s.MaxImagesPerRequest)
 	}
 	if protocol == HTTPProtocolHTTP1 && s.HTTP2ConnectionShards > 1 {
 		return fmt.Errorf("http2_connection_shards must be 1 when http_protocol is http1")

@@ -207,6 +207,22 @@ relayAttempts:
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		// The channel setting is the upstream's own image limit, so the request
+		// past it is refused here instead of an attempt that would only come
+		// back as an upstream error. The client sees a context overflow and
+		// compacts the conversation instead.
+		if limitErr := relay.CheckRequestImageLimit(
+			relayInfo.Request,
+			relayFormat,
+			channel.GetSetting().MaxImagesPerRequest,
+			channel.Id,
+			channel.Name,
+			relayInfo.OriginModelName,
+		); limitErr != nil {
+			newAPIError = limitErr
+			break
+		}
+
 		attemptStart := time.Now()
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
