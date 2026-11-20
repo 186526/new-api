@@ -98,28 +98,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			service.RecordRequestPolicyTermination(c, newAPIError)
 			logger.LogError(c, common.LogText("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
-			upstreamURLs := common.UpstreamAddresses(c)
-			if relayFormat != types.RelayFormatOpenAIRealtime && c.Writer.Written() &&
-				strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream") {
-				writeRelayStreamError(c, relayFormat, newAPIError)
-				return
-			}
-			if relayFormat != types.RelayFormatOpenAIRealtime {
-				c.Header("Content-Type", "application/json; charset=utf-8")
-			}
-			switch relayFormat {
-			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError(upstreamURLs...))
-			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"type":  "error",
-					"error": newAPIError.ToClaudeError(upstreamURLs...),
-				})
-			default:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(upstreamURLs...),
-				})
-			}
+			writeRelayErrorFrame(c, ws, relayFormat, newAPIError)
 		}
 	}()
 
@@ -290,6 +269,41 @@ relayAttempts:
 	}
 }
 
+// writeRelayErrorFrame sends a failed request to the client in the one shape
+// its format and its state allow. Before the first byte the response is still
+// a whole error document with its own status and Content-Type. After it, the
+// status and the headers are settled, so the error is one more frame of the
+// body the client already reads and its shape follows the format alone: the
+// header is never consulted, and a path that wrote bytes without asking for a
+// stream, guarded audio or a search result, still ends on a frame instead of a
+// bare document appended to its body.
+func writeRelayErrorFrame(c *gin.Context, ws *websocket.Conn, format types.RelayFormat, apiError *types.NewAPIError) {
+	upstreamURLs := common.UpstreamAddresses(c)
+	if format != types.RelayFormatOpenAIRealtime && c.Writer.Written() {
+		writeRelayStreamError(c, format, apiError)
+		return
+	}
+	if format != types.RelayFormatOpenAIRealtime {
+		c.Header("Content-Type", "application/json; charset=utf-8")
+	}
+	switch format {
+	case types.RelayFormatOpenAIRealtime:
+		helper.WssError(c, ws, apiError.ToOpenAIError(upstreamURLs...))
+	case types.RelayFormatClaude:
+		c.JSON(apiError.StatusCode, gin.H{
+			"type":  "error",
+			"error": apiError.ToClaudeError(upstreamURLs...),
+		})
+	default:
+		c.JSON(apiError.StatusCode, gin.H{
+			"error": apiError.ToOpenAIError(upstreamURLs...),
+		})
+	}
+}
+
+// writeRelayStreamError sends the error as one more frame of a body the client
+// already started reading. The frame follows the format the client asked for,
+// and nothing here touches a header: the first byte settled them.
 func writeRelayStreamError(c *gin.Context, format types.RelayFormat, apiError *types.NewAPIError) {
 	// 心跳提交响应头后，最终错误继续通过同一个流返回。
 	status, _ := common.GetContextKeyType[*relaycommon.StreamStatus](c, constant.ContextKeyResponseStreamStatus)
