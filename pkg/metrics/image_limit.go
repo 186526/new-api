@@ -2,7 +2,6 @@ package metrics
 
 import (
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 var imageLimitRejectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -17,10 +16,4 @@ func ObserveImageLimitRejection(channelName string, channelID int, model string)
 		labelName(channelName, channelID),
 		model,
 	).Inc()
-}
-
-// ImageLimitRejectionsForTest returns the rejection count recorded under one
-// channel and model label, so a caller can assert the metric it publishes.
-func ImageLimitRejectionsForTest(channel, model string) float64 {
-	return testutil.ToFloat64(imageLimitRejectionsTotal.WithLabelValues(channel, model))
 }

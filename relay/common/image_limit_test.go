@@ -7,6 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -198,4 +199,41 @@ func TestRequestImageCountCountsGeminiFileImages(t *testing.T) {
 		}}},
 	}
 	assert.Equal(t, 1, RequestImageCount(types.RelayFormatGemini, request))
+}
+
+// A tool response replayed in an agent loop carries the screenshot the tool
+// produced inside functionResponse.parts, which arrives as raw bytes and must
+// decode into the same parts the request itself uses.
+func TestRequestImageCountCountsGeminiFunctionResponseImages(t *testing.T) {
+	replay, err := json.Marshal([]dto.GeminiPart{
+		{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: testImageAlpha}},
+		{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: testImageBeta}},
+		{InlineData: &dto.GeminiInlineData{MimeType: "image/png", Data: testImageAlpha}},
+		{Text: "captured the login page"},
+	})
+	require.NoError(t, err)
+
+	// The replay only counts when it decodes into GeminiPart values; a shape
+	// the decoder drops would leave the count at zero.
+	var decoded []dto.GeminiPart
+	require.NoError(t, json.Unmarshal(replay, &decoded))
+	require.Len(t, decoded, 4, "the replayed parts must decode as Gemini parts")
+	require.NotNil(t, decoded[0].InlineData, "the replayed image must survive decoding")
+
+	request := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{
+			{Role: "model", Parts: []dto.GeminiPart{{
+				FunctionCall: &dto.FunctionCall{FunctionName: "screenshot"},
+			}}},
+			{Role: "user", Parts: []dto.GeminiPart{{
+				FunctionResponse: &dto.GeminiFunctionResponse{
+					Name:     "screenshot",
+					Response: map[string]any{"status": "ok"},
+					Parts:    replay,
+				},
+			}}},
+		},
+	}
+	assert.Equal(t, 2, RequestImageCount(types.RelayFormatGemini, request),
+		"the two distinct screenshots replayed by the tool are counted once each")
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
+	prometheusmodel "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -156,11 +157,48 @@ func TestCheckRequestImageLimitIgnoresFormatsWithoutImages(t *testing.T) {
 
 func TestCheckRequestImageLimitCountsRejections(t *testing.T) {
 	request := imageLimitTestRequest(t, types.RelayFormatClaude, imageUrls(21))
+	channel, model := "image-limit-metric-channel", "image-limit-metric-model"
+	other := imageLimitTestRequest(t, types.RelayFormatClaude, imageUrls(5))
+	assert.Nil(t, CheckRequestImageLimit(other, types.RelayFormatClaude, 20, 7, channel, model))
+	before := imageLimitRejections(t, channel, model)
 
-	require.NotNil(t, CheckRequestImageLimit(request, types.RelayFormatClaude, 20, 7, "", imageLimitTestModel))
-	require.NotNil(t, CheckRequestImageLimit(request, types.RelayFormatClaude, 20, 7, "", imageLimitTestModel))
+	require.NotNil(t, CheckRequestImageLimit(request, types.RelayFormatClaude, 20, 7, channel, model))
+	require.NotNil(t, CheckRequestImageLimit(request, types.RelayFormatClaude, 20, 7, channel, model))
 
-	assert.Equal(t, 2.0, metrics.ImageLimitRejectionsForTest("7", imageLimitTestModel))
+	assert.Equal(t, before+2, imageLimitRejections(t, channel, model),
+		"the two rejections above are counted, an accepted request is not")
+}
+
+// imageLimitRejections reads one series of the rejection counter from the
+// package registry, so it asserts what the endpoint would report.
+func imageLimitRejections(t *testing.T, channel, model string) float64 {
+	t.Helper()
+	families, err := metrics.Registry().Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != "newapi_image_limit_rejections_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if metricHasLabels(metric, map[string]string{"channel": channel, "model": model}) {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func metricHasLabels(metric *prometheusmodel.Metric, want map[string]string) bool {
+	labels := make(map[string]string, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		labels[label.GetName()] = label.GetValue()
+	}
+	for name, value := range want {
+		if labels[name] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCheckRequestImageLimitAnswersWithTopLevelErrorCode(t *testing.T) {

@@ -75,6 +75,10 @@ func StartServer() *http.Server {
 // METRICS_ADDR pays nothing for it.
 func Enabled() bool { return enabled.Load() }
 
+// Registry returns the registry the endpoint serves, so a package that
+// publishes a metric can read it back through a test.
+func Registry() *prometheus.Registry { return registry }
+
 // labelName is the value a panel shows for a user or channel: the display name
 // when the caller resolved one, otherwise the numeric ID as text.
 func labelName(name string, id int) string {

@@ -723,6 +723,12 @@ func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
 	err = (&ChannelSettings{HTTPProtocol: "http1", HTTP2ConnectionShards: 2}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "http2_connection_shards")
+
+	require.NoError(t, (&ChannelSettings{MaxImagesPerRequest: 20}).ValidateHTTPTransport())
+
+	err = (&ChannelSettings{MaxImagesPerRequest: -1}).ValidateHTTPTransport()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_images_per_request")
 }
 
 func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
