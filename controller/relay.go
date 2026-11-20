@@ -260,6 +260,10 @@ relayAttempts:
 			return
 		}
 
+		// The upstream answered, so the attempt above is counted whatever comes
+		// next; the client reads an image ceiling as a context overflow instead
+		// of a 400 it cannot act on, which also settles the retry decision below.
+		newAPIError = relay.TranslateUpstreamImageLimitError(newAPIError)
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 

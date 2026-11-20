@@ -13,8 +13,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -372,4 +374,214 @@ func imageLimitRelayBodyWithModel(t *testing.T, images int, model string) string
 	})
 	require.NoError(t, err)
 	return string(body)
+}
+
+// imageCeilingReply is the 400 measured on api.mistral.ai for the ninth image
+// of a model that allows 8.
+const imageCeilingReply = `{"object":"error","message":"Total number of images exceeds the maximum allowed of 8.","type":"invalid_request_invalid_args","code":"3051"}`
+
+// imageCeilingHint is what every image refusal tells the client to do, whether
+// new-api refused the request itself or translated the upstream's refusal.
+const imageCeilingHint = "Request a smaller batch of images or compact the conversation and retry."
+
+// imageCeilingUpstream answers every attempt with a fixed status and body and
+// counts the attempts, so a test can tell how many times the upstream was
+// called and whether a retry happened.
+type imageCeilingUpstream struct {
+	server   *httptest.Server
+	attempts atomic.Int32
+}
+
+func newImageCeilingUpstream(t *testing.T, statusCode int, body string) *imageCeilingUpstream {
+	t.Helper()
+	upstream := &imageCeilingUpstream{}
+	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(upstream.server.Close)
+	return upstream
+}
+
+// imageCeilingGateway serves Relay on the context the distributor filled for a
+// selected channel, with the channel base URL pointing at the test upstream, so
+// the request really leaves the gateway. The channel allows no local image
+// limit, which is how a 400 for the image count reaches the client today.
+func imageCeilingGateway(t *testing.T, upstreamURL string, relayFormat types.RelayFormat) *httptest.Server {
+	t.Helper()
+	path := "/v1/chat/completions"
+	channelType := constant.ChannelTypeMistral
+	if relayFormat == types.RelayFormatClaude {
+		// The Mistral adaptor of this fork has no Claude request conversion, so
+		// the Claude envelope is exercised on a channel that does.
+		path, channelType = "/v1/messages", constant.ChannelTypeAnthropic
+	}
+	engine := gin.New()
+	engine.POST(path, func(c *gin.Context) {
+		selectDistributorChannel(c, upstreamURL, 0)
+		common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
+		Relay(c, relayFormat)
+	})
+	return httptest.NewServer(engine)
+}
+
+func postImageCeiling(t *testing.T, gatewayURL string, relayFormat types.RelayFormat, body string) (int, []byte) {
+	t.Helper()
+	path := "/v1/chat/completions"
+	if relayFormat == types.RelayFormatClaude {
+		path = "/v1/messages"
+	}
+	response, err := http.Post(gatewayURL+path, "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	return response.StatusCode, payload
+}
+
+// imageCeilingClaudeBody asks for a Claude reply with the given number of
+// image blocks, which is the request the relay counts for the image limit.
+func imageCeilingClaudeBody(t *testing.T, images int) string {
+	t.Helper()
+	blocks := make([]map[string]any, 0, images+1)
+	blocks = append(blocks, map[string]any{"type": "text", "text": "look"})
+	for i := 0; i < images; i++ {
+		blocks = append(blocks, map[string]any{
+			"type":   "image",
+			"source": map[string]any{"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      "mistral-large-latest",
+		"max_tokens": 16,
+		"messages":   []map[string]any{{"role": "user", "content": blocks}},
+	})
+	require.NoError(t, err)
+	return string(body)
+}
+
+// allowImageCeilingRelay takes the test off token counting, billing and consume
+// logging the same way allowImageLimitRelayModel does, and gives the relay a
+// retry budget: common.RetryTimes defaults to zero, so without it a retry could
+// never happen and the tests could not tell a translated error from a retried
+// one. The channel health setting is the production one, so the disable
+// decision is read as the relay makes it.
+func allowImageCeilingRelay(t *testing.T) func() {
+	t.Helper()
+	cleanup := allowImageLimitRelayModel(t)
+	previousRetryTimes := common.RetryTimes
+	previousAutoDisable := common.AutomaticDisableChannelEnabled
+	common.RetryTimes = 2
+	common.AutomaticDisableChannelEnabled = true
+	return func() {
+		common.RetryTimes = previousRetryTimes
+		common.AutomaticDisableChannelEnabled = previousAutoDisable
+		cleanup()
+	}
+}
+
+// TestRelayTranslatesAnUpstreamImageCeiling covers a channel whose local limit
+// lets the request out and whose upstream refuses it for the image count. The
+// client must read the reply as a context overflow, the attempt must be
+// counted once, the request must not be retried on another channel, and the
+// channel must be judged by the translated error.
+func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		relayFormat types.RelayFormat
+		body        func(t *testing.T) string
+	}{
+		{name: "openai", relayFormat: types.RelayFormatOpenAI, body: func(t *testing.T) string { return imageLimitRelayBody(t, 9) }},
+		{name: "claude", relayFormat: types.RelayFormatClaude, body: func(t *testing.T) string { return imageCeilingClaudeBody(t, 9) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanup := allowImageCeilingRelay(t)
+			defer cleanup()
+
+			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, imageCeilingReply)
+			gateway := imageCeilingGateway(t, upstream.server.URL, tc.relayFormat)
+			defer gateway.Close()
+
+			statusCode, payload := postImageCeiling(t, gateway.URL, tc.relayFormat, tc.body(t))
+			code, message := imageCeilingEnvelope(t, tc.relayFormat, statusCode, payload)
+
+			assert.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+			assert.Equal(t, "context_length_exceeded", code)
+			assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+			assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
+			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+		})
+	}
+}
+
+// TestRelayKeepsAnUpstreamImageCeilingTheTranslationMisses is the counter-case:
+// an upstream 400 that does not name an image ceiling keeps its own code, so
+// the translation only rewrites the refusal it recognizes.
+func TestRelayKeepsAnUpstreamImageCeilingTheTranslationMisses(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest,
+		`{"object":"error","message":"Invalid model: mistral-tiny-1","type":"invalid_request_invalid_args","code":"1002"}`)
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatOpenAI)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatOpenAI, imageLimitRelayBody(t, 9))
+
+	code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, statusCode, payload)
+	assert.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+	assert.NotEqual(t, "context_length_exceeded", code, "an unrelated 400 keeps the error it was raised as")
+	assert.Equal(t, "Invalid model: mistral-tiny-1", message)
+}
+
+// imageCeilingEnvelope reads the error code and message from the reply of the
+// relay format: the OpenAI envelope carries them under error, the Claude one
+// under error.type and error.message.
+func imageCeilingEnvelope(t *testing.T, relayFormat types.RelayFormat, statusCode int, payload []byte) (string, string) {
+	t.Helper()
+	require.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+	if relayFormat == types.RelayFormatClaude {
+		var body struct {
+			Type  string `json:"type"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &body))
+		require.Equal(t, "error", body.Type)
+		return body.Error.Type, body.Error.Message
+	}
+	var body struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(payload, &body))
+	return body.Error.Code, body.Error.Message
+}
+
+// TestUpstreamImageCeilingKeepsTheChannelEnabled reads the health decision on
+// the error the relay lets through: the translated refusal names no channel
+// fault, so a channel asked to disable on its errors keeps serving. The
+// decision is read with the channel health setting on, which the relay's own
+// path cannot make observable without a database.
+func TestUpstreamImageCeilingKeepsTheChannelEnabled(t *testing.T) {
+	previousAutoDisable := common.AutomaticDisableChannelEnabled
+	common.AutomaticDisableChannelEnabled = true
+	defer func() { common.AutomaticDisableChannelEnabled = previousAutoDisable }()
+
+	upstreamError := types.WithOpenAIError(types.OpenAIError{
+		Message: "Total number of images exceeds the maximum allowed of 8.",
+		Type:    "invalid_request_invalid_args",
+		Code:    "3051",
+	}, http.StatusBadRequest)
+
+	translated := relay.TranslateUpstreamImageLimitError(upstreamError)
+	require.NotSame(t, upstreamError, translated)
+	assert.False(t, service.ShouldDisableChannel(translated))
 }

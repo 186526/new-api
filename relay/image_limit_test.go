@@ -2,6 +2,7 @@ package relay
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -412,4 +413,104 @@ func TestCheckRequestImageLimitForModelsKeepsTheWiderModelLimit(t *testing.T) {
 	apiErr := CheckRequestImageLimitForModels(over, types.RelayFormatOpenAI, settings, imageLimitModelMapping(), 1, "mistral", imageLimitMeasuredWideLimitModel)
 	require.NotNil(t, apiErr)
 	assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 20")
+}
+
+// upstreamImageLimitError is the error the upstream's 400 becomes on the relay
+// path: a Message and a Code the upstream chose, wrapped as an OpenAI relay
+// error carrying the upstream status.
+func upstreamImageLimitError(statusCode int, message string, code any) *types.NewAPIError {
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: message,
+		Type:    "invalid_request_invalid_args",
+		Code:    code,
+	}, statusCode)
+}
+
+// TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal covers the
+// replies measured on api.mistral.ai: each names the ceiling of its own model,
+// and the client reads all of them as a context overflow it can compact away.
+func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		code    any
+		message string
+	}{
+		{name: "measured reply", code: "3051", message: "Total number of images exceeds the maximum allowed of 8."},
+		{name: "wide model", code: "3051", message: "Total number of images exceeds the maximum allowed of 20."},
+		{name: "lower case", code: nil, message: "total number of images exceeds the maximum allowed of 8"},
+		{name: "singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8."},
+		{name: "count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8."},
+		{name: "second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apiErr := TranslateUpstreamImageLimitError(upstreamImageLimitError(http.StatusBadRequest, tc.message, tc.code))
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+			assert.Equal(t, imageLimitErrorCode, apiErr.GetErrorCode())
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.False(t, types.IsChannelError(apiErr), "the channel is not at fault for the request's image count")
+			assert.Equal(t, tc.message+" "+imageLimitRetryHint, apiErr.Error())
+			assert.Contains(t, apiErr.Error(), "maximum allowed of", "the ceiling the upstream named stays in the message")
+			openAIError := apiErr.ToOpenAIError()
+			assert.Equal(t, "invalid_request_error", openAIError.Type)
+			assert.Equal(t, openAIError.Code, apiErr.GetErrorCode(), "the top-level error code is the one a client reads")
+			assert.Equal(t, string(imageLimitErrorCode), apiErr.ToClaudeError().Type,
+				"the Claude envelope carries the same code it reads from the local refusal")
+		})
+	}
+}
+
+// TestTranslateUpstreamImageLimitErrorKeepsOtherErrors covers the replies the
+// translation must leave alone: a 400 of another kind, another status, and an
+// error new-api raised itself.
+func TestTranslateUpstreamImageLimitErrorKeepsOtherErrors(t *testing.T) {
+	measured := "Total number of images exceeds the maximum allowed of 8."
+	for _, tc := range []struct {
+		name string
+		err  *types.NewAPIError
+	}{
+		{name: "nil", err: nil},
+		{name: "other 400", err: upstreamImageLimitError(http.StatusBadRequest, "Invalid model: mistral-tiny-1", "1002")},
+		{name: "message naming images without a ceiling", err: upstreamImageLimitError(http.StatusBadRequest, "Image input is not supported", "1002")},
+		{name: "image ceiling under another status", err: upstreamImageLimitError(http.StatusUnprocessableEntity, measured, "3051")},
+		{
+			name: "wording raised by new-api",
+			err: types.NewErrorWithStatusCode(fmt.Errorf("image download failed: %s", measured),
+				types.ErrorCodeInvalidRequest, http.StatusBadRequest),
+		},
+		{
+			name: "wording from a channel's own failure",
+			err: types.NewErrorWithStatusCode(fmt.Errorf("channel config: %s", measured),
+				types.ErrorCodeChannelParamOverrideInvalid, http.StatusBadRequest),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			translated := TranslateUpstreamImageLimitError(tc.err)
+			assert.Same(t, tc.err, translated, "an error of another kind is returned unchanged")
+		})
+	}
+}
+
+// TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow covers a
+// reply the upstream already coded as a context overflow: the client needs no
+// new code, but the action stays missing from the upstream's sentence, so the
+// translation adds it and makes the error skip the retry.
+func TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow(t *testing.T) {
+	upstreamMessage := "Total number of images exceeds the maximum allowed of 8."
+	apiErr := upstreamImageLimitError(http.StatusBadRequest, upstreamMessage, imageLimitErrorCode)
+	translated := TranslateUpstreamImageLimitError(apiErr)
+	require.NotNil(t, translated)
+	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode())
+	assert.Equal(t, upstreamMessage+" "+imageLimitRetryHint, translated.Error())
+	assert.True(t, types.IsSkipRetryError(translated))
+}
+
+// A channel without any image limit refuses nothing, including through the
+// per-model entry: a zero limit means unlimited, not a ceiling of zero.
+func TestCheckRequestImageLimitForModelsLeavesAnUnlimitedChannel(t *testing.T) {
+	request := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(9))
+	assert.Nil(t, CheckRequestImageLimitForModels(request, types.RelayFormatOpenAI, dto.ChannelSettings{}, "", 1, "mistral", imageLimitMappedAlias))
+	zeroed := dto.ChannelSettings{MaxImagesPerModel: map[string]int{imageLimitMappedAlias: 0}}
+	assert.Nil(t, CheckRequestImageLimitForModels(request, types.RelayFormatOpenAI, zeroed, "", 1, "mistral", imageLimitMappedAlias),
+		"a model configured with a zero limit stays unlimited")
 }

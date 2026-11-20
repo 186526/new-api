@@ -3,6 +3,7 @@ package relay
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 )
 
@@ -19,6 +21,18 @@ import (
 // compacted images, so a request refused for its image count succeeds once
 // the conversation is compacted.
 const imageLimitErrorCode types.ErrorCode = "context_length_exceeded"
+
+// imageLimitRetryHint closes every image refusal with the same action, whether
+// new-api refused the request before the upstream saw it or wrote it from the
+// upstream's own refusal.
+const imageLimitRetryHint = "Request a smaller batch of images or compact the conversation and retry."
+
+// upstreamImageLimitPattern matches the reply of an upstream refusing a request
+// for its image count, for example `Total number of images exceeds the maximum
+// allowed of 8.` The count the upstream read is not part of the match, so a
+// session or plan named in the sentence, or a second sentence after it, still
+// matches.
+var upstreamImageLimitPattern = regexp.MustCompile(`(?i)images?\b[^.]*?\bexceeds\b[^.]*?\bmaximum allowed\b`)
 
 // CheckRequestImageLimit refuses a request that carries more image
 // occurrences than the limit of the model it is sent to. The limit is the
@@ -46,11 +60,36 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 	}
 	appmetrics.ObserveImageLimitRejection(channelName, channelId, model)
 	message := fmt.Sprintf(
-		"Total number of images (%d) exceeds the maximum allowed of %d. Request a smaller batch of images or compact the conversation and retry.",
-		images, limit,
+		"Total number of images (%d) exceeds the maximum allowed of %d. %s",
+		images, limit, imageLimitRetryHint,
 	)
 	return types.WithOpenAIError(types.OpenAIError{
 		Message: message,
+		Type:    "invalid_request_error",
+		Code:    imageLimitErrorCode,
+	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+}
+
+// TranslateUpstreamImageLimitError turns an upstream refusal for the image
+// count into the local image refusal, so the client reads it as a context
+// overflow and compacts the conversation instead of failing on a 400 it cannot
+// act on. The upstream tried and answered, so the rewritten error skips the
+// retry and names no channel fault: the channel stays enabled.
+//
+// The message keeps the upstream wording and its own limit, so the client and
+// the operator both see what the upstream allowed. An error of another kind
+// is returned unchanged.
+func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError {
+	if err == nil || err.StatusCode != http.StatusBadRequest {
+		return err
+	}
+	// An error new-api raised itself, before or after an upstream answer, is
+	// not the upstream's wording, even when it quotes the request.
+	if service.RelayErrorSource(err) != "upstream" || !upstreamImageLimitPattern.MatchString(err.Error()) {
+		return err
+	}
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: strings.TrimSpace(err.Error()) + " " + imageLimitRetryHint,
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -73,7 +112,8 @@ func refuseModelMappingCycle(err error) *types.NewAPIError {
 // CheckRequestImageLimit, but takes the limit of the models the channel
 // settings configure: the requested model, the names its reasoning suffix
 // strips to, and the name the channel's model_mapping sends it under. A model
-// without a configured limit falls back to the channel-wide limit.
+// without a configured limit falls back to the channel-wide limit, and a zero
+// limit leaves the channel unlimited.
 func CheckRequestImageLimitForModels(
 	request dto.Request,
 	relayFormat types.RelayFormat,
@@ -89,6 +129,9 @@ func CheckRequestImageLimitForModels(
 	}
 	images := relaycommon.RequestImageCount(relayFormat, request)
 	limit := settings.ImageLimitForModel(names...)
+	if limit <= 0 {
+		return nil
+	}
 	if images > limit {
 		return refuseImagesPastLimit(images, limit, channelId, channelName, model)
 	}
