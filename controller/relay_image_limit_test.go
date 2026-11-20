@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -20,23 +21,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const imageLimitRelayChannelId = 4343
+
+// imageLimitUpstream answers every attempt with a fixed chat completion and
+// counts the attempts, so a test can tell that the request reached it.
+type imageLimitUpstream struct {
+	server   *httptest.Server
+	attempts atomic.Int32
+}
+
+func newImageLimitUpstream(t *testing.T) *imageLimitUpstream {
+	t.Helper()
+	upstream := &imageLimitUpstream{}
+	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"img-limit","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	t.Cleanup(upstream.server.Close)
+	return upstream
+}
+
 // TestRelayRefusesTheImagePastTheChannelLimit reproduces the production
 // request: the distributor already selected the channel, so the relay path
-// holds a stub without settings, and the channel metadata carries the limit.
-// A request with one image more than the channel allows must be refused
-// locally instead of being sent upstream.
+// holds a stub without settings. A request with one image more than the
+// channel allows must be refused locally instead of being sent upstream.
 func TestRelayRefusesTheImagePastTheChannelLimit(t *testing.T) {
 	cleanup := allowImageLimitRelayModel(t)
 	defer cleanup()
 
-	var upstreamAttempts atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamAttempts.Add(1)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	gateway := imageLimitRelayGateway()
+	upstream := newImageLimitUpstream(t)
+	gateway := imageLimitRelayGateway(t, upstream.server.URL)
 	defer gateway.Close()
 
 	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBody(t, 21)))
@@ -53,29 +68,40 @@ func TestRelayRefusesTheImagePastTheChannelLimit(t *testing.T) {
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
 	assert.Equal(t, "context_length_exceeded", body.Error.Code)
 	assert.Contains(t, body.Error.Message, "Total number of images (21) exceeds the maximum allowed of 20")
-	assert.Equal(t, int32(0), upstreamAttempts.Load(), "the request never reaches the upstream")
+	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
 }
 
 // TestRelaySendsTheImagesWithinTheChannelLimit covers the other side of the
-// same path: at exactly the limit the local check lets the request through.
+// same path: at exactly the limit the request goes out, so the client gets the
+// upstream's own answer instead of a local refusal.
 func TestRelaySendsTheImagesWithinTheChannelLimit(t *testing.T) {
 	cleanup := allowImageLimitRelayModel(t)
 	defer cleanup()
 
-	gateway := imageLimitRelayGateway()
+	upstream := newImageLimitUpstream(t)
+	gateway := imageLimitRelayGateway(t, upstream.server.URL)
 	defer gateway.Close()
 
 	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBody(t, 20)))
 	require.NoError(t, err)
 	defer response.Body.Close()
-	require.NotEqual(t, http.StatusBadRequest, response.StatusCode)
+
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode, "response body: %s", payload)
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "20 images reach the upstream exactly once")
 	var body struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
+		ID      string `json:"id"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
-	_ = json.NewDecoder(response.Body).Decode(&body)
-	assert.NotEqual(t, "context_length_exceeded", body.Error.Code, "20 images stay within the limit of 20")
+	require.NoError(t, json.Unmarshal(payload, &body))
+	assert.Equal(t, "img-limit", body.ID, "the client gets the upstream's answer")
+	require.Len(t, body.Choices, 1)
+	assert.Equal(t, "ok", body.Choices[0].Message.Content)
 }
 
 // allowImageLimitRelayModel takes the test off token counting and billing: the
@@ -101,22 +127,28 @@ func allowImageLimitRelayModel(t *testing.T) func() {
 }
 
 // imageLimitRelayGateway serves Relay on the context the distributor filled for
-// a selected channel, which is the path that holds a stub channel.
-func imageLimitRelayGateway() *httptest.Server {
+// a selected channel, which is the path whose channel object is a stub. The
+// channel base URL points at the test upstream, so a request that passes the
+// image check really leaves the gateway.
+func imageLimitRelayGateway(t *testing.T, upstreamURL string) *httptest.Server {
+	t.Helper()
 	engine := gin.New()
 	engine.POST("/v1/chat/completions", func(c *gin.Context) {
-		selectDistributorChannel(c)
+		selectDistributorChannel(c, upstreamURL)
 		Relay(c, types.RelayFormatOpenAI)
 	})
 	return httptest.NewServer(engine)
 }
 
-func selectDistributorChannel(c *gin.Context) {
+func selectDistributorChannel(c *gin.Context, upstreamURL string) {
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, "mistral-large-latest")
-	common.SetContextKey(c, constant.ContextKeyChannelId, 4343)
+	common.SetContextKey(c, constant.ContextKeyChannelId, imageLimitRelayChannelId)
 	common.SetContextKey(c, constant.ContextKeyChannelName, "mistral")
 	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeMistral)
 	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{MaxImagesPerRequest: 20})
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstreamURL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "image-limit-test-key")
+	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, true)
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
 }

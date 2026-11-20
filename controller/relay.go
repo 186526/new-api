@@ -210,14 +210,17 @@ relayAttempts:
 		// The channel setting is the upstream's own image limit, so the request
 		// past it is refused here instead of an attempt that would only come
 		// back as an upstream error. The client sees a context overflow and
-		// compacts the conversation instead. The setting is read from the
-		// context the distributor filled, because getChannel rebuilds the
-		// channel from the context id and its object carries no settings.
+		// compacts the conversation instead. The limit is read from the
+		// settings the distributor stored for the selected channel: the
+		// channel object below is a stub without settings, because
+		// getChannel rebuilds it from the context id, and relayInfo carries no
+		// channel settings here either, because the handler fills ChannelMeta
+		// only after this check. Reading channel.GetSetting() is always zero.
 		channelSetting, _ := common.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting)
 		if limitErr := relay.CheckRequestImageLimit(
 			relayInfo.Request,
 			relayFormat,
-			relay.ChannelImageLimit(channelSetting),
+			channelSetting.MaxImagesPerRequest,
 			channel.Id,
 			channel.Name,
 			relayInfo.OriginModelName,
