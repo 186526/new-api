@@ -721,6 +721,16 @@ const (
 	// openAINonImageEvent is a chunk of another kind: it names no ceiling, so
 	// the refusal translation leaves it where it was.
 	openAINonImageEvent = `{"error":{"message":"The model does not exist","type":"invalid_request_model_not_found","code":"1002"}}`
+	// claudeNonImageEvent is the error event of a Claude stream of the same kind.
+	claudeNonImageEvent = `{"type":"error","error":{"type":"overloaded_error","message":"Upstream is busy"}}`
+	// imageCeilingBesideANonObjectError holds the ceiling wording next to an
+	// `error` that is not an object, which is not an error object and so names
+	// no ceiling.
+	imageCeilingBesideANonObjectError = `{"error":"boom","message":"context length limit hit for images, maximum allowed of 8"}`
+	// imageCeilingAtTheTopLevel is a refusal of the kind an upstream writes
+	// without the `error` wrapper: the object is the event, and its `object`
+	// field says which one.
+	imageCeilingAtTheTopLevel = `{"object":"error","message":"Total number of images exceeds the maximum allowed of 8.","type":"invalid_request_invalid_args","code":"3051"}`
 )
 
 // restoreImageCeilingHooks puts the registered hooks back the way the relay
@@ -805,32 +815,42 @@ func TestStreamImageCeilingLeavesAnUnregisteredHandlerAlone(t *testing.T) {
 	require.NotNil(t, openai.ImageCeilingRefusalFor(imageCeilingOpenAIEvent))
 }
 
-// TestOpenAIStreamErrorKeepsTheUpstreamCode covers an error chunk that names
-// no ceiling: the handler streams it or raises it as before, and the error it
-// is raised as keeps the upstream's code.
-func TestOpenAIStreamErrorKeepsTheUpstreamCode(t *testing.T) {
+// TestStreamErrorOfAnotherKindIsNotTranslated covers the counter-case of the
+// two stream translations: an event of another kind is answered with nil, so
+// the handler streams it and raises it the way it always did, and only an event
+// whose error object names the ceiling is rewritten.
+func TestStreamErrorOfAnotherKindIsNotTranslated(t *testing.T) {
 	restoreImageCeilingHooks(t)
-	openai.SetImageCeilingRefusal(nil)
-	assert.Nil(t, translateOpenAIImageCeiling(openAINonImageEvent), "the refusal translation leaves an error of another kind alone")
 
-	apiErr := streamEventError(openAINonImageEvent)
-	assert.Equal(t, types.ErrorCode("1002"), apiErr.GetErrorCode())
-	assert.Equal(t, "The model does not exist", apiErr.Error())
-	assert.Equal(t, "invalid_request_model_not_found", apiErr.ToOpenAIError().Type)
-
-	coded := streamEventError(imageCeilingOpenAIEvent)
-	assert.Equal(t, types.ErrorCode("bad_request"), coded.GetErrorCode(), "a refusal the translation misses keeps its own code")
+	assert.Nil(t, translateOpenAIImageCeiling(openAINonImageEvent))
+	assert.Nil(t, translateClaudeImageCeiling(types.RelayFormatClaude, claudeNonImageEvent))
+	assert.Nil(t, claude.ImageCeilingRefusalFor(types.RelayFormatClaude, claudeNonImageEvent))
+	assert.Nil(t, openai.ImageCeilingRefusalFor(openAINonImageEvent))
 }
 
-// TestClaudeStreamErrorKeepsTheUpstreamSentence covers the error a Claude
-// handler raises from an event of another kind: the error object's type and
-// message are kept, and the ceiling translation leaves it alone.
-func TestClaudeStreamErrorKeepsTheUpstreamSentence(t *testing.T) {
+// TestStreamSentenceIsReadFromTheErrorObject covers the ceiling wording read
+// from an event whose `error` is not an object: the sentence of another key is
+// not the sentence of an error object, so the event is not a refusal and the
+// handler leaves it to the path it always took.
+func TestStreamSentenceIsReadFromTheErrorObject(t *testing.T) {
 	restoreImageCeilingHooks(t)
-	claude.SetImageCeilingRefusal(nil)
-	event := `{"type":"error","error":{"type":"overloaded_error","message":"Upstream is busy"}}`
-	assert.Nil(t, claude.ImageCeilingRefusalFor(types.RelayFormatClaude, event))
-	nonImage := streamEventError(event)
-	assert.Equal(t, "Upstream is busy", nonImage.Error(), "the error object's sentence reaches the message")
-	assert.Equal(t, "overloaded_error", nonImage.ToOpenAIError().Type, "the error object's type is kept")
+	assert.Empty(t, errorObjectSentence(imageCeilingBesideANonObjectError))
+	assert.Nil(t, translateOpenAIImageCeiling(imageCeilingBesideANonObjectError), "a ceiling wording beside a non-object error is not read as a refusal")
+	assert.Nil(t, translateClaudeImageCeiling(types.RelayFormatClaude, imageCeilingBesideANonObjectError))
+}
+
+// TestStreamCeilingReadsAnErrorObjectAtTheTopLevel covers the refusal an
+// upstream writes with the object itself as the event, the shape
+// dto.GeneralErrorResponse does not unwrap: the sentence and the code of that
+// object are read, and the client reads the ceiling and the code the upstream
+// refused with.
+func TestStreamCeilingReadsAnErrorObjectAtTheTopLevel(t *testing.T) {
+	restoreImageCeilingHooks(t)
+	assert.Equal(t, "Total number of images exceeds the maximum allowed of 8.", errorObjectSentence(imageCeilingAtTheTopLevel))
+
+	refusal := translateOpenAIImageCeiling(imageCeilingAtTheTopLevel)
+	require.NotNil(t, refusal)
+	assert.Equal(t, imageLimitErrorCode, refusal.GetErrorCode())
+	assert.Contains(t, refusal.Error(), "Total number of images exceeds the maximum allowed of 8.")
+	assert.NotContains(t, refusal.Error(), `"object":"error"`, "the upstream envelope stays out of the message")
 }

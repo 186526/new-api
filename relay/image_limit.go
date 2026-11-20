@@ -1,7 +1,7 @@
 package relay
 
 import (
-	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
@@ -161,57 +162,22 @@ func relayFormatImageLimitRefusal(relayFormat types.RelayFormat, refusal *types.
 	}, refusal.StatusCode, types.ErrOptionWithSkipRetry())
 }
 
-// openAIImageCeilingRefusal reads an OpenAI event stream's refusal. A chunk
+// translateOpenAIImageCeiling reads an OpenAI event stream's refusal. A chunk
 // that names an image ceiling is a refusal whatever its code says, because the
 // chunks before it made the upstream's answer; every other error is left to the
-// caller, which raises it with the code the upstream gave it.
+// handler, which streams it and keeps the path it always took. The ceiling is
+// read from the event, not from the message the handler raises from it: that
+// message is the text of the chunk, and the retry loop rebuilds it around the
+// refusal once it arrives.
 func translateOpenAIImageCeiling(event string) *types.NewAPIError {
-	apiErr := streamEventError(event)
-	if !NamesUpstreamImageLimit(apiErr.Error()) {
+	refusal := upstreamImageLimitRefusal(event)
+	if !NamesUpstreamImageLimit(refusal.Error()) {
 		return nil
 	}
-	return TranslateUpstreamImageLimitError(apiErr)
-}
-
-// streamEventError is an error event read with the code the upstream gave it.
-// The relay reaches the translation of an image refusal by error code, so every
-// error code the relay reads is kept on the error: the upstream's own code when
-// its error object carries one, and the code the relay gives a body that names
-// none. The code is a string, the shape both the envelope of the upstream and
-// the error the relay writes carry. The message is the one sentence of the
-// error object, so an envelope never reaches the client.
-func streamEventError(event string) *types.NewAPIError {
-	apiErr := upstreamImageLimitRefusal(event)
-	openAIError := types.OpenAIError{
-		Message: apiErr.Error(),
+	return TranslateUpstreamImageLimitError(types.WithOpenAIError(types.OpenAIError{
+		Message: errorObjectSentence(event),
 		Type:    "upstream_error",
-	}
-	var errResponse dto.GeneralErrorResponse
-	if err := common.Unmarshal([]byte(event), &errResponse); err == nil {
-		if upstreamError := errResponse.TryToOpenAIError(); upstreamError != nil {
-			openAIError.Type = cmp.Or(upstreamError.Type, openAIError.Type)
-			openAIError.Param = upstreamError.Param
-			openAIError.Code = upstreamErrorCode(upstreamError.Code)
-		}
-		if sentence := streamEventSentence(event); sentence != "" {
-			openAIError.Message = sentence
-		}
-	}
-	return types.WithOpenAIError(openAIError, http.StatusBadRequest)
-}
-
-// upstreamErrorCode is the code of an upstream error as a string, which is what
-// both error envelopes carry.
-func upstreamErrorCode(code any) string {
-	switch value := code.(type) {
-	case nil:
-		return string(types.ErrorCodeBadResponseStatusCode)
-	case string:
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return fmt.Sprint(code)
+	}, http.StatusBadRequest))
 }
 
 // upstreamImageLimitRefusal builds the error of the image refusal an event of a
@@ -231,20 +197,69 @@ func upstreamImageLimitRefusal(event string) *types.NewAPIError {
 	// other event is not a refusal, and the handler reads it by its error
 	// object anyway, so collapsing one to its message would let a chunk
 	// naming the event of an image ceiling read as a refusal twice.
-	if sentence := streamEventSentence(event); sentence != "" && upstreamImageLimitPattern.MatchString(sentence) {
+	if sentence := errorObjectSentence(event); sentence != "" && upstreamImageLimitPattern.MatchString(sentence) {
 		message = sentence
 	}
 	return types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest)
 }
 
-// streamEventSentence is the sentence of the error object an event carries, or
-// an empty string when it carries none.
-func streamEventSentence(event string) string {
-	var errResponse dto.GeneralErrorResponse
-	if err := common.Unmarshal([]byte(event), &errResponse); err != nil {
+// streamErrorObject is the error object an event carries in the shape the
+// OpenAI error envelope reads, or nil when the event carries none. The code it
+// carries is read as that envelope reads it, a string, so a client of the relay
+// reads back the code the upstream refused with.
+//
+// An event names its error object in one of two ways: under `error`, the shape
+// of the envelope, or as the event itself with an `object` field saying so. The
+// second shape is the one an upstream writes without the wrapper, and the
+// envelope of the relay does not unwrap it.
+func streamErrorObject(event string) *types.OpenAIError {
+	var eventFields map[string]json.RawMessage
+	if err := common.Unmarshal([]byte(event), &eventFields); err != nil {
+		return nil
+	}
+	errorObject := json.RawMessage{}
+	if wrapped, ok := eventFields["error"]; ok {
+		errorObject = wrapped
+	}
+	if kitutil.GetJsonType(errorObject) != "object" {
+		if object, _ := jsonString(eventFields["object"]); object != "error" {
+			return nil
+		}
+		errorObject, _ = common.Marshal(eventFields)
+	}
+	var openAIError types.OpenAIError
+	if err := common.Unmarshal(errorObject, &openAIError); err != nil || openAIError.Message == "" {
+		return nil
+	}
+	if openAIError.Type == "" {
+		openAIError.Type = "upstream_error"
+	}
+	if code, ok := openAIError.Code.(string); !ok || strings.TrimSpace(code) == "" {
+		openAIError.Code = string(types.ErrorCodeBadResponseStatusCode)
+	} else {
+		openAIError.Code = strings.TrimSpace(code)
+	}
+	return &openAIError
+}
+
+// errorObjectSentence is the sentence of an event's error object, or an empty
+// string when the event carries no error object.
+func errorObjectSentence(event string) string {
+	openAIError := streamErrorObject(event)
+	if openAIError == nil {
 		return ""
 	}
-	return strings.TrimSpace(errResponse.ToMessage())
+	return strings.TrimSpace(openAIError.Message)
+}
+
+// jsonString is the string a JSON value holds, or an empty string for a value
+// of another kind.
+func jsonString(value json.RawMessage) (string, bool) {
+	var text string
+	if err := common.Unmarshal(value, &text); err != nil {
+		return "", false
+	}
+	return text, true
 }
 
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image

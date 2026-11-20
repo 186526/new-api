@@ -136,6 +136,27 @@ func TestClaudeStreamHandlerRefusesAnImageCeilingAfterTheHeaders(t *testing.T) {
 	assert.Empty(t, claudeErrorEvents(t, recorder.Body.String()), "the handler writes no error event of its own")
 }
 
+// TestClaudeStreamHandlerKeepsEveryChunkBeforeTheRefusal covers the chunks the
+// handler already gave the client when the refusal arrives. The chunks are
+// buffered for the format the client asked for, so a case that sees only one
+// chunk cannot tell whether the last one held back is written on the refusal.
+func TestClaudeStreamHandlerKeepsEveryChunkBeforeTheRefusal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	claudeImageCeilingRefusal(t)
+	stream := claudeTextChunk("chunk-one") + claudeTextChunk("chunk-two-before-ceiling") + claudeErrorEvent("invalid_request_error", claudeImageCeilingMessage)
+
+	for _, relayFormat := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAI, types.RelayFormatGemini} {
+		t.Run(string(relayFormat), func(t *testing.T) {
+			recorder, apiErr := newClaudeStreamHandlerContext(t, relayFormat, stream)
+			require.NotNil(t, apiErr, "the refusal reaches the controller: %s", recorder.Body.String())
+			body := recorder.Body.String()
+			assert.Contains(t, body, "chunk-one", "the first chunk before the refusal stays")
+			assert.Contains(t, body, "chunk-two-before-ceiling", "the last chunk held back is written on the refusal")
+			assert.Less(t, strings.Index(body, "chunk-one"), strings.Index(body, "chunk-two-before-ceiling"), "the chunks keep their order")
+		})
+	}
+}
+
 // TestClaudeStreamHandlerKeepsANonImageStreamError is the counter-case: an
 // error event that names no ceiling keeps the error the handler raised from it,
 // and it is written where it always was.

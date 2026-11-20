@@ -1015,3 +1015,252 @@ func TestUpstreamImageCeilingKeepsTheChannelEnabled(t *testing.T) {
 		})
 	}
 }
+
+// committedStreamUpstream answers every attempt with a 200 event stream that
+// delivers the frames in order and flushes each one, which is how an upstream
+// commits a stream before it refuses the request inside it.
+func committedStreamUpstream(t *testing.T, frames []string) *imageCeilingUpstream {
+	t.Helper()
+	upstream := &imageCeilingUpstream{}
+	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, frame := range frames {
+			_, _ = io.WriteString(w, "data: "+frame+"\n\n")
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(upstream.server.Close)
+	return upstream
+}
+
+// streamChunksBeforeTheCeiling are the chunks a committed stream delivers
+// before it refuses the request. Two of them: the handler forwards each chunk
+// one event late, so a single chunk says nothing about whether the chunk held
+// back when the refusal arrives reaches the client.
+var streamChunksBeforeTheCeiling = []string{
+	`{"id":"chunk-1","object":"chat.completion.chunk","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":"chunk-one"}}]}`,
+	`{"id":"chunk-1","object":"chat.completion.chunk","model":"mistral-large-latest","choices":[{"index":0,"delta":{"content":"chunk-two-before-ceiling"}}]}`,
+}
+
+// commitStreamBeforeTheCeiling is the stream a test upstream delivers when it
+// refuses a request it already committed.
+func commitStreamBeforeTheCeiling(refusal string) []string {
+	return append(append([]string{}, streamChunksBeforeTheCeiling...), refusal)
+}
+
+// servedFrames reads the data payloads of a written event stream in the order
+// the client read them, skipping heartbeats and the closing frames of the
+// protocol that do not carry a JSON object.
+func servedFrames(payload []byte) []string {
+	var frames []string
+	for _, line := range strings.Split(string(payload), "\n") {
+		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+		if !ok {
+			continue
+		}
+		data = strings.TrimSpace(data)
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		frames = append(frames, data)
+	}
+	return frames
+}
+
+// requireTheChunksThenTheRefusal requires the frames the client read to be the
+// chunks of the answer in the order the upstream wrote them, then the refusal,
+// and nothing after the refusal.
+func requireTheChunksThenTheRefusal(t *testing.T, payload []byte, codeOf func(t *testing.T, frame string) string, refusalCode string) {
+	t.Helper()
+	frames := contentFrames(t, payload)
+	require.Len(t, frames, 2, "the client reads both chunks and no chunk of the refusal: %s", payload)
+	assert.Equal(t, "chunk-one", messageOfChunk(t, frames[0]), "the first chunk of the answer reaches the client")
+	assert.Equal(t, "chunk-two-before-ceiling", messageOfChunk(t, frames[1]), "the last chunk, held back when the refusal was read, reaches the client")
+	frames = servedFrames(payload)
+	last := frames[len(frames)-1]
+	assert.Equal(t, refusalCode, codeOf(t, last), "the refusal is the last frame the client reads: %s", payload)
+}
+
+// messageOfChunk reads the text a chunk of the answer carries: an OpenAI chunk
+// holds it in its delta, a Claude event in its delta as well.
+func messageOfChunk(t *testing.T, frame string) string {
+	t.Helper()
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+		Delta struct {
+			Text string `json:"text"`
+		} `json:"delta"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(frame), &chunk), "frame: %s", frame)
+	if len(chunk.Choices) > 0 {
+		return chunk.Choices[0].Delta.Content
+	}
+	return chunk.Delta.Text
+}
+
+// TestRelayKeepsTheChunksBeforeAStreamRefusalForClaude covers a Claude client
+// on a channel that speaks Chat Completions: the upstream commits the stream,
+// delivers two chunks and refuses the request for its image count inside it.
+// The client reads both chunks in its own format and then one Claude error
+// event, and the upstream is attempted once.
+func TestRelayKeepsTheChunksBeforeAStreamRefusalForClaude(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	upstream := committedStreamUpstream(t, commitStreamBeforeTheCeiling(imageCeilingReply))
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeStreamBody(t, 1))
+	require.Equal(t, http.StatusOK, statusCode, "a committed stream keeps its status: %s", payload)
+	assert.NotContains(t, string(payload), "[DONE]", "a Claude stream ends on its error event")
+	assert.Equal(t, 1, strings.Count(string(payload), "event: error"), "one refusal ends the stream: %s", payload)
+	requireTheChunksThenTheRefusal(t, payload, func(t *testing.T, frame string) string {
+		var event struct {
+			Type  string `json:"type"`
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(frame), &event), "frame: %s", frame)
+		require.Equal(t, "error", event.Type)
+		assert.Contains(t, event.Error.Message, "Total number of images exceeds the maximum allowed of 8.")
+		assertImageOverflowWording(t, event.Error.Message)
+		requireImageCeilingMessageToldOnce(t, event.Error.Message)
+		return event.Error.Type
+	}, "context_length_exceeded")
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// TestRelayKeepsTheChunksBeforeAStreamRefusalForOpenAI covers an OpenAI client
+// on the same kind of channel: it reads both chunks, the frame that closes an
+// OpenAI stream and then the one error frame, and the upstream is attempted
+// once.
+func TestRelayKeepsTheChunksBeforeAStreamRefusalForOpenAI(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	upstream := committedStreamUpstream(t, commitStreamBeforeTheCeiling(imageCeilingReply))
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatOpenAI)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatOpenAI, imageLimitRelayBody(t, 1))
+	require.Equal(t, http.StatusOK, statusCode, "a committed stream keeps its status: %s", payload)
+	assert.Equal(t, 1, strings.Count(string(payload), "context_length_exceeded"), "one refusal ends the stream: %s", payload)
+	requireTheChunksThenTheRefusal(t, payload, func(t *testing.T, frame string) string {
+		var body struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(frame), &body), "frame: %s", frame)
+		assert.Contains(t, body.Error.Message, "Total number of images exceeds the maximum allowed of 8.")
+		assertImageOverflowWording(t, body.Error.Message)
+		requireImageCeilingMessageToldOnce(t, body.Error.Message)
+		return body.Error.Code
+	}, "context_length_exceeded")
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// TestRelayKeepsTheChunksBeforeAStreamRefusalForGemini covers a native Gemini
+// client on the same kind of channel: it reads both chunks as Gemini events,
+// then the frame that ends a Gemini stream and the one error frame, and the
+// upstream is attempted once.
+func TestRelayKeepsTheChunksBeforeAStreamRefusalForGemini(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	upstream := committedStreamUpstream(t, commitStreamBeforeTheCeiling(imageCeilingReply))
+	gateway := imageCeilingGeminiGateway(t, upstream.server.URL)
+	defer gateway.Close()
+
+	statusCode, payload := postGeminiImageCeiling(t, gateway.URL, "/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse")
+	require.Equal(t, http.StatusOK, statusCode, "a committed stream keeps its status: %s", payload)
+	assert.Equal(t, 1, strings.Count(string(payload), "context_length_exceeded"), "one refusal ends the stream: %s", payload)
+	requireTheChunksThenTheRefusal(t, payload, func(t *testing.T, frame string) string {
+		var body struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(frame), &body), "frame: %s", frame)
+		assert.Contains(t, body.Error.Message, "Total number of images exceeds the maximum allowed of 8.")
+		assertImageOverflowWording(t, body.Error.Message)
+		requireImageCeilingMessageToldOnce(t, body.Error.Message)
+		return body.Error.Code
+	}, "context_length_exceeded")
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// imageCeilingClaudeStreamBody asks a Claude channel for a streamed reply with
+// the given number of image blocks.
+func imageCeilingClaudeStreamBody(t *testing.T, images int) string {
+	t.Helper()
+	blocks := make([]map[string]any, 0, images+1)
+	blocks = append(blocks, map[string]any{"type": "text", "text": "look"})
+	for i := 0; i < images; i++ {
+		blocks = append(blocks, map[string]any{
+			"type":   "image",
+			"source": map[string]any{"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+		})
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      "mistral-large-latest",
+		"max_tokens": 16,
+		"stream":     true,
+		"messages":   []map[string]any{{"role": "user", "content": blocks}},
+	})
+	require.NoError(t, err)
+	return string(body)
+}
+
+// contentFrames are the frames of a written stream that carry text of the
+// answer, in the order the client read them: a Claude event of that kind, or a
+// frame of any format whose delta holds text.
+func contentFrames(t *testing.T, payload []byte) []string {
+	t.Helper()
+	var frames []string
+	for _, frame := range servedFrames(payload) {
+		var chunk struct {
+			Type    string `json:"type"`
+			Object  string `json:"object"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Delta struct {
+				Text string `json:"text"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal([]byte(frame), &chunk) != nil {
+			continue
+		}
+		switch {
+		case chunk.Object == "error":
+			continue
+		case chunk.Type == "content_block_delta":
+			frames = append(frames, frame)
+		case len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "":
+			frames = append(frames, frame)
+		}
+	}
+	return frames
+}

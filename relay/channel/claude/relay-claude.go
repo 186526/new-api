@@ -114,17 +114,20 @@ func ImageCeilingRefusalFor(relayFormat types.RelayFormat, data string) *types.N
 }
 
 func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
+	// A refusal the handler translates is returned alone: the controller writes
+	// it as the one error event of the relay, after the events before it. The
+	// handle is asked before the event is read as a Claude response, because a
+	// channel that speaks another format ends its stream with an error object
+	// this conversion cannot hold, and that error is the refusal itself.
+	refusal := ImageCeilingRefusalFor(claudeStreamRelayFormat(info), data)
+	if refusal != nil {
+		return refusal
+	}
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
 		common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	// A refusal the handler translates is returned alone: the controller writes
-	// it as the one error event of the relay, after the events before it.
-	refusal := ImageCeilingRefusalFor(claudeStreamRelayFormat(info), data)
-	if refusal != nil {
-		return refusal
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
@@ -384,7 +387,16 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
-			sr.Stop(err)
+			// A translated refusal is the end of the stream, not a fault of it:
+			// the controller writes it as the one error event after the events
+			// before it, and the status a stream that ended on its own would
+			// have is kept, so a refusal the client can act on is not counted
+			// as a broken stream. Every other error is a fault and is recorded.
+			if refusalErr := ImageCeilingRefusalFor(claudeStreamRelayFormat(info), data); refusalErr != nil && err == refusalErr {
+				sr.Done()
+			} else {
+				sr.Stop(err)
+			}
 		}
 	})
 	info.StreamStatus.RequireTerminal()

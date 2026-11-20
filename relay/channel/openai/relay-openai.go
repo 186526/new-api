@@ -154,20 +154,21 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var refusal *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		// Each chunk is forwarded one event late, so an event is still the last
-		// one read when the next arrives. An image refusal is read before that
-		// chunk goes out: it is returned to the controller, which writes the one
-		// error event of the relay, and the stream stops there.
-		if refusalErr := ImageCeilingRefusalFor(data); refusalErr != nil {
-			refusal = refusalErr
-			sr.Stop(refusalErr)
-			return
-		}
 		if lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog(common.LogText("error handling stream format: %s", err.Error()))
 				sr.Error(err)
 			}
+		}
+		// Each chunk is forwarded one event late, so the chunk an event follows
+		// has just been written and this one is held back. An image refusal is
+		// not held back: it is returned to the controller, which writes the one
+		// error event of the relay after the chunks before it, and the stream
+		// stops there.
+		if refusalErr := ImageCeilingRefusalFor(data); refusalErr != nil {
+			refusal = refusalErr
+			sr.Stop(refusalErr)
+			return
 		}
 		if len(data) > 0 {
 			if lastStreamData != "" {
@@ -185,12 +186,13 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 
 	info.StreamStatus.RequireTerminal()
 	if refusal != nil {
-		// The chunk the refusal follows is still the last one read, and the
-		// handler writes it here as the tail of its stream: the refusal then
-		// follows every chunk of the answer it was raised after.
-		if info.RelayFormat == types.RelayFormatOpenAI && lastStreamData != "" {
-			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
-		}
+		// The refusal is read after the chunk before it was written, so the
+		// client already holds every chunk of the answer, in its own format.
+		// The end of the stream is still recorded the way a stream that ended
+		// on its own records it, so the refusal the client can act on is not
+		// counted as a broken stream. Nothing else is written: the relay's one
+		// error event follows, which is the last frame the client reads.
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 		return nil, refusal
 	}
 

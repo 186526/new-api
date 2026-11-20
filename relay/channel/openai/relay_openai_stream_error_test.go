@@ -67,7 +67,7 @@ func openAIErrorEvent(message string, code string) string {
 // newOaiStreamHandlerContext runs OaiStreamHandler on an event stream written
 // by the test upstream, with the same relay state the retry loop hands the
 // handler.
-func newOaiStreamHandlerContext(t *testing.T, stream string) (*httptest.ResponseRecorder, *types.NewAPIError) {
+func newOaiStreamHandlerContext(t *testing.T, relayFormat types.RelayFormat, stream string) (*httptest.ResponseRecorder, *types.NewAPIError) {
 	t.Helper()
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
@@ -82,7 +82,7 @@ func newOaiStreamHandlerContext(t *testing.T, stream string) (*httptest.Response
 		Body:       io.NopCloser(strings.NewReader(stream)),
 	}
 	info := &relaycommon.RelayInfo{
-		RelayFormat: types.RelayFormatOpenAI,
+		RelayFormat: relayFormat,
 		IsStream:    true,
 		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "deepseek-v4.1-flash-dedicated"},
 	}
@@ -101,7 +101,7 @@ func TestOaiStreamHandlerRefusesAnImageCeilingAfterTheHeaders(t *testing.T) {
 	openAIImageCeilingRefusal(t)
 	stream := openAITextChunk("before-the-ceiling") + openAIErrorEvent(openAIImageCeilingMessage, "bad_request")
 
-	recorder, apiErr := newOaiStreamHandlerContext(t, stream)
+	recorder, apiErr := newOaiStreamHandlerContext(t, types.RelayFormatOpenAI, stream)
 
 	require.NotNil(t, apiErr, "the refusal reaches the controller: %s", recorder.Body.String())
 	assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
@@ -110,7 +110,32 @@ func TestOaiStreamHandlerRefusesAnImageCeilingAfterTheHeaders(t *testing.T) {
 	assert.Contains(t, apiErr.Error(), openAIImageCeilingMessage, "the ceiling the upstream named stays")
 	assert.Contains(t, recorder.Body.String(), "before-the-ceiling", "the chunk before the refusal stays")
 	assert.NotContains(t, recorder.Body.String(), "maximum allowed of 8", "the refusal is not forwarded as a content chunk")
-	assert.NotContains(t, recorder.Body.String(), "[DONE]", "the stream ends on the refusal, not on a chunk it would have followed")
+	assert.NotContains(t, recorder.Body.String(), "[DONE]", "the stream ends on the refusal event the controller writes")
+}
+
+// TestOaiStreamHandlerKeepsEveryChunkBeforeTheRefusal covers the chunks the
+// handler already gave the client when the refusal arrives. The handler
+// forwards each chunk one event late, so the chunk before the refusal is still
+// held back when the refusal is read; every format the handler serves has to
+// write it, not only the OpenAI one, and that no chunk of the refusal is
+// forwarded in any of them.
+func TestOaiStreamHandlerKeepsEveryChunkBeforeTheRefusal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	openAIImageCeilingRefusal(t)
+	stream := openAITextChunk("chunk-one") + openAITextChunk("chunk-two-before-ceiling") + openAIErrorEvent(openAIImageCeilingMessage, "bad_request")
+
+	for _, relayFormat := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatClaude, types.RelayFormatGemini} {
+		t.Run(string(relayFormat), func(t *testing.T) {
+			recorder, apiErr := newOaiStreamHandlerContext(t, relayFormat, stream)
+			require.NotNil(t, apiErr, "the refusal reaches the controller: %s", recorder.Body.String())
+			body := recorder.Body.String()
+			assert.Contains(t, body, "chunk-one", "the first chunk before the refusal stays")
+			assert.Contains(t, body, "chunk-two-before-ceiling", "the last chunk held back is written on the refusal")
+			assert.Less(t, strings.Index(body, "chunk-one"), strings.Index(body, "chunk-two-before-ceiling"), "the chunks keep their order")
+			assert.NotContains(t, body, "maximum allowed of 8", "the refusal is not forwarded as a content chunk")
+			assert.True(t, streamsCloseTheWayAnAnswerEnds(t, relayFormat, body), "every chunk of the answer reaches the client once, and no frame follows the refusal")
+		})
+	}
 }
 
 // TestOaiStreamHandlerKeepsANonImageStreamError is the counter-case next to the
@@ -121,11 +146,14 @@ func TestOaiStreamHandlerKeepsANonImageStreamError(t *testing.T) {
 	openAIImageCeilingRefusal(t)
 	stream := openAITextChunk("before-the-error") + openAIErrorEvent("Invalid model: mistral-tiny-1", "1002")
 
-	recorder, apiErr := newOaiStreamHandlerContext(t, stream)
+	recorder, apiErr := newOaiStreamHandlerContext(t, types.RelayFormatOpenAI, stream)
 
 	assert.Nil(t, apiErr, "an error of another kind keeps the path it always took")
-	assert.Contains(t, recorder.Body.String(), "before-the-error")
-	assert.Contains(t, recorder.Body.String(), "Invalid model: mistral-tiny-1", "the error chunk is streamed as the upstream wrote it")
+	body := recorder.Body.String()
+	assert.Contains(t, body, "before-the-error")
+	assert.Contains(t, body, `"message":"Invalid model: mistral-tiny-1"`, "the error chunk reaches the client with the sentence the upstream wrote")
+	assert.Contains(t, body, `"code":"1002"`, "and with the upstream's code")
+	assert.NotContains(t, body, "context length limit", "it is not rewritten as a refusal")
 }
 
 // TestOaiStreamHandlerLeavesTheStreamAloneWithoutATranslation covers the
@@ -138,9 +166,19 @@ func TestOaiStreamHandlerLeavesTheStreamAloneWithoutATranslation(t *testing.T) {
 	t.Cleanup(func() { SetImageCeilingRefusal(realTranslation) })
 	stream := openAITextChunk("before-the-ceiling") + openAIErrorEvent(openAIImageCeilingMessage, "bad_request")
 
-	recorder, apiErr := newOaiStreamHandlerContext(t, stream)
+	recorder, apiErr := newOaiStreamHandlerContext(t, types.RelayFormatOpenAI, stream)
 
 	assert.Nil(t, apiErr)
 	assert.Contains(t, recorder.Body.String(), "before-the-ceiling")
 	assert.Contains(t, recorder.Body.String(), "[DONE]")
+}
+
+// streamsCloseTheWayAnAnswerEnds reports whether the body a handler wrote holds
+// every chunk of the answer once, in the order the upstream wrote them, and no
+// frame that would follow a refusal.
+func streamsCloseTheWayAnAnswerEnds(t *testing.T, relayFormat types.RelayFormat, body string) bool {
+	t.Helper()
+	return strings.Count(body, "chunk-two-before-ceiling") == 1 &&
+		!strings.Contains(body, "[DONE]") &&
+		strings.Index(body, "chunk-one") < strings.Index(body, "chunk-two-before-ceiling")
 }
