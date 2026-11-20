@@ -591,53 +591,195 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 // whether the retry loop recognizes the refusal.
 const claudeImageCeilingReply = `{"type":"error","error":{"type":"invalid_request_error","message":"Total number of images exceeds the maximum allowed of 8."}}`
 
+// claudeImageCeilingStreamReply is the same envelope as an upstream writes it
+// into a stream: an event named for the error, then the envelope on its data
+// line.
+const claudeImageCeilingStreamReply = "event: error\ndata: " + claudeImageCeilingReply + "\n\n"
+
 // TestRelayTranslatesAClaudeEnvelopeImageCeiling covers a Claude client whose
-// non-streaming upstream answers the image ceiling inside the error envelope of
-// the Messages API with a 400. The Claude handler used to raise the envelope as
+// upstream answers the image ceiling inside the error envelope of the Messages
+// API with a 400, on the non-streaming path and on the stream the upstream had
+// already opened with a 2xx. The Claude handlers used to raise the envelope as
 // a 500 whatever the status it arrived with, and the retry loop translates a
-// refusal by the status only, so the client read a 500 it could not act on.
-// The envelope keeps the status the upstream refused it with now, so the client
-// reads the context overflow and the upstream is attempted once.
+// refusal by the status only, so the client read a 500 it could not act on. The
+// stream is the harder path: the keepalive has committed its headers, so the
+// refusal is written as the one error event of the Claude format after
+// everything the client already read.
 func TestRelayTranslatesAClaudeEnvelopeImageCeiling(t *testing.T) {
-	cleanup := allowImageCeilingRelay(t)
-	defer cleanup()
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
 
-	upstream := newImageCeilingUpstream(t, http.StatusBadRequest, claudeImageCeilingReply)
-	defer upstream.server.Close()
-	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
-	defer gateway.Close()
+	for _, tc := range []struct {
+		name   string
+		body   func(t *testing.T) string
+		reply  string
+		stream bool
+	}{
+		{name: "non-streaming", body: func(t *testing.T) string { return imageCeilingClaudeBody(t, 1) }, reply: claudeImageCeilingReply},
+		{name: "streaming", body: func(t *testing.T) string { return imageCeilingClaudeStreamBody(t, 1) }, reply: claudeImageCeilingStreamReply, stream: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanup := allowImageCeilingRelay(t)
+			defer cleanup()
 
-	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeBody(t, 1))
+			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, tc.reply)
+			defer upstream.server.Close()
+			gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
+			defer gateway.Close()
 
-	code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
-	assert.Equal(t, "context_length_exceeded", code)
-	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
-	assertImageOverflowWording(t, message)
-	requireImageCeilingMessageToldOnce(t, message)
-	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+			statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, tc.body(t))
+
+			// The keepalive starts only for an accepted answer, and this
+			// upstream refuses with a 400, so the response headers are still
+			// uncommitted and the client reads the refusal with the status the
+			// upstream refused it with on both paths.
+			require.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+			if tc.stream {
+				assert.NotContains(t, string(payload), "event: error", "a refusal before the stream committed is answered as JSON, not as an event")
+			}
+			code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
+			assert.Equal(t, "context_length_exceeded", code)
+			assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+			assertImageOverflowWording(t, message)
+			requireImageCeilingMessageToldOnce(t, message)
+			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+		})
+	}
 }
 
 // TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind is the counter-case next to
-// the ceiling: an error envelope of another kind keeps the status the upstream
-// answered with and its message, so the change reaches the status only. It is
-// written the way the relay wrote every Claude envelope before this change,
-// which is what the case checks: a translation that widened its status guard
-// would rewrite this reply too.
+// the ceiling: a Claude error envelope of another kind keeps the status the
+// upstream answered with and its own message, on both paths, so the change
+// reaches the status only. It is read the way a client reads a Claude error, the
+// code from error.type and the sentence from error.message; the refusal of the
+// other cases carries context_length_exceeded there instead.
 func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	const envelope = `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: field required"}}`
+	for _, tc := range []struct {
+		name string
+		body func(t *testing.T) string
+	}{
+		{name: "non-streaming", body: func(t *testing.T) string { return imageCeilingClaudeBody(t, 1) }},
+		{name: "streaming", body: func(t *testing.T) string { return imageCeilingClaudeStreamBody(t, 1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanup := allowImageCeilingRelay(t)
+			defer cleanup()
+
+			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, envelope)
+			defer upstream.server.Close()
+			gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
+			defer gateway.Close()
+
+			statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, tc.body(t))
+
+			code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
+			assert.Equal(t, "invalid_request_error", code, "an error of another kind keeps its own type: %s", payload)
+			assert.Equal(t, "max_tokens: field required", message)
+		})
+	}
+}
+
+// TestRelayKeepsAClaudeNonEnvelopeStreamError covers a streaming request whose
+// upstream refuses with a body that is no Claude envelope: the error object of
+// another provider, which service.RelayErrorHandler reads and the translation
+// then recognizes by its wording. The client reads the same context overflow it
+// read before this change, so the envelope reader leaves every answer it does
+// not recognize where it was.
+func TestRelayKeepsAClaudeNonEnvelopeStreamError(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
 	cleanup := allowImageCeilingRelay(t)
 	defer cleanup()
 
 	upstream := newImageCeilingUpstream(t, http.StatusBadRequest,
-		`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: field required"}}`)
+		`{"object":"error","message":"Total number of images exceeds the maximum allowed of 8.","type":"invalid_request_invalid_args","code":"3051"}`)
 	defer upstream.server.Close()
 	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
 	defer gateway.Close()
 
-	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeBody(t, 1))
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeStreamBody(t, 1))
 
-	want := `{"error":{"type":"<nil>","message":"max_tokens: field required (request id: )"},"type":"error"}`
-	assert.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
-	assert.JSONEq(t, want, string(payload))
+	code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
+	assert.Equal(t, "context_length_exceeded", code, "the reply is the one service.RelayErrorHandler produced and the translation read")
+	assert.Equal(t, "Total number of images exceeds the maximum allowed of 8. "+imageCeilingHint+" "+imageCeilingOverflowHint,
+		strings.TrimSuffix(message, " (request id: )"))
+}
+
+// imageCeilingResponsesGateway serves Relay on /v1/responses for a Claude
+// channel, whose adaptor converts the request into the Messages API.
+func imageCeilingResponsesGateway(t *testing.T, upstreamURL string) *httptest.Server {
+	t.Helper()
+	engine := gin.New()
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		selectDistributorChannelOfType(c, upstreamURL, 0, constant.ChannelTypeAnthropic)
+		Relay(c, types.RelayFormatOpenAIResponses)
+	})
+	return httptest.NewServer(engine)
+}
+
+// postResponsesImageCeiling sends a /v1/responses request carrying one text
+// turn, streaming or not.
+func postResponsesImageCeiling(t *testing.T, gatewayURL string, stream bool) (int, []byte) {
+	t.Helper()
+	body := `{"model":"mistral-large-latest","stream":` + strconv.FormatBool(stream) + `,"input":"look"}`
+	response, err := http.Post(gatewayURL+"/v1/responses", "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	return response.StatusCode, payload
+}
+
+// TestRelayTranslatesAClaudeEnvelopeImageCeilingForResponses covers a
+// /v1/responses client on a Claude channel: the upstream answers the envelope of
+// the Messages API with a 400, which ResponsesHelper used to hand to
+// service.RelayErrorHandler, whose OpenAI envelope reads no type out of it and
+// answered bad_response_status_code. The envelope is read with the upstream's
+// status now, so the client reads the context overflow it reads on the other
+// routes, and the upstream is attempted once.
+//
+// The request carries a text turn, not images: dto.RequestImageCount answers
+// zero for an OpenAI Responses request on a Claude channel, because the channel
+// converts the body itself, so the ceiling reaches the relay as the upstream's
+// own refusal, which is exactly the path this case covers.
+func TestRelayTranslatesAClaudeEnvelopeImageCeilingForResponses(t *testing.T) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	for _, stream := range []bool{false, true} {
+		t.Run("stream="+strconv.FormatBool(stream), func(t *testing.T) {
+			cleanup := allowImageCeilingRelay(t)
+			defer cleanup()
+
+			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, claudeImageCeilingStreamReply)
+			defer upstream.server.Close()
+			gateway := imageCeilingResponsesGateway(t, upstream.server.URL)
+			defer gateway.Close()
+
+			statusCode, payload := postResponsesImageCeiling(t, gateway.URL, stream)
+
+			var body struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			require.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+			require.NoError(t, json.Unmarshal(payload, &body), "a refusal before the stream started is a JSON error: %s", payload)
+			assert.Equal(t, "context_length_exceeded", body.Error.Code)
+			assertImageOverflowWording(t, body.Error.Message)
+			requireImageCeilingMessageToldOnce(t, body.Error.Message)
+			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+		})
+	}
 }
 
 // imageCeilingGeminiChunk is the native Gemini event the upstream of the
