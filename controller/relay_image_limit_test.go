@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -71,6 +72,7 @@ func TestRelayRefusesTheImagePastTheChannelLimit(t *testing.T) {
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
 	assert.Equal(t, "context_length_exceeded", body.Error.Code)
 	assert.Contains(t, body.Error.Message, "Total number of images (21) exceeds the maximum allowed of 20")
+	assertImageOverflowWording(t, body.Error.Message)
 	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
 }
 
@@ -139,6 +141,7 @@ func TestRelayRefusesTheImagesPastALowerChannelLimit(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &body))
 	assert.Equal(t, "context_length_exceeded", body.Error.Code)
 	assert.Contains(t, body.Error.Message, "Total number of images (20) exceeds the maximum allowed of 19")
+	assertImageOverflowWording(t, body.Error.Message)
 	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
 }
 
@@ -173,6 +176,7 @@ func TestRelayRefusesTheImagePastTheModelLimit(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &body))
 	assert.Equal(t, "context_length_exceeded", body.Error.Code)
 	assert.Contains(t, body.Error.Message, "Total number of images (9) exceeds the maximum allowed of 8")
+	assertImageOverflowWording(t, body.Error.Message)
 	assert.Equal(t, int32(0), upstream.attempts.Load(), "the channel-wide 20 never lets the request out")
 
 	// 21 images pass the model limit and the channel limit both, so the
@@ -185,6 +189,7 @@ func TestRelayRefusesTheImagePastTheModelLimit(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, sent.StatusCode, "response body: %s", payload)
 	require.NoError(t, json.Unmarshal(payload, &body))
 	assert.Contains(t, body.Error.Message, "Total number of images (21) exceeds the maximum allowed of 20")
+	assertImageOverflowWording(t, body.Error.Message)
 	assert.Equal(t, int32(0), upstream.attempts.Load())
 }
 
@@ -400,6 +405,19 @@ const commandCodeTurnCeilingReply = `{"error":{"message":"This turn adds 20 imag
 // new-api refused the request itself or translated the upstream's refusal.
 const imageCeilingHint = "Request a smaller batch of images or compact the conversation and retry."
 
+// imageCeilingWording is the phrase that makes a client read a 400 as a context
+// overflow. Kimi Code 2.4.1 on Chat Completions matches its message against
+// /context[ _-]?length/i and never reads error.code, so every image refusal has
+// to carry this phrase next to the code.
+var imageCeilingWording = regexp.MustCompile(`(?i)context[ _-]?length`)
+
+// assertImageOverflowWording checks the body a client reads carries the phrase
+// it classifies a context overflow by.
+func assertImageOverflowWording(t *testing.T, message string) {
+	t.Helper()
+	assert.Regexp(t, imageCeilingWording, message, "the client finds the context length limit in the message it reads")
+}
+
 // imageCeilingUpstream answers every attempt with a fixed status and body and
 // counts the attempts, so a test can tell how many times the upstream was
 // called and whether a retry happened.
@@ -543,6 +561,7 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 			assert.Equal(t, "context_length_exceeded", code)
 			assert.Contains(t, message, tc.ceiling, "the ceiling the upstream named reaches the client")
 			assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
+			assertImageOverflowWording(t, message)
 			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
 		})
 	}
@@ -577,6 +596,7 @@ func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
 	assert.Equal(t, "context_length_exceeded", code)
 	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
 	assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
+	assertImageOverflowWording(t, message)
 	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
 }
 

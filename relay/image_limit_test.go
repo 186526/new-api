@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,7 +126,8 @@ func TestCheckRequestImageLimitRejectsPastTheLimit(t *testing.T) {
 				assert.Equal(t, apiErr.GetErrorCode(), apiErr.ToOpenAIError().Code)
 				assert.Equal(t,
 					"Total number of images ("+strconv.Itoa(images)+") exceeds the maximum allowed of 20. "+
-						"Request a smaller batch of images or compact the conversation and retry.",
+						"Request a smaller batch of images or compact the conversation and retry. "+
+						"Request exceeds the context length limit; compact the conversation before retrying it.",
 					apiErr.Error())
 			}
 		})
@@ -240,7 +242,8 @@ func TestCheckRequestImageLimitAnswersWithTopLevelErrorCode(t *testing.T) {
 	assert.Equal(t, "context_length_exceeded", body.Error.Code)
 	assert.Equal(t, "invalid_request_error", body.Error.Type)
 	assert.Equal(t, "Total number of images (21) exceeds the maximum allowed of 20. "+
-		"Request a smaller batch of images or compact the conversation and retry.", body.Error.Message)
+		"Request a smaller batch of images or compact the conversation and retry. "+
+		"Request exceeds the context length limit; compact the conversation before retrying it.", body.Error.Message)
 }
 
 func TestCheckRequestImageLimitForModelsPrefersTheModelLimit(t *testing.T) {
@@ -474,7 +477,7 @@ func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T
 			assert.Equal(t, imageLimitErrorCode, apiErr.GetErrorCode())
 			assert.True(t, types.IsSkipRetryError(apiErr))
 			assert.False(t, types.IsChannelError(apiErr), "the channel is not at fault for the request's image count")
-			assert.Equal(t, tc.message+" "+imageLimitRetryHint, apiErr.Error())
+			assert.Equal(t, imageLimitMessage(tc.message), apiErr.Error())
 			assert.Contains(t, apiErr.Error(), tc.ceiling, "the ceiling the upstream named stays in the message")
 			openAIError := apiErr.ToOpenAIError()
 			assert.Equal(t, "invalid_request_error", openAIError.Type)
@@ -514,7 +517,7 @@ func TestTranslateUpstreamImageLimitErrorReadsTheUpstreamJSONBody(t *testing.T) 
 	assert.Contains(t, translated.Error(), "deepseek-v4.1-flash-dedicated takes at most 8 new images per turn",
 		"the ceiling the upstream named stays in the message")
 	assert.Contains(t, translated.Error(), imageLimitRetryHint)
-	assert.Equal(t, commandCodeTurnCeilingMessage+" "+imageLimitRetryHint, translated.Error())
+	assert.Equal(t, commandCodeTurnCeilingMessage+" "+imageLimitRetryHint+" "+imageLimitContextOverflowHint, translated.Error())
 	assert.True(t, types.IsSkipRetryError(translated))
 }
 
@@ -587,14 +590,15 @@ func TestTranslateUpstreamImageLimitErrorKeepsOtherErrors(t *testing.T) {
 // TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow covers a
 // reply the upstream already coded as a context overflow: the client needs no
 // new code, but the action stays missing from the upstream's sentence, so the
-// translation adds it and makes the error skip the retry.
+// translation adds it and makes the error skip the retry. The client still
+// reads the context overflow from the message, whatever the code says.
 func TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow(t *testing.T) {
-	upstreamMessage := "Total number of images exceeds the maximum allowed of 8."
+	upstreamMessage := "Total number of images (9) exceeds the maximum allowed of 8."
 	apiErr := upstreamImageLimitError(http.StatusBadRequest, upstreamMessage, imageLimitErrorCode)
 	translated := TranslateUpstreamImageLimitError(apiErr)
 	require.NotNil(t, translated)
 	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode())
-	assert.Equal(t, upstreamMessage+" "+imageLimitRetryHint, translated.Error())
+	assert.Equal(t, imageLimitMessage(upstreamMessage), translated.Error())
 	assert.True(t, types.IsSkipRetryError(translated))
 }
 
@@ -622,7 +626,7 @@ func TestTranslateUpstreamImageLimitErrorKeepsChannelFaults(t *testing.T) {
 // rebuild cannot hand out a key the envelope would have hidden.
 func TestTranslateUpstreamImageLimitErrorMasksTheKeyItRepeats(t *testing.T) {
 	upstreamURL := "https://api.mistral.ai"
-	upstreamMessage := "Invalid base url: https://user:KEY@host. Total number of images exceeds the maximum allowed of 8."
+	upstreamMessage := "Invalid base url: https://user:KEY@host. Total number of images (9) exceeds the maximum allowed of 8."
 	apiErr := upstreamImageLimitError(http.StatusBadRequest, upstreamMessage, "3051")
 
 	translated := TranslateUpstreamImageLimitError(apiErr)
@@ -631,7 +635,7 @@ func TestTranslateUpstreamImageLimitErrorMasksTheKeyItRepeats(t *testing.T) {
 	untranslated := apiErr.ToOpenAIError(upstreamURL).Message
 	assert.NotContains(t, untranslated, "KEY", "the envelope masks the credential without the translation")
 	assert.NotContains(t, translated.Error(), "KEY", "the translated message is masked before it is rebuilt")
-	assert.Equal(t, strings.TrimSpace(untranslated)+" "+imageLimitRetryHint, translated.Error(),
+	assert.Equal(t, strings.TrimSpace(untranslated)+" "+imageLimitRetryHint+" "+imageLimitContextOverflowHint, translated.Error(),
 		"the translated message is the masked text the client would have read, plus the hint")
 	assert.Equal(t, translated.Error(), translated.ToOpenAIError(upstreamURL).Message,
 		"masking the translated message again changes nothing")
@@ -646,4 +650,61 @@ func TestCheckRequestImageLimitForModelsLeavesAnUnlimitedChannel(t *testing.T) {
 	zeroed := dto.ChannelSettings{MaxImagesPerModel: map[string]int{imageLimitMappedAlias: 0}}
 	assert.Nil(t, CheckRequestImageLimitForModels(request, types.RelayFormatOpenAI, zeroed, "", 1, "mistral", imageLimitMappedAlias),
 		"a model configured with a zero limit stays unlimited")
+}
+
+// contextOverflowWording is the pattern Kimi Code 2.4.1 compacts a 400 on: a
+// Chat Completions reply enters its context overflow path only when the message
+// matches one of its patterns, among them this one, and the reply's
+// error.code is not read on that path.
+var contextOverflowWording = regexp.MustCompile(`(?i)context[ _-]?length`)
+
+// previousImageLimitMessage is the refusal as it read before the wording was
+// added: the ceiling, the action, and the context-length code on the envelope.
+// Kimi Code 2.4.1 answered it with `provider.api_error: 400 ...` and exit 1
+// against a mock upstream, and the same body carrying contextOverflowWording
+// compacted, retried and exited 0, so the tests below fail if a refusal ever
+// reads like this again.
+func previousImageLimitMessage(ceiling string) string {
+	return ceiling + " " + imageLimitRetryHint
+}
+
+// TestImageLimitRefusalReadsAsAContextOverflow covers both refusals: the one
+// new-api makes before the upstream sees the request, and the one it writes from
+// the upstream's own reply. Each keeps its ceiling and the action, reads the
+// same HTTP status and code, and carries the context length limit the client
+// scans for.
+func TestImageLimitRefusalReadsAsAContextOverflow(t *testing.T) {
+	localCeiling := "Total number of images (21) exceeds the maximum allowed of 20."
+	local := refuseImagesPastLimit(21, 20, 1, "mistral", imageLimitTestModel)
+	translated := TranslateUpstreamImageLimitError(upstreamImageLimitError(
+		http.StatusBadRequest, commandCodeTurnCeilingMessage, "bad_request"))
+
+	for name, apiErr := range map[string]*types.NewAPIError{"local refusal": local, "translated upstream refusal": translated} {
+		t.Run(name, func(t *testing.T) {
+			require.NotNil(t, apiErr)
+			message := apiErr.Error()
+			assert.Regexp(t, contextOverflowWording, message, "the client finds the context length limit in the message")
+			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+			assert.Equal(t, imageLimitErrorCode, apiErr.GetErrorCode())
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.Contains(t, message, imageLimitRetryHint)
+		})
+	}
+	assert.True(t, strings.HasPrefix(local.Error(), localCeiling),
+		"the ceiling opens the message, so the context length limit shares its sentence")
+	assert.Contains(t, translated.Error(), "takes at most 8 new images per turn",
+		"the upstream's own per-turn ceiling stays in the translated message")
+}
+
+// TestPreviousImageLimitWordingDoesNotReadAsAContextOverflow is the
+// counter-case: the message as it read before, with the same ceiling and hint
+// and the same context-length code on the envelope, is not matched by the
+// client's pattern. A refusal that reads this way keeps the behavior measured
+// against Kimi Code 2.4.1: the client fails on the 400 and never compacts.
+func TestPreviousImageLimitWordingDoesNotReadAsAContextOverflow(t *testing.T) {
+	previous := upstreamImageLimitError(http.StatusBadRequest, previousImageLimitMessage("Total number of images (21) exceeds the maximum allowed of 20."), imageLimitErrorCode)
+	assert.Equal(t, imageLimitErrorCode, previous.GetErrorCode(), "the counter-case carries the code the old refusal carried")
+	assert.NotRegexp(t, contextOverflowWording, previous.Error(), "the old wording is what the client failed on")
+	assert.NotRegexp(t, contextOverflowWording, imageLimitRetryHint,
+		"the sentence carrying the wording is the added one, not the hint both refusals already carried")
 }

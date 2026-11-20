@@ -16,16 +16,38 @@ import (
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 )
 
-// imageLimitErrorCode is the error code a client treats as a context
+// imageLimitErrorCode is the error code a client may treat as a context
 // overflow: it compacts the conversation and resends the request without the
 // compacted images, so a request refused for its image count succeeds once
 // the conversation is compacted.
+//
+// The code alone does not reach every client. Kimi Code 2.4.1 on the Chat
+// Completions path reads a 400 as a context overflow only when its message
+// matches /context[ _-]?length/i and never looks at error.code, so an image
+// refusal must carry the wording below as well as this code.
 const imageLimitErrorCode types.ErrorCode = "context_length_exceeded"
 
 // imageLimitRetryHint closes every image refusal with the same action, whether
 // new-api refused the request before the upstream saw it or wrote it from the
 // upstream's own refusal.
 const imageLimitRetryHint = "Request a smaller batch of images or compact the conversation and retry."
+
+// imageLimitContextOverflowHint names the refusal as a context length limit,
+// the phrase a client scans a 400 message for before it compacts the
+// conversation. Kimi Code 2.4.1 against a mock upstream answered a refusal
+// carrying only error.code `context_length_exceeded` with
+// `provider.api_error: 400 ...` and exited 1, and the same reply carrying this
+// phrase in its message took the context overflow path, compacted, retried and
+// exited 0. OpenAI-compatible clients that do read the code lose nothing: the
+// code stays on the error.
+const imageLimitContextOverflowHint = "Request exceeds the context length limit; compact the conversation before retrying it."
+
+// imageLimitMessage is the message of every image refusal: the sentence naming
+// the ceiling, the action, and the phrase the client reads as a context
+// overflow.
+func imageLimitMessage(ceiling string) string {
+	return ceiling + " " + imageLimitRetryHint + " " + imageLimitContextOverflowHint
+}
 
 // upstreamImageLimitWordings lists the wordings measured on the upstreams that
 // refuse a request for its image count, in the order they are tried. A wording
@@ -77,12 +99,9 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 		return nil
 	}
 	appmetrics.ObserveImageLimitRejection(channelName, channelId, model)
-	message := fmt.Sprintf(
-		"Total number of images (%d) exceeds the maximum allowed of %d. %s",
-		images, limit, imageLimitRetryHint,
-	)
+	ceiling := fmt.Sprintf("Total number of images (%d) exceeds the maximum allowed of %d.", images, limit)
 	return types.WithOpenAIError(types.OpenAIError{
-		Message: message,
+		Message: imageLimitMessage(ceiling),
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -113,7 +132,7 @@ func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError
 		return err
 	}
 	return types.WithOpenAIError(types.OpenAIError{
-		Message: strings.TrimSpace(err.MaskSensitiveError()) + " " + imageLimitRetryHint,
+		Message: imageLimitMessage(strings.TrimSpace(err.MaskSensitiveError())),
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
