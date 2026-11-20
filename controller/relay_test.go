@@ -39,6 +39,7 @@ const relayErrorMessage = "upstream closed the body after 200"
 var relayErrorFormats = []types.RelayFormat{
 	types.RelayFormatOpenAI,
 	types.RelayFormatClaude,
+	types.RelayFormatOpenAIResponses,
 	types.RelayFormatGemini,
 }
 
@@ -147,6 +148,10 @@ func assertOneErrorFrame(t *testing.T, format types.RelayFormat, body string) {
 	switch format {
 	case types.RelayFormatClaude:
 		require.Contains(t, body, "event: error\n")
+		require.NotContains(t, body, "data: [DONE]")
+	case types.RelayFormatOpenAIResponses:
+		require.Contains(t, body, `data: {"response":{"error":`)
+		require.Contains(t, body, `"type":"response.failed"`)
 		require.NotContains(t, body, "data: [DONE]")
 	default:
 		require.Contains(t, body, `data: {"error":`)
