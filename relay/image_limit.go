@@ -32,7 +32,7 @@ const imageLimitRetryHint = "Request a smaller batch of images or compact the co
 // allowed of 8.` The count the upstream read is not part of the match, so a
 // session or plan named in the sentence, or a second sentence after it, still
 // matches.
-var upstreamImageLimitPattern = regexp.MustCompile(`(?i)images?\b[^.]*?\bexceeds\b[^.]*?\bmaximum allowed\b`)
+var upstreamImageLimitPattern = regexp.MustCompile(`(?i)images?\b[^.]*?\bexceeds?\b[^.]*?\bmaximum allowed\b`)
 
 // CheckRequestImageLimit refuses a request that carries more image
 // occurrences than the limit of the model it is sent to. The limit is the
@@ -77,8 +77,10 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 // retry and names no channel fault: the channel stays enabled.
 //
 // The message keeps the upstream wording and its own limit, so the client and
-// the operator both see what the upstream allowed. An error of another kind
-// is returned unchanged.
+// the operator both see what the upstream allowed. The wording is read through
+// MaskSensitiveError, so a key the upstream echoes is masked the same way the
+// envelope masks it. An error of another kind, including one that names a
+// channel fault, is returned unchanged.
 func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError {
 	if err == nil || err.StatusCode != http.StatusBadRequest {
 		return err
@@ -88,8 +90,15 @@ func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError
 	if service.RelayErrorSource(err) != "upstream" || !upstreamImageLimitPattern.MatchString(err.Error()) {
 		return err
 	}
+	// A body that names a channel fault keeps its own code, so the channel is
+	// still disabled the way the upstream asked for. RelayErrorSource already
+	// answers "channel" for such an error, which the source guard above turns
+	// away, and IsChannelError repeats that answer for a reader of this file.
+	if types.IsChannelError(err) {
+		return err
+	}
 	return types.WithOpenAIError(types.OpenAIError{
-		Message: strings.TrimSpace(err.Error()) + " " + imageLimitRetryHint,
+		Message: strings.TrimSpace(err.MaskSensitiveError()) + " " + imageLimitRetryHint,
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())

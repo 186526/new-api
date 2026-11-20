@@ -441,6 +441,7 @@ func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T
 		{name: "singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8."},
 		{name: "count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8."},
 		{name: "second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request."},
+		{name: "plural verb", code: "3051", message: "Total number of images exceed the maximum allowed of 8."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			apiErr := TranslateUpstreamImageLimitError(upstreamImageLimitError(http.StatusBadRequest, tc.message, tc.code))
@@ -503,6 +504,21 @@ func TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow(t *testing.T)
 	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode())
 	assert.Equal(t, upstreamMessage+" "+imageLimitRetryHint, translated.Error())
 	assert.True(t, types.IsSkipRetryError(translated))
+}
+
+// TestTranslateUpstreamImageLimitErrorKeepsChannelFaults covers a reply that
+// names the image ceiling and also reports a channel fault: the channel code
+// keeps its meaning so the relay can still disable the channel.
+func TestTranslateUpstreamImageLimitErrorKeepsChannelFaults(t *testing.T) {
+	apiErr := types.WithOpenAIError(types.OpenAIError{
+		Message: "Total number of images exceeds the maximum allowed of 8.",
+		Type:    "invalid_request_invalid_args",
+		Code:    types.ErrorCodeChannelParamOverrideInvalid,
+	}, http.StatusBadRequest)
+	assert.True(t, types.IsChannelError(apiErr))
+	translated := TranslateUpstreamImageLimitError(apiErr)
+	assert.Same(t, apiErr, translated, "a channel fault is not rewritten into the client's image count")
+	assert.True(t, types.IsChannelError(translated))
 }
 
 // A channel without any image limit refuses nothing, including through the
