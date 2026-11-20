@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/pkg/metrics"
@@ -519,6 +520,28 @@ func TestTranslateUpstreamImageLimitErrorKeepsChannelFaults(t *testing.T) {
 	translated := TranslateUpstreamImageLimitError(apiErr)
 	assert.Same(t, apiErr, translated, "a channel fault is not rewritten into the client's image count")
 	assert.True(t, types.IsChannelError(translated))
+}
+
+// TestTranslateUpstreamImageLimitErrorMasksTheKeyItRepeats covers an upstream
+// that echoes a credential in the same sentence as the ceiling. The client
+// reads exactly what the untranslated error would have been masked to, so the
+// rebuild cannot hand out a key the envelope would have hidden.
+func TestTranslateUpstreamImageLimitErrorMasksTheKeyItRepeats(t *testing.T) {
+	upstreamURL := "https://api.mistral.ai"
+	upstreamMessage := "Invalid base url: https://user:KEY@host. Total number of images exceeds the maximum allowed of 8."
+	apiErr := upstreamImageLimitError(http.StatusBadRequest, upstreamMessage, "3051")
+
+	translated := TranslateUpstreamImageLimitError(apiErr)
+	require.NotSame(t, apiErr, translated, "the ceiling sentence is still recognized")
+
+	untranslated := apiErr.ToOpenAIError(upstreamURL).Message
+	assert.NotContains(t, untranslated, "KEY", "the envelope masks the credential without the translation")
+	assert.NotContains(t, translated.Error(), "KEY", "the translated message is masked before it is rebuilt")
+	assert.Equal(t, strings.TrimSpace(untranslated)+" "+imageLimitRetryHint, translated.Error(),
+		"the translated message is the masked text the client would have read, plus the hint")
+	assert.Equal(t, translated.Error(), translated.ToOpenAIError(upstreamURL).Message,
+		"masking the translated message again changes nothing")
+	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode())
 }
 
 // A channel without any image limit refuses nothing, including through the

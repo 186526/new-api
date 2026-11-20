@@ -261,10 +261,14 @@ func imageLimitRelayGateway(t *testing.T, upstreamURL string, imageLimit int) *h
 }
 
 func selectDistributorChannel(c *gin.Context, upstreamURL string, imageLimit int) {
+	selectDistributorChannelOfType(c, upstreamURL, imageLimit, constant.ChannelTypeMistral)
+}
+
+func selectDistributorChannelOfType(c *gin.Context, upstreamURL string, imageLimit int, channelType int) {
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, "mistral-large-latest")
 	common.SetContextKey(c, constant.ContextKeyChannelId, imageLimitRelayChannelId)
 	common.SetContextKey(c, constant.ContextKeyChannelName, "mistral")
-	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeMistral)
+	common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
 	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{MaxImagesPerRequest: imageLimit})
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstreamURL)
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "image-limit-test-key")
@@ -515,6 +519,41 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 		})
 	}
 }
+
+// TestRelayTranslatesAnUpstreamImageCeilingForGemini covers a Gemini channel
+// that streams a native answer to an upstream which refuses the request for
+// its image count with the measured body. The client reads the context
+// overflow the other formats read, and the upstream is attempted once.
+func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest, imageCeilingReply)
+	defer upstream.server.Close()
+	engine := gin.New()
+	engine.POST("/v1beta/models/:model", func(c *gin.Context) {
+		selectDistributorChannelOfType(c, upstream.server.URL, 0, constant.ChannelTypeGemini)
+		Relay(c, types.RelayFormatGemini)
+	})
+	gateway := httptest.NewServer(engine)
+	defer gateway.Close()
+
+	path := "/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse"
+	response, err := http.Post(gateway.URL+path, "application/json", strings.NewReader(imageCeilingGeminiBody))
+	require.NoError(t, err)
+	defer response.Body.Close()
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, response.StatusCode, payload)
+	assert.Equal(t, "context_length_exceeded", code)
+	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+	assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// imageCeilingGeminiBody is a native Gemini request carrying a text turn.
+const imageCeilingGeminiBody = `{"contents":[{"role":"user","parts":[{"text":"look"}]}]}`
 
 // TestRelayKeepsAnUpstreamImageCeilingTheTranslationMisses is the counter-case:
 // an upstream 400 that does not name an image ceiling keeps its own code, so
