@@ -2,6 +2,7 @@ package claude
 
 import (
 	"cmp"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,12 +87,44 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	return relayconvert.FormatClaudeResponseInfo(claudeResponse, oaiResponse, claudeInfo)
 }
 
+// imageCeilingRefusal translates an error event of a stream that refuses the
+// request for its image count into the local image refusal of the relay format
+// the client asked for, or returns nil for an event of another kind. It is
+// registered by the relay package, which holds the wording and imports this
+// package: the claude package cannot import it back. A nil hook leaves an event
+// to the error the handler reads from it.
+var imageCeilingRefusal func(relayFormat types.RelayFormat, event string) *types.NewAPIError
+
+// SetImageCeilingRefusal registers the translation and returns the previous one
+// for tests to restore.
+func SetImageCeilingRefusal(translate func(relayFormat types.RelayFormat, event string) *types.NewAPIError) func(relayFormat types.RelayFormat, event string) *types.NewAPIError {
+	previous := imageCeilingRefusal
+	imageCeilingRefusal = translate
+	return previous
+}
+
+// ImageCeilingRefusalFor returns the refusal an event carries, or nil for every
+// other event. Only a JSON document is read; a refusal is a JSON object, and
+// the translation answers nil for a document that does not unpack as an error.
+func ImageCeilingRefusalFor(relayFormat types.RelayFormat, data string) *types.NewAPIError {
+	if imageCeilingRefusal == nil || !json.Valid([]byte(data)) {
+		return nil
+	}
+	return imageCeilingRefusal(relayFormat, data)
+}
+
 func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
 		common.SysLog(common.LogText("error unmarshalling stream response: %s", err.Error()))
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
+	}
+	// A refusal the handler translates is returned alone: the controller writes
+	// it as the one error event of the relay, after the events before it.
+	refusal := ImageCeilingRefusalFor(claudeStreamRelayFormat(info), data)
+	if refusal != nil {
+		return refusal
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
@@ -343,6 +376,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		Usage:        &dto.Usage{},
 	}
 	var err *types.NewAPIError
+	// The keepalive usually commits the stream before the first event is read,
+	// so a refusal it carries cannot have a status code. HandleStreamResponseData
+	// returns a refusal it translates, which is returned alone: the controller
+	// writes it as the one error event of the relay after the events before it.
+	// Any other error stops the scanner and is returned the way it always was.
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
@@ -462,4 +500,14 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 		return nil, handleErr
 	}
 	return claudeInfo.Usage, nil
+}
+
+// claudeStreamRelayFormat is the format the client asked for, which the relay
+// writes an error of the stream in. A stream without relay state cannot name
+// one, and its client reads the Claude envelope.
+func claudeStreamRelayFormat(info *relaycommon.RelayInfo) types.RelayFormat {
+	if info == nil {
+		return types.RelayFormatClaude
+	}
+	return info.RelayFormat
 }

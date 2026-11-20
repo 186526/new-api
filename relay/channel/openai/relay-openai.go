@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,6 +102,31 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 	return helper.ObjectData(c, lastStreamResponse)
 }
 
+// imageCeilingRefusal translates an error event of a stream that refuses the
+// request for its image count into the local image refusal, or returns nil for
+// an event of another kind. It is registered by the relay package, which holds
+// the wording and imports this package: the openai package cannot import it
+// back. A nil hook leaves an event to the error the handler reads from it.
+var imageCeilingRefusal func(event string) *types.NewAPIError
+
+// SetImageCeilingRefusal registers the translation and returns the previous one
+// for tests to restore.
+func SetImageCeilingRefusal(translate func(event string) *types.NewAPIError) func(event string) *types.NewAPIError {
+	previous := imageCeilingRefusal
+	imageCeilingRefusal = translate
+	return previous
+}
+
+// ImageCeilingRefusalFor returns the refusal an event carries, or nil for every
+// other event. Only a JSON document is read; a refusal is a JSON object, and
+// the translation answers nil for a document that does not unpack as an error.
+func ImageCeilingRefusalFor(data string) *types.NewAPIError {
+	if imageCeilingRefusal == nil || !json.Valid([]byte(data)) {
+		return nil
+	}
+	return imageCeilingRefusal(data)
+}
+
 func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, common.LogText("invalid response or response body"))
@@ -125,8 +151,18 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
+	var refusal *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		// Each chunk is forwarded one event late, so an event is still the last
+		// one read when the next arrives. An image refusal is read before that
+		// chunk goes out: it is returned to the controller, which writes the one
+		// error event of the relay, and the stream stops there.
+		if refusalErr := ImageCeilingRefusalFor(data); refusalErr != nil {
+			refusal = refusalErr
+			sr.Stop(refusalErr)
+			return
+		}
 		if lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog(common.LogText("error handling stream format: %s", err.Error()))
@@ -148,6 +184,15 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	})
 
 	info.StreamStatus.RequireTerminal()
+	if refusal != nil {
+		// The chunk the refusal follows is still the last one read, and the
+		// handler writes it here as the tail of its stream: the refusal then
+		// follows every chunk of the answer it was raised after.
+		if info.RelayFormat == types.RelayFormatOpenAI && lastStreamData != "" {
+			_ = sendStreamData(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+		}
+		return nil, refusal
+	}
 
 	// 处理最后的响应
 	shouldSendLastResp := true

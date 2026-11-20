@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,7 +11,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -115,13 +118,100 @@ func NamesUpstreamImageLimit(text string) bool {
 	return upstreamImageLimitPattern.MatchString(text)
 }
 
-// init hands the ceiling wording and the builder of a refusal to the native
-// Gemini stream, which reads the first event of a stream before its headers go
-// out. The gemini package cannot import this one: this package imports every
-// adaptor, so the adaptor registers both here instead.
+// init hands the image refusal to the stream handlers of every adaptor that
+// reads one. Those packages cannot import this one: this package imports every
+// adaptor, so each adaptor registers its hook here instead. A handler whose
+// hook is unregistered streams an event as it always did.
 func init() {
 	gemini.SetStreamRefusalNamesCeiling(NamesUpstreamImageLimit)
 	gemini.SetStreamRefusalError(upstreamImageLimitRefusal)
+	claude.SetImageCeilingRefusal(translateClaudeImageCeiling)
+	openai.SetImageCeilingRefusal(translateOpenAIImageCeiling)
+}
+
+// translateClaudeImageCeiling is the refusal a Claude event stream carried,
+// read as the 400 the upstream would have answered with. The handler returns it
+// to the controller, whose writeRelayStreamError writes it as an error event of
+// the format the client asked for, like the error of any failed attempt. An
+// event that names no image ceiling is left to the error the handler reads from
+// it, so only the refusal is rewritten.
+func translateClaudeImageCeiling(relayFormat types.RelayFormat, event string) *types.NewAPIError {
+	refusal := upstreamImageLimitRefusal(event)
+	if !NamesUpstreamImageLimit(refusal.Error()) {
+		return nil
+	}
+	return relayFormatImageLimitRefusal(relayFormat, TranslateUpstreamImageLimitError(refusal))
+}
+
+// relayFormatImageLimitRefusal reads a refused event stream in the envelope of
+// the relay format the client asked for. writeRelayStreamError writes the error
+// it is given as that format's own error, so the code is kept where the format
+// reads it: a Claude error has no code field of its own, and its type is the
+// field a client reads as the code. Every other format, the OpenAI one included,
+// reads the error object of the relay and is left as it is.
+func relayFormatImageLimitRefusal(relayFormat types.RelayFormat, refusal *types.NewAPIError) *types.NewAPIError {
+	if refusal == nil || (relayFormat != types.RelayFormatClaude && relayFormat != types.RelayFormatGemini) {
+		return refusal
+	}
+	openAIError := refusal.ToOpenAIError()
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: openAIError.Message,
+		Type:    openAIError.Type,
+		Code:    imageLimitErrorCode,
+	}, refusal.StatusCode, types.ErrOptionWithSkipRetry())
+}
+
+// openAIImageCeilingRefusal reads an OpenAI event stream's refusal. A chunk
+// that names an image ceiling is a refusal whatever its code says, because the
+// chunks before it made the upstream's answer; every other error is left to the
+// caller, which raises it with the code the upstream gave it.
+func translateOpenAIImageCeiling(event string) *types.NewAPIError {
+	apiErr := streamEventError(event)
+	if !NamesUpstreamImageLimit(apiErr.Error()) {
+		return nil
+	}
+	return TranslateUpstreamImageLimitError(apiErr)
+}
+
+// streamEventError is an error event read with the code the upstream gave it.
+// The relay reaches the translation of an image refusal by error code, so every
+// error code the relay reads is kept on the error: the upstream's own code when
+// its error object carries one, and the code the relay gives a body that names
+// none. The code is a string, the shape both the envelope of the upstream and
+// the error the relay writes carry. The message is the one sentence of the
+// error object, so an envelope never reaches the client.
+func streamEventError(event string) *types.NewAPIError {
+	apiErr := upstreamImageLimitRefusal(event)
+	openAIError := types.OpenAIError{
+		Message: apiErr.Error(),
+		Type:    "upstream_error",
+	}
+	var errResponse dto.GeneralErrorResponse
+	if err := common.Unmarshal([]byte(event), &errResponse); err == nil {
+		if upstreamError := errResponse.TryToOpenAIError(); upstreamError != nil {
+			openAIError.Type = cmp.Or(upstreamError.Type, openAIError.Type)
+			openAIError.Param = upstreamError.Param
+			openAIError.Code = upstreamErrorCode(upstreamError.Code)
+		}
+		if sentence := streamEventSentence(event); sentence != "" {
+			openAIError.Message = sentence
+		}
+	}
+	return types.WithOpenAIError(openAIError, http.StatusBadRequest)
+}
+
+// upstreamErrorCode is the code of an upstream error as a string, which is what
+// both error envelopes carry.
+func upstreamErrorCode(code any) string {
+	switch value := code.(type) {
+	case nil:
+		return string(types.ErrorCodeBadResponseStatusCode)
+	case string:
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return fmt.Sprint(code)
 }
 
 // upstreamImageLimitRefusal builds the error of the image refusal an event of a
@@ -137,13 +227,24 @@ func init() {
 // may read it by.
 func upstreamImageLimitRefusal(event string) *types.NewAPIError {
 	message := strings.TrimSpace(event)
-	var errResponse dto.GeneralErrorResponse
-	if err := common.Unmarshal([]byte(event), &errResponse); err == nil {
-		if sentence := strings.TrimSpace(errResponse.ToMessage()); sentence != "" && upstreamImageLimitPattern.MatchString(sentence) {
-			message = sentence
-		}
+	// The sentence is kept on its own only when it names the ceiling. Every
+	// other event is not a refusal, and the handler reads it by its error
+	// object anyway, so collapsing one to its message would let a chunk
+	// naming the event of an image ceiling read as a refusal twice.
+	if sentence := streamEventSentence(event); sentence != "" && upstreamImageLimitPattern.MatchString(sentence) {
+		message = sentence
 	}
 	return types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest)
+}
+
+// streamEventSentence is the sentence of the error object an event carries, or
+// an empty string when it carries none.
+func streamEventSentence(event string) string {
+	var errResponse dto.GeneralErrorResponse
+	if err := common.Unmarshal([]byte(event), &errResponse); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(errResponse.ToMessage())
 }
 
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image
