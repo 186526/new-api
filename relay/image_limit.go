@@ -27,12 +27,30 @@ const imageLimitErrorCode types.ErrorCode = "context_length_exceeded"
 // upstream's own refusal.
 const imageLimitRetryHint = "Request a smaller batch of images or compact the conversation and retry."
 
+// upstreamImageLimitWordings lists the wordings measured on the upstreams that
+// refuse a request for its image count, in the order they are tried. A wording
+// must name the ceiling with a number: that number is what tells an image
+// ceiling from any other reply that mentions images, and the message the client
+// reads keeps it.
+//
+//   - api.mistral.ai, a whole request: `Total number of images (9) exceeds the
+//     maximum allowed of 8.` The count the upstream read is not part of the
+//     match, so a session or plan named in the sentence, or a second sentence
+//     after it, still matches.
+//   - Command Code, the model `deepseek-v4.1-flash-dedicated` behind channels 3
+//     and 4: `This turn adds 20 images (the images after the last assistant
+//     message); deepseek-v4.1-flash-dedicated takes at most 8 new images per
+//     turn. Images earlier in the conversation do not count.` The ceiling is
+//     per turn, not per request, so a sentence without `per turn` names
+//     another condition and stays unchanged.
+var upstreamImageLimitWordings = []string{
+	`(?i)\bimages?\b[^.]*?\bexceeds?\b[^.]*?\bmaximum allowed\b[^.]*?\d`,
+	`(?i)\btakes at most \d+ new images? per turn\b`,
+}
+
 // upstreamImageLimitPattern matches the reply of an upstream refusing a request
-// for its image count, for example `Total number of images exceeds the maximum
-// allowed of 8.` The count the upstream read is not part of the match, so a
-// session or plan named in the sentence, or a second sentence after it, still
-// matches.
-var upstreamImageLimitPattern = regexp.MustCompile(`(?i)images?\b[^.]*?\bexceeds?\b[^.]*?\bmaximum allowed\b`)
+// for its image count in any of the wordings above.
+var upstreamImageLimitPattern = regexp.MustCompile(strings.Join(upstreamImageLimitWordings, "|"))
 
 // CheckRequestImageLimit refuses a request that carries more image
 // occurrences than the limit of the model it is sent to. The limit is the

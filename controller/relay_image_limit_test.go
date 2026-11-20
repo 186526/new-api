@@ -384,6 +384,18 @@ func imageLimitRelayBodyWithModel(t *testing.T, images int, model string) string
 // of a model that allows 8.
 const imageCeilingReply = `{"object":"error","message":"Total number of images exceeds the maximum allowed of 8.","type":"invalid_request_invalid_args","code":"3051"}`
 
+// commandCodeTurnCeilingMessage is the message measured on Command Code, the
+// model deepseek-v4.1-flash-dedicated behind channels 3 and 4, for a request
+// whose current turn holds 20 images. The ceiling counts the images after the
+// last assistant message, so it is per turn rather than per request.
+const commandCodeTurnCeilingMessage = "This turn adds 20 images (the images after the last assistant message); " +
+	"deepseek-v4.1-flash-dedicated takes at most 8 new images per turn. " +
+	"Images earlier in the conversation do not count."
+
+// commandCodeTurnCeilingReply is that refusal as the upstream sends it: a 400
+// whose error object carries the message, the type, the code and the param.
+const commandCodeTurnCeilingReply = `{"error":{"message":"This turn adds 20 images (the images after the last assistant message); deepseek-v4.1-flash-dedicated takes at most 8 new images per turn. Images earlier in the conversation do not count.","type":"invalid_request_error","code":"bad_request","param":"messages"}}`
+
 // imageCeilingHint is what every image refusal tells the client to do, whether
 // new-api refused the request itself or translated the upstream's refusal.
 const imageCeilingHint = "Request a smaller batch of images or compact the conversation and retry."
@@ -490,21 +502,37 @@ func allowImageCeilingRelay(t *testing.T) func() {
 // lets the request out and whose upstream refuses it for the image count. The
 // client must read the reply as a context overflow, the attempt must be
 // counted once, the request must not be retried on another channel, and the
-// channel must be judged by the translated error.
+// channel must be judged by the translated error. The second case is the
+// per-turn ceiling measured on Command Code behind channels 3 and 4.
 func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		relayFormat types.RelayFormat
+		reply       string
+		ceiling     string
 		body        func(t *testing.T) string
 	}{
-		{name: "openai", relayFormat: types.RelayFormatOpenAI, body: func(t *testing.T) string { return imageLimitRelayBody(t, 9) }},
-		{name: "claude", relayFormat: types.RelayFormatClaude, body: func(t *testing.T) string { return imageCeilingClaudeBody(t, 9) }},
+		{
+			name: "openai", relayFormat: types.RelayFormatOpenAI, reply: imageCeilingReply,
+			ceiling: "Total number of images exceeds the maximum allowed of 8.",
+			body:    func(t *testing.T) string { return imageLimitRelayBody(t, 9) },
+		},
+		{
+			name: "claude", relayFormat: types.RelayFormatClaude, reply: imageCeilingReply,
+			ceiling: "Total number of images exceeds the maximum allowed of 8.",
+			body:    func(t *testing.T) string { return imageCeilingClaudeBody(t, 9) },
+		},
+		{
+			name: "command code per turn", relayFormat: types.RelayFormatOpenAI,
+			reply: commandCodeTurnCeilingReply, ceiling: "takes at most 8 new images per turn",
+			body: func(t *testing.T) string { return imageLimitRelayBodyForModel(t, 20, "deepseek-v4.1-flash-dedicated") },
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cleanup := allowImageCeilingRelay(t)
 			defer cleanup()
 
-			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, imageCeilingReply)
+			upstream := newImageCeilingUpstream(t, http.StatusBadRequest, tc.reply)
 			gateway := imageCeilingGateway(t, upstream.server.URL, tc.relayFormat)
 			defer gateway.Close()
 
@@ -513,7 +541,7 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 
 			assert.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
 			assert.Equal(t, "context_length_exceeded", code)
-			assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+			assert.Contains(t, message, tc.ceiling, "the ceiling the upstream named reaches the client")
 			assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
 			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
 		})
@@ -554,6 +582,27 @@ func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
 
 // imageCeilingGeminiBody is a native Gemini request carrying a text turn.
 const imageCeilingGeminiBody = `{"contents":[{"role":"user","parts":[{"text":"look"}]}]}`
+
+// TestRelayKeepsAnUpstreamTurnImageCountWithoutACeiling is the counter-case
+// next to the Command Code wording: a 400 that counts the images of the turn
+// but names no ceiling keeps its own code, so only the sentence with the
+// ceiling is rewritten.
+func TestRelayKeepsAnUpstreamTurnImageCountWithoutACeiling(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest,
+		`{"error":{"message":"This turn adds 20 images (the images after the last assistant message); split them.","type":"invalid_request_error","code":"bad_request","param":"messages"}}`)
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatOpenAI)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatOpenAI,
+		imageLimitRelayBodyForModel(t, 20, "deepseek-v4.1-flash-dedicated"))
+
+	code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, statusCode, payload)
+	assert.NotEqual(t, "context_length_exceeded", code, "a 400 naming no ceiling keeps the error it was raised as: %s", payload)
+	assert.Equal(t, "This turn adds 20 images (the images after the last assistant message); split them.", message)
+}
 
 // TestRelayKeepsAnUpstreamImageCeilingTheTranslationMisses is the counter-case:
 // an upstream 400 that does not name an image ceiling keeps its own code, so
@@ -608,19 +657,32 @@ func imageCeilingEnvelope(t *testing.T, relayFormat types.RelayFormat, statusCod
 // the error the relay lets through: the translated refusal names no channel
 // fault, so a channel asked to disable on its errors keeps serving. The
 // decision is read with the channel health setting on, which the relay's own
-// path cannot make observable without a database.
+// path cannot make observable without a database. The Command Code per-turn
+// wording is read next to the Mistral one.
 func TestUpstreamImageCeilingKeepsTheChannelEnabled(t *testing.T) {
 	previousAutoDisable := common.AutomaticDisableChannelEnabled
 	common.AutomaticDisableChannelEnabled = true
 	defer func() { common.AutomaticDisableChannelEnabled = previousAutoDisable }()
 
-	upstreamError := types.WithOpenAIError(types.OpenAIError{
-		Message: "Total number of images exceeds the maximum allowed of 8.",
-		Type:    "invalid_request_invalid_args",
-		Code:    "3051",
-	}, http.StatusBadRequest)
+	for _, tc := range []struct {
+		name    string
+		message string
+		code    string
+	}{
+		{name: "mistral wording", message: "Total number of images exceeds the maximum allowed of 8.", code: "3051"},
+		{name: "command code per-turn wording", message: commandCodeTurnCeilingMessage, code: "bad_request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstreamError := types.WithOpenAIError(types.OpenAIError{
+				Message: tc.message,
+				Type:    "invalid_request_error",
+				Code:    tc.code,
+			}, http.StatusBadRequest)
 
-	translated := relay.TranslateUpstreamImageLimitError(upstreamError)
-	require.NotSame(t, upstreamError, translated)
-	assert.False(t, service.ShouldDisableChannel(translated))
+			translated := relay.TranslateUpstreamImageLimitError(upstreamError)
+			require.NotSame(t, upstreamError, translated, "the reply is the image ceiling the translation recognizes")
+			assert.False(t, types.IsChannelError(translated))
+			assert.False(t, service.ShouldDisableChannel(translated), "a context overflow keeps the channel enabled")
+		})
+	}
 }

@@ -1,8 +1,11 @@
 package relay
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -428,23 +431,42 @@ func upstreamImageLimitError(statusCode int, message string, code any) *types.Ne
 	}, statusCode)
 }
 
+// commandCodeTurnCeilingMessage is the message measured on Command Code, the
+// model deepseek-v4.1-flash-dedicated behind channels 3 and 4, when a request
+// carries 20 images of which the last assistant message leaves 20 in the
+// current turn. The ceiling is per turn, not per request.
+const commandCodeTurnCeilingMessage = "This turn adds 20 images (the images after the last assistant message); " +
+	"deepseek-v4.1-flash-dedicated takes at most 8 new images per turn. " +
+	"Images earlier in the conversation do not count."
+
+// imageLimitWordingCases lists the wordings the translation must rewrite, with
+// the phrase the client has to find in the translated message. The Mistral
+// wordings are read on api.mistral.ai, the Command Code ones on the model
+// deepseek-v4.1-flash-dedicated behind channels 3 and 4.
+var imageLimitWordingCases = []struct {
+	name     string
+	code     any
+	message  string
+	ceiling  string
+	fullText bool
+}{
+	{name: "mistral measured reply", code: "3051", message: "Total number of images exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral wide model", code: "3051", message: "Total number of images exceeds the maximum allowed of 20.", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral lower case", code: nil, message: "total number of images exceeds the maximum allowed of 8", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request.", ceiling: "maximum allowed of", fullText: true},
+	{name: "mistral plural verb", code: "3051", message: "Total number of images exceed the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
+	{name: "command code per-turn", code: "bad_request", message: commandCodeTurnCeilingMessage, ceiling: "at most 8 new images per turn", fullText: true},
+	{name: "command code per-turn in a wider sentence", code: "bad_request", message: "This turn adds 12 images. The model takes at most 8 new images per turn, so send fewer.", ceiling: "at most 8 new images per turn", fullText: false},
+}
+
 // TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal covers the
-// replies measured on api.mistral.ai: each names the ceiling of its own model,
-// and the client reads all of them as a context overflow it can compact away.
+// replies measured on the upstreams: each names the ceiling of its own model,
+// per request on api.mistral.ai and per turn on Command Code, and the client
+// reads all of them as a context overflow it can compact away.
 func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		code    any
-		message string
-	}{
-		{name: "measured reply", code: "3051", message: "Total number of images exceeds the maximum allowed of 8."},
-		{name: "wide model", code: "3051", message: "Total number of images exceeds the maximum allowed of 20."},
-		{name: "lower case", code: nil, message: "total number of images exceeds the maximum allowed of 8"},
-		{name: "singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8."},
-		{name: "count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8."},
-		{name: "second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request."},
-		{name: "plural verb", code: "3051", message: "Total number of images exceed the maximum allowed of 8."},
-	} {
+	for _, tc := range imageLimitWordingCases {
 		t.Run(tc.name, func(t *testing.T) {
 			apiErr := TranslateUpstreamImageLimitError(upstreamImageLimitError(http.StatusBadRequest, tc.message, tc.code))
 			require.NotNil(t, apiErr)
@@ -453,7 +475,7 @@ func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T
 			assert.True(t, types.IsSkipRetryError(apiErr))
 			assert.False(t, types.IsChannelError(apiErr), "the channel is not at fault for the request's image count")
 			assert.Equal(t, tc.message+" "+imageLimitRetryHint, apiErr.Error())
-			assert.Contains(t, apiErr.Error(), "maximum allowed of", "the ceiling the upstream named stays in the message")
+			assert.Contains(t, apiErr.Error(), tc.ceiling, "the ceiling the upstream named stays in the message")
 			openAIError := apiErr.ToOpenAIError()
 			assert.Equal(t, "invalid_request_error", openAIError.Type)
 			assert.Equal(t, openAIError.Code, apiErr.GetErrorCode(), "the top-level error code is the one a client reads")
@@ -463,11 +485,45 @@ func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T
 	}
 }
 
+// TestTranslateUpstreamImageLimitErrorReadsTheUpstreamJSONBody covers the body
+// measured on Command Code behind channels 3 and 4: a 400 whose error object is
+// the per-turn ceiling. The body is read the way the relay reads every upstream
+// error, and the client gets the context overflow with the ceiling the upstream
+// named.
+func TestTranslateUpstreamImageLimitErrorReadsTheUpstreamJSONBody(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": commandCodeTurnCeilingMessage,
+			"type":    "invalid_request_error",
+			"code":    "bad_request",
+			"param":   "messages",
+		},
+	})
+	require.NoError(t, err)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	}
+	upstreamError := service.RelayErrorHandler(context.Background(), resp, false)
+	require.NotNil(t, upstreamError)
+	require.Equal(t, commandCodeTurnCeilingMessage, upstreamError.Error(), "the relay reads the message of the error object")
+
+	translated := TranslateUpstreamImageLimitError(upstreamError)
+	require.NotSame(t, upstreamError, translated, "the per-turn ceiling is recognized in the body one reads from the upstream")
+	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode(), "the top-level error code is the one a client reads")
+	assert.Contains(t, translated.Error(), "deepseek-v4.1-flash-dedicated takes at most 8 new images per turn",
+		"the ceiling the upstream named stays in the message")
+	assert.Contains(t, translated.Error(), imageLimitRetryHint)
+	assert.Equal(t, commandCodeTurnCeilingMessage+" "+imageLimitRetryHint, translated.Error())
+	assert.True(t, types.IsSkipRetryError(translated))
+}
+
 // TestTranslateUpstreamImageLimitErrorKeepsOtherErrors covers the replies the
 // translation must leave alone: a 400 of another kind, another status, and an
 // error new-api raised itself.
 func TestTranslateUpstreamImageLimitErrorKeepsOtherErrors(t *testing.T) {
 	measured := "Total number of images exceeds the maximum allowed of 8."
+	turnWording := "deepseek-v4.1-flash-dedicated takes at most 8 new images per turn."
 	for _, tc := range []struct {
 		name string
 		err  *types.NewAPIError
@@ -477,13 +533,47 @@ func TestTranslateUpstreamImageLimitErrorKeepsOtherErrors(t *testing.T) {
 		{name: "message naming images without a ceiling", err: upstreamImageLimitError(http.StatusBadRequest, "Image input is not supported", "1002")},
 		{name: "image ceiling under another status", err: upstreamImageLimitError(http.StatusUnprocessableEntity, measured, "3051")},
 		{
+			name: "per-turn count without the upstream's ceiling",
+			err:  upstreamImageLimitError(http.StatusBadRequest, "This turn adds 20 images (the images after the last assistant message); split them.", "bad_request"),
+		},
+		{
+			name: "per-turn ceiling under another status",
+			err:  upstreamImageLimitError(http.StatusForbidden, commandCodeTurnCeilingMessage, "bad_request"),
+		},
+		{
+			name: "ceiling without per turn",
+			err:  upstreamImageLimitError(http.StatusBadRequest, "deepseek-v4.1-flash-dedicated takes at most 8 new images.", "bad_request"),
+		},
+		{
+			name: "ceiling without a number",
+			err:  upstreamImageLimitError(http.StatusBadRequest, "deepseek-v4.1-flash-dedicated takes at most a few new images per turn.", "bad_request"),
+		},
+		{
+			name: "other per-turn sentence",
+			err:  upstreamImageLimitError(http.StatusBadRequest, "deepseek-v4.1-flash-dedicated takes at most 8 new messages per turn.", "bad_request"),
+		},
+		{
+			name: "ready to send 8 new images",
+			err:  upstreamImageLimitError(http.StatusBadRequest, "deepseek-v4.1-flash-dedicated takes up to 8 new images per turn.", "bad_request"),
+		},
+		{
 			name: "wording raised by new-api",
 			err: types.NewErrorWithStatusCode(fmt.Errorf("image download failed: %s", measured),
 				types.ErrorCodeInvalidRequest, http.StatusBadRequest),
 		},
 		{
+			name: "per-turn wording raised by new-api",
+			err: types.NewErrorWithStatusCode(fmt.Errorf("image download failed: %s", turnWording),
+				types.ErrorCodeInvalidRequest, http.StatusBadRequest),
+		},
+		{
 			name: "wording from a channel's own failure",
 			err: types.NewErrorWithStatusCode(fmt.Errorf("channel config: %s", measured),
+				types.ErrorCodeChannelParamOverrideInvalid, http.StatusBadRequest),
+		},
+		{
+			name: "per-turn wording from a channel's own failure",
+			err: types.NewErrorWithStatusCode(fmt.Errorf("channel config: %s", turnWording),
 				types.ErrorCodeChannelParamOverrideInvalid, http.StatusBadRequest),
 		},
 	} {
