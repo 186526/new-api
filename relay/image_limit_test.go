@@ -447,21 +447,20 @@ const commandCodeTurnCeilingMessage = "This turn adds 20 images (the images afte
 // wordings are read on api.mistral.ai, the Command Code ones on the model
 // deepseek-v4.1-flash-dedicated behind channels 3 and 4.
 var imageLimitWordingCases = []struct {
-	name     string
-	code     any
-	message  string
-	ceiling  string
-	fullText bool
+	name    string
+	code    any
+	message string
+	ceiling string
 }{
-	{name: "mistral measured reply", code: "3051", message: "Total number of images exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral wide model", code: "3051", message: "Total number of images exceeds the maximum allowed of 20.", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral lower case", code: nil, message: "total number of images exceeds the maximum allowed of 8", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request.", ceiling: "maximum allowed of", fullText: true},
-	{name: "mistral plural verb", code: "3051", message: "Total number of images exceed the maximum allowed of 8.", ceiling: "maximum allowed of", fullText: true},
-	{name: "command code per-turn", code: "bad_request", message: commandCodeTurnCeilingMessage, ceiling: "at most 8 new images per turn", fullText: true},
-	{name: "command code per-turn in a wider sentence", code: "bad_request", message: "This turn adds 12 images. The model takes at most 8 new images per turn, so send fewer.", ceiling: "at most 8 new images per turn", fullText: false},
+	{name: "mistral measured reply", code: "3051", message: "Total number of images exceeds the maximum allowed of 8.", ceiling: "maximum allowed of"},
+	{name: "mistral wide model", code: "3051", message: "Total number of images exceeds the maximum allowed of 20.", ceiling: "maximum allowed of"},
+	{name: "mistral lower case", code: nil, message: "total number of images exceeds the maximum allowed of 8", ceiling: "maximum allowed of"},
+	{name: "mistral singular", code: "3051", message: "Total number of image exceeds the maximum allowed of 8.", ceiling: "maximum allowed of"},
+	{name: "mistral count in the sentence", code: "3051", message: "Total number of images (9) exceeds the maximum allowed of 8.", ceiling: "maximum allowed of"},
+	{name: "mistral second sentence", code: "3051", message: "Total number of images exceeds the maximum allowed of 8. Split the request.", ceiling: "maximum allowed of"},
+	{name: "mistral plural verb", code: "3051", message: "Total number of images exceed the maximum allowed of 8.", ceiling: "maximum allowed of"},
+	{name: "command code per-turn", code: "bad_request", message: commandCodeTurnCeilingMessage, ceiling: "at most 8 new images per turn"},
+	{name: "command code per-turn in a wider sentence", code: "bad_request", message: "This turn adds 12 images. The model takes at most 8 new images per turn, so send fewer.", ceiling: "at most 8 new images per turn"},
 }
 
 // TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal covers the

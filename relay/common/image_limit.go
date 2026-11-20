@@ -58,9 +58,21 @@ func countChatImages(request *dto.GeneralOpenAIRequest) int {
 	return count
 }
 
-// countGeminiImages counts the inline and file images of a request, also the
-// ones a function response replays to the model.
+// countGeminiImages counts the images of a generateContent request and of
+// every element of a batch request. Each batch element carries its own
+// contents and may itself hold further requests, and the relay sends all of
+// them upstream, so every one is counted.
 func countGeminiImages(request *dto.GeminiChatRequest) int {
+	count := countGeminiContentsImages(request.Contents)
+	for _, batched := range request.Requests {
+		count += countGeminiImages(&batched)
+	}
+	return count
+}
+
+// countGeminiContentsImages counts the inline and file images of one turn set,
+// also the ones a function response replays to the model.
+func countGeminiContentsImages(contents []dto.GeminiChatContent) int {
 	count := 0
 	collect := func(part dto.GeminiPart) {
 		if part.InlineData != nil && part.InlineData.Data != "" && isImageMimeType(part.InlineData.MimeType) {
@@ -70,7 +82,7 @@ func countGeminiImages(request *dto.GeminiChatRequest) int {
 			count++
 		}
 	}
-	for _, content := range request.Contents {
+	for _, content := range contents {
 		for _, part := range content.Parts {
 			collect(part)
 			if part.FunctionResponse == nil || len(part.FunctionResponse.Parts) == 0 {

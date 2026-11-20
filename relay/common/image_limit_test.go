@@ -101,6 +101,75 @@ func geminiRequestWithImages(urls ...string) *dto.GeminiChatRequest {
 	}
 }
 
+// geminiBatchRequest wraps the given requests as the elements of a
+// generateContent batch request, the shape a batched prediction sends.
+func geminiBatchRequest(requests ...*dto.GeminiChatRequest) *dto.GeminiChatRequest {
+	batch := &dto.GeminiChatRequest{}
+	for _, request := range requests {
+		batch.Requests = append(batch.Requests, *request)
+	}
+	return batch
+}
+
+// A batch request carries its images inside requests[], and the relay sends
+// every element upstream, so the count has to cover them all.
+func TestRequestImageCountCountsGeminiBatchRequestImages(t *testing.T) {
+	cases := []struct {
+		name    string
+		request *dto.GeminiChatRequest
+		want    int
+	}{
+		{
+			name: "every element counts",
+			request: geminiBatchRequest(
+				geminiRequestWithImages(testImageAlpha, testImageBeta),
+				geminiRequestWithImages(testImageAlpha),
+				&dto.GeminiChatRequest{Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "no image"}}}}},
+			),
+			want: 3,
+		},
+		{
+			name: "an element repeats an image",
+			request: geminiBatchRequest(
+				geminiRequestWithImages(testImageAlpha, testImageAlpha),
+			),
+			want: 2,
+		},
+		{
+			name: "contents and requests are both counted",
+			request: func() *dto.GeminiChatRequest {
+				batch := geminiBatchRequest(geminiRequestWithImages(testImageBeta, testImageBeta))
+				batch.Contents = geminiRequestWithImages(testImageAlpha).Contents
+				return batch
+			}(),
+			want: 3,
+		},
+		{
+			name: "an element carries its own requests",
+			request: geminiBatchRequest(
+				geminiBatchRequest(
+					geminiRequestWithImages(testImageAlpha),
+					geminiRequestWithImages(testImageAlpha, testImageBeta),
+				),
+				geminiRequestWithImages(testImageBeta),
+			),
+			want: 4,
+		},
+		{
+			name: "a batched file image counts",
+			request: geminiBatchRequest(&dto.GeminiChatRequest{Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{
+				{FileData: &dto.GeminiFileData{MimeType: "image/jpeg", FileUri: "https://example.test/a.jpg"}},
+			}}}}),
+			want: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, RequestImageCount(types.RelayFormatGemini, tc.request))
+		})
+	}
+}
+
 func TestRequestImageCountCountsEveryRelayFormat(t *testing.T) {
 	cases := []struct {
 		name        string
