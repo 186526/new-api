@@ -353,7 +353,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}
-	if info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone {
+	if info.StreamStatus.EndReason() == relaycommon.StreamEndReasonClientGone {
 		return usage, nil
 	}
 

@@ -33,7 +33,7 @@ func ClassifyRelayOutcome(ctx context.Context, info *relaycommon.RelayInfo, apiE
 		completedNormally = completedNormally &&
 			stream.Response == relaycommon.ResponseOutcomeCompleted &&
 			(stream.EndReason == relaycommon.StreamEndReasonEOF || stream.EndReason == relaycommon.StreamEndReasonDone) &&
-			!stream.HasErrors && info.StreamStatus.EndError == nil
+			!stream.HasErrors && info.StreamStatus.EndError() == nil
 	}
 	if ctx != nil && ctx.Err() == context.Canceled && !completedNormally {
 		return OutcomeIgnored
@@ -49,7 +49,7 @@ func ClassifyRelayOutcome(ctx context.Context, info *relaycommon.RelayInfo, apiE
 		local := root.GetErrorType() == types.ErrorTypeNewAPIError
 		return classifyFailure(local, string(root.GetErrorCode()), root.ToOpenAIError().Type, root.StatusCode)
 	}
-	deadlineExceeded := info.StreamStatus != nil && errors.Is(info.StreamStatus.EndError, context.DeadlineExceeded)
+	deadlineExceeded := info.StreamStatus != nil && errors.Is(info.StreamStatus.EndError(), context.DeadlineExceeded)
 	if stream.Response == relaycommon.ResponseOutcomeCancelled || stream.EndReason == relaycommon.StreamEndReasonPingFail {
 		return OutcomeIgnored
 	}

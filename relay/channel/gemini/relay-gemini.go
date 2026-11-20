@@ -299,7 +299,7 @@ func isGeminiDownstreamStop(c *gin.Context, info *relaycommon.RelayInfo) bool {
 		return true
 	}
 	return info != nil && info.StreamStatus != nil &&
-		info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone
+		info.StreamStatus.EndReason() == relaycommon.StreamEndReasonClientGone
 }
 
 func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

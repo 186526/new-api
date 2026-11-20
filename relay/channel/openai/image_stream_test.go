@@ -353,7 +353,7 @@ func TestOpenaiImageStreamHandlerClientDisconnectKeepsRequestedCount(t *testing.
 	// handler_stop (failed client write); both must be treated as untrusted.
 	require.Contains(t,
 		[]relaycommon.StreamEndReason{relaycommon.StreamEndReasonClientGone, relaycommon.StreamEndReasonHandlerStop},
-		info.StreamStatus.EndReason)
+		info.StreamStatus.EndReason())
 	require.Contains(t, recorder.Body.String(), `"b64_json":"first"`)
 	require.Equal(t, 3.0, info.PriceData.OtherRatios()["n"], "client abort must not reduce the billed image count")
 }
@@ -388,7 +388,7 @@ func TestOpenaiImageStreamHandlerClientDisconnectRaisesCount(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	require.Contains(t,
 		[]relaycommon.StreamEndReason{relaycommon.StreamEndReasonClientGone, relaycommon.StreamEndReasonHandlerStop},
-		info.StreamStatus.EndReason)
+		info.StreamStatus.EndReason())
 	require.Equal(t, 2.0, info.PriceData.OtherRatios()["n"], "completed events beyond the recorded n must raise the charge even on abort")
 }
 
@@ -621,7 +621,7 @@ func TestOpenaiImageStreamHandlerRecordsUpstreamErrorEvent(t *testing.T) {
 	require.Nil(t, err)
 	require.NotNil(t, usage)
 	require.NotNil(t, info.StreamStatus)
-	require.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
+	require.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason())
 	require.True(t, info.StreamStatus.HasErrors())
 	require.Equal(t, 1, info.StreamStatus.TotalErrorCount())
 	require.Contains(t, info.StreamStatus.Errors[0].Message, "INTERNAL_ERROR")
