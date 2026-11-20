@@ -53,51 +53,73 @@ func TestMultiKeyEnableRestoresOnlyExhaustedChannels(t *testing.T) {
 			for _, tc := range []struct {
 				name           string
 				initialStatus  int
+				autoExhaust    bool
 				manualOverride string
 				wantStatus     int
 			}{
 				{name: "key exhaustion restores", initialStatus: common.ChannelStatusEnabled, wantStatus: common.ChannelStatusEnabled},
 				{name: "manual disable is preserved", initialStatus: common.ChannelStatusManuallyDisabled, wantStatus: common.ChannelStatusManuallyDisabled},
-				{name: "manual disable after exhaustion is preserved", initialStatus: common.ChannelStatusEnabled, manualOverride: "status", wantStatus: common.ChannelStatusManuallyDisabled},
+				{name: "manual disable after exhaustion is preserved", initialStatus: common.ChannelStatusEnabled, autoExhaust: true, manualOverride: "status", wantStatus: common.ChannelStatusManuallyDisabled},
 				{name: "tag disable after exhaustion is preserved", initialStatus: common.ChannelStatusEnabled, manualOverride: "tag", wantStatus: common.ChannelStatusManuallyDisabled},
+				{name: "auto key exhaustion restores", initialStatus: common.ChannelStatusEnabled, autoExhaust: true, wantStatus: common.ChannelStatusEnabled},
+				{name: "auto disable for another reason is preserved", initialStatus: common.ChannelStatusAutoDisabled, wantStatus: common.ChannelStatusAutoDisabled},
+				{name: "manual disable after auto exhaustion is preserved", initialStatus: common.ChannelStatusEnabled, autoExhaust: true, manualOverride: "status", wantStatus: common.ChannelStatusManuallyDisabled},
+				{name: "tag disable after auto exhaustion is preserved", initialStatus: common.ChannelStatusEnabled, autoExhaust: true, manualOverride: "tag", wantStatus: common.ChannelStatusManuallyDisabled},
 			} {
 				t.Run(fmt.Sprintf("cache=%t/%s/%s", cacheEnabled, action, tc.name), func(t *testing.T) {
 					common.MemoryCacheEnabled = cacheEnabled
 					tag := t.Name()
+					// Key one is left unset when the enable action targets all keys,
+					// because that action clears every key status itself.
+					keyOneStatus := common.ChannelStatusManuallyDisabled
+					if action == "enable_key" {
+						keyOneStatus = 0
+					}
+					keyStatusList := map[int]int{1: common.ChannelStatusManuallyDisabled}
+					if keyOneStatus != 0 {
+						keyStatusList[0] = keyOneStatus
+					}
 					channel := &model.Channel{Name: t.Name(), Type: 1, Key: "key-one\nkey-two", Status: tc.initialStatus, Models: "test-model", Group: "default", Tag: &tag,
-						ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: map[int]int{1: common.ChannelStatusManuallyDisabled}},
+						ChannelInfo: model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2, MultiKeyStatusList: keyStatusList},
 					}
 					require.NoError(t, channel.Insert())
+					model.InitChannelCache()
 					t.Cleanup(func() {
 						require.NoError(t, channel.Delete())
 						model.InitChannelCache()
 					})
-					for _, operation := range []string{"disable_key", action} {
-						if operation == action {
-							if tc.manualOverride == "status" {
-								model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation")
-							} else if tc.manualOverride == "tag" {
-								require.NoError(t, model.DisableChannelByTag(tag))
-							}
-						}
-						payload, err := common.Marshal(MultiKeyManageRequest{ChannelId: channel.Id, Action: operation, KeyIndex: common.GetPointer(0)})
-						require.NoError(t, err)
-						recorder := httptest.NewRecorder()
-						c, _ := gin.CreateTestContext(recorder)
-						c.Set("id", root.Id)
-						c.Set("role", common.RoleRootUser)
-						c.Request = httptest.NewRequest(http.MethodPost, "/api/channel/multi_key", bytes.NewReader(payload))
-						c.Request.Header.Set("Content-Type", "application/json")
-						ManageMultiKeys(c)
-						var result struct {
-							Success bool `json:"success"`
-						}
-						require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
-						require.True(t, result.Success, recorder.Body.String())
+					if tc.autoExhaust {
+						// Key one fails while key two is already disabled, which
+						// leaves every key failed and the channel auto-disabled.
+						require.True(t, model.UpdateChannelStatus(channel.Id, "key-one", common.ChannelStatusAutoDisabled, "provider rejected key"))
 					}
+					if tc.manualOverride == "status" {
+						model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation")
+					} else if tc.manualOverride == "tag" {
+						require.NoError(t, model.DisableChannelByTag(tag))
+					}
+					payload, err := common.Marshal(MultiKeyManageRequest{ChannelId: channel.Id, Action: action, KeyIndex: common.GetPointer(0)})
+					require.NoError(t, err)
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Set("id", root.Id)
+					c.Set("role", common.RoleRootUser)
+					c.Request = httptest.NewRequest(http.MethodPost, "/api/channel/multi_key", bytes.NewReader(payload))
+					c.Request.Header.Set("Content-Type", "application/json")
+					ManageMultiKeys(c)
+					var result struct {
+						Success bool `json:"success"`
+					}
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &result))
+					require.True(t, result.Success, recorder.Body.String())
 					loaded, err := model.GetChannelById(channel.Id, true)
 					require.NoError(t, err)
 					assert.Equal(t, tc.wantStatus, loaded.Status)
+					if cacheEnabled {
+						cached, err := model.CacheGetChannel(channel.Id)
+						require.NoError(t, err)
+						assert.Equal(t, loaded.Status, cached.Status)
+					}
 					assert.NotContains(t, loaded.ChannelInfo.MultiKeyStatusList, 0)
 					assert.NotContains(t, loaded.ChannelInfo.MultiKeyDisabledReason, 0)
 					assert.NotContains(t, loaded.ChannelInfo.MultiKeyDisabledTime, 0)
