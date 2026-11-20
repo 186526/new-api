@@ -39,6 +39,11 @@ func DecideRelayRetry(c *gin.Context, err *types.NewAPIError, retryTimes int) Po
 	if types.IsSkipRetryError(err) {
 		return PolicyDecision{Action: "stop", Reason: "non_retryable_error", Source: "system"}
 	}
+	// A request new-api rejected before contacting the upstream fails the same
+	// way on every channel, whatever status it carries.
+	if RelayErrorSource(err) == "local" {
+		return PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "system"}
+	}
 	if retryTimes <= 0 {
 		return PolicyDecision{Action: "stop", Reason: "attempt_budget_exhausted", Source: "global"}
 	}

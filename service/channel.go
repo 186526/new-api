@@ -64,7 +64,14 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if err == nil {
 		return false
 	}
-	if types.IsChannelError(err) {
+	// Channel key and config errors fail for every request, so they disable.
+	// Errors new-api raised itself never do, whatever their status: the request
+	// may not have reached the upstream, and their message can carry client
+	// input that would otherwise match a disable keyword.
+	switch RelayErrorSource(err) {
+	case "local":
+		return false
+	case "channel":
 		return true
 	}
 	if types.IsSkipRetryError(err) {

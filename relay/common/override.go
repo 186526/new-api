@@ -108,6 +108,32 @@ func (e *ParamOverrideReturnError) Error() string {
 	return e.Message
 }
 
+// ParamOverrideRequestValueError reports a valid condition that could not be
+// evaluated because the request carried a value of another type than the rule
+// compares against, for example a string temperature in a numeric gt rule.
+// The request triggered it, so callers report a 400 instead of a channel error.
+type ParamOverrideRequestValueError struct {
+	Path string
+	Err  error
+}
+
+func (e *ParamOverrideRequestValueError) Error() string {
+	if e == nil {
+		return "param override request value error"
+	}
+	if e.Path == "" {
+		return e.Err.Error()
+	}
+	return fmt.Sprintf("comparison failed for path %s: %v", e.Path, e.Err)
+}
+
+func (e *ParamOverrideRequestValueError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 func AsParamOverrideReturnError(err error) (*ParamOverrideReturnError, bool) {
 	if err == nil {
 		return nil, false
@@ -687,6 +713,11 @@ func checkSingleCondition(data []byte, contextJSON string, condition *ConditionO
 
 	result, err := condition.compareGjsonValues(value, targetValue)
 	if err != nil {
+		var valueErr *ParamOverrideRequestValueError
+		if errors.As(err, &valueErr) {
+			valueErr.Path = condition.Path
+			return false, valueErr
+		}
 		return false, fmt.Errorf("comparison failed for path %s: %v", condition.Path, err)
 	}
 
@@ -772,9 +803,9 @@ func compareEqual(jsonValue, targetValue gjson.Result) (bool, error) {
 		return jsonValue.Bool() == targetValue.Bool(), nil
 	}
 
-	// 如果类型不同，报错
+	// 如果类型不同，报错。请求值类型与规则值不同由请求决定，规则值不成立对每个请求都会失败。
 	if jsonValue.Type != targetValue.Type {
-		return false, fmt.Errorf("compare for different types, got %v and %v", jsonValue.Type, targetValue.Type)
+		return false, &ParamOverrideRequestValueError{Err: fmt.Errorf("compare for different types, got %v and %v", jsonValue.Type, targetValue.Type)}
 	}
 
 	switch jsonValue.Type {
@@ -790,9 +821,13 @@ func compareEqual(jsonValue, targetValue gjson.Result) (bool, error) {
 }
 
 func compareNumeric(jsonValue, targetValue gjson.Result, operator string) (bool, error) {
-	// 只有数字类型才支持数值比较
-	if jsonValue.Type != gjson.Number || targetValue.Type != gjson.Number {
+	// 只有数字类型才支持数值比较。规则值不是数字是配置错误，
+	// 请求值不是数字是请求错误。
+	if targetValue.Type != gjson.Number {
 		return false, fmt.Errorf("numeric comparison requires both values to be numbers, got %v and %v", jsonValue.Type, targetValue.Type)
+	}
+	if jsonValue.Type != gjson.Number {
+		return false, &ParamOverrideRequestValueError{Err: fmt.Errorf("numeric comparison requires both values to be numbers, got %v and %v", jsonValue.Type, targetValue.Type)}
 	}
 
 	jsonNum := jsonValue.Num
