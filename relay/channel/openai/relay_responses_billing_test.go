@@ -190,7 +190,7 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			require.Nil(t, apiErr)
 			require.NotNil(t, usage)
 			require.NotNil(t, info.StreamStatus)
-			assert.Equal(t, tc.wantEnd, info.StreamStatus.EndReason)
+			assert.Equal(t, tc.wantEnd, info.StreamStatus.EndReason())
 			assert.Equal(t, tc.responseStatus, info.StreamStatus.ResponseOutcome())
 			log := service.GenerateTextOtherInfo(c, info, 1, 1, 1, 0, 1, 0, 1).Snapshot()["stream_status"].(map[string]any)
 			assert.Equal(t, tc.wantError, log["status"] == "error")
@@ -205,10 +205,10 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			if tc.failWrite == 0 {
 				assert.Contains(t, writer.Body.String(), payload+"\n\n")
 			} else {
-				assert.ErrorIs(t, info.StreamStatus.EndError, writer.writeErr)
+				assert.ErrorIs(t, info.StreamStatus.EndError(), writer.writeErr)
 			}
 			if tc.failFlush {
-				assert.ErrorIs(t, info.StreamStatus.EndError, writer.flushErr)
+				assert.ErrorIs(t, info.StreamStatus.EndError(), writer.flushErr)
 			}
 			if !tc.eof {
 				select {

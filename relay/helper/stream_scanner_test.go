@@ -234,8 +234,8 @@ func TestStreamScannerHandler_DoneStopsScanner(t *testing.T) {
 
 			assert.Equal(t, test.want, received)
 			require.NotNil(t, info.StreamStatus)
-			assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
-			assert.NoError(t, info.StreamStatus.EndError)
+			assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
+			assert.NoError(t, info.StreamStatus.EndError())
 			assert.Equal(t, len(test.want), info.ReceivedResponseCount)
 		})
 	}
@@ -259,7 +259,7 @@ func TestStreamScannerHandler_StopStopsStream(t *testing.T) {
 
 	assert.Equal(t, stopAt, count.Load())
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason())
 }
 
 func TestStreamScannerHandler_SkipsNonDataLines(t *testing.T) {
@@ -365,7 +365,7 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 
 	assert.Equal(t, int64(1), count.Load(), "no chunk after disconnect should be processed")
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason())
 
 	body := recorder.Body.String()
 	assert.Contains(t, body, "first")
@@ -479,8 +479,8 @@ func TestStreamScannerHandler_StreamStatus_DoneReason(t *testing.T) {
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
-	assert.Nil(t, info.StreamStatus.EndError)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
+	assert.Nil(t, info.StreamStatus.EndError())
 	assert.True(t, info.StreamStatus.IsNormalEnd())
 	assert.False(t, info.StreamStatus.HasErrors())
 }
@@ -497,7 +497,7 @@ func TestStreamScannerHandler_StreamStatus_EOFWithoutDone(t *testing.T) {
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonEOF, info.StreamStatus.EndReason())
 	assert.True(t, info.StreamStatus.IsNormalEnd())
 }
 
@@ -516,7 +516,7 @@ func TestStreamScannerHandler_StreamStatus_HandlerStop(t *testing.T) {
 	})
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason())
 	assert.True(t, info.StreamStatus.HasErrors())
 }
 
@@ -536,7 +536,7 @@ func TestStreamScannerHandler_StreamStatus_HandlerDone(t *testing.T) {
 
 	assert.Equal(t, int64(5), count.Load())
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
 	assert.False(t, info.StreamStatus.HasErrors())
 }
 
@@ -573,7 +573,7 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	}
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason())
 	assert.False(t, info.StreamStatus.IsNormalEnd())
 }
 
@@ -588,7 +588,7 @@ func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {
 	})
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
 	assert.True(t, info.StreamStatus.HasErrors())
 	assert.Equal(t, 10, info.StreamStatus.TotalErrorCount())
 }
@@ -605,7 +605,7 @@ func TestStreamScannerHandler_StreamStatus_MultipleErrorsPerChunk(t *testing.T) 
 	})
 
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
 	assert.Equal(t, 10, info.StreamStatus.TotalErrorCount())
 }
 
@@ -629,7 +629,7 @@ func TestStreamScannerHandler_StreamStatus_ErrorThenStop(t *testing.T) {
 
 	assert.Equal(t, int64(1), count.Load())
 	require.NotNil(t, info.StreamStatus)
-	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason())
 	assert.Equal(t, 2, info.StreamStatus.TotalErrorCount())
 }
 
@@ -657,7 +657,7 @@ func TestStreamScannerHandler_StreamStatus_ReplacesPreInitialized(t *testing.T) 
 
 	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
 
-	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason())
 	assert.Equal(t, 0, info.StreamStatus.TotalErrorCount())
 }
 

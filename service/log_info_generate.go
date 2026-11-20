@@ -166,13 +166,13 @@ func appendStreamStatus(relayInfo *relaycommon.RelayInfo, other *model.LogOther)
 	}
 	streamInfo := map[string]any{
 		"status":     status,
-		"end_reason": string(ss.EndReason),
+		"end_reason": string(ss.EndReason()),
 	}
 	if outcome := ss.ResponseOutcome(); outcome != "" {
 		streamInfo["response_status"] = outcome
 	}
-	if ss.EndError != nil {
-		streamInfo["end_error"] = ss.EndError.Error()
+	if endErr := ss.EndError(); endErr != nil {
+		streamInfo["end_error"] = endErr.Error()
 	}
 	if ss.ErrorCount > 0 {
 		streamInfo["error_count"] = ss.ErrorCount
