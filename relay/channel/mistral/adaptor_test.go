@@ -1,11 +1,14 @@
 package mistral
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/gin-gonic/gin"
 )
@@ -39,4 +42,42 @@ func setupHeaderForAPIKey(t *testing.T, apiKey string) http.Header {
 		t.Fatalf("SetupRequestHeader() error: %v", err)
 	}
 	return header
+}
+
+func TestConvertClaudeRequestRefusesWithATypedError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "mstrl_test_key_123"}}
+
+	var converted any
+	var err error
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("ConvertClaudeRequest panicked: %v", recovered)
+			}
+		}()
+		converted, err = (&Adaptor{}).ConvertClaudeRequest(c, info, &dto.ClaudeRequest{Model: "mistral-large-latest"})
+	}()
+
+	if err == nil {
+		t.Fatalf("ConvertClaudeRequest() error = nil, want a conversion error")
+	}
+	if converted != nil {
+		t.Errorf("ConvertClaudeRequest() request = %v, want nil", converted)
+	}
+
+	var apiError *types.NewAPIError
+	if !errors.As(err, &apiError) {
+		t.Fatalf("ConvertClaudeRequest() error type = %T, want *types.NewAPIError", err)
+	}
+	if code := apiError.GetErrorCode(); code != types.ErrorCodeConvertRequestFailed {
+		t.Errorf("error code = %q, want %q", code, types.ErrorCodeConvertRequestFailed)
+	}
+	if apiError.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", apiError.StatusCode, http.StatusBadRequest)
+	}
+	if !types.IsSkipRetryError(apiError) {
+		t.Errorf("skip retry = false, want true: another attempt cannot make a Claude-format request acceptable to a Mistral channel")
+	}
 }
