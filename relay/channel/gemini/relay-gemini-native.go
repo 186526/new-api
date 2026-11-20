@@ -97,11 +97,18 @@ func NativeGeminiEmbeddingHandler(c *gin.Context, resp *http.Response, info *rel
 	return usage, nil
 }
 
-// streamRefusalNamesCeiling is what the relay package registers at start-up:
-// the predicate telling whether a text names an image ceiling. The gemini
-// package cannot import the relay package, which imports every adaptor, so the
-// wording is handed to it instead of being read here.
+// streamRefusalNamesCeiling tells whether a text names the image ceiling. It is
+// registered by the relay package, which holds the wording and imports this
+// package: the gemini package cannot import it back. A nil predicate leaves the
+// stream to the scanner.
 var streamRefusalNamesCeiling func(string) bool
+
+// streamRefusalError builds the translated error of an image refusal a stream
+// carried, or nil when the text it is given names no ceiling. It is registered
+// by the relay package for the same reason, and the error it builds is returned
+// to the controller, which writes it into the committed stream the way it
+// writes every other relay failure.
+var streamRefusalError func(string) *types.NewAPIError
 
 // SetStreamRefusalNamesCeiling registers the predicate and returns the
 // previous one for tests to restore.
@@ -111,20 +118,36 @@ func SetStreamRefusalNamesCeiling(namesCeiling func(string) bool) func(string) b
 	return previous
 }
 
+// SetStreamRefusalError registers the builder and returns the previous one for
+// tests to restore.
+func SetStreamRefusalError(buildRefusal func(string) *types.NewAPIError) func(string) *types.NewAPIError {
+	previous := streamRefusalError
+	streamRefusalError = buildRefusal
+	return previous
+}
+
 func GeminiTextGenerationStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	// An upstream can accept the request, commit its headers and only then
-	// refuse it: the event stream opens with the refusal, or delivers an event
-	// before it. Once the stream is committed the refusal can no longer carry
-	// its status code, so the first event is read before the headers go out.
-	if streamRefusalNamesCeiling != nil {
-		if refusal := pendingStreamRefusal(c, resp, streamRefusalNamesCeiling); refusal != nil {
-			return nil, refusal
-		}
+	// refuse it for its image count. A streaming request starts its keepalive
+	// with the upstream's 2xx, so the stream is usually committed by now and
+	// the refusal cannot carry a status code. The refusal is returned anyway:
+	// the controller writes it into the committed stream as the one error event
+	// of the relay, so the client reads the context overflow instead of a
+	// second error event raised by the scanner on its way out.
+	if refusal := pendingStreamRefusal(c, resp); refusal != nil {
+		return nil, refusal
 	}
 
 	helper.SetEventStreamHeaders(c)
 
-	return geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
+	// The refusal a stream delivers after a chunk of the answer is returned the
+	// same way, which keeps the chunk: only the error event of the relay follows.
+	var deliveredRefusal *types.NewAPIError
+	usage, err := geminiStreamHandler(c, info, resp, func(data string, geminiResponse *dto.GeminiChatResponse) bool {
+		if refusal := streamRefusalErrorFor(data); refusal != nil {
+			deliveredRefusal = refusal
+			return false
+		}
 		err := helper.StringData(c, data)
 		if err != nil {
 			logger.LogError(c, common.LogText("failed to write stream data: %s", err.Error()))
@@ -133,60 +156,102 @@ func GeminiTextGenerationStreamHandler(c *gin.Context, info *relaycommon.RelayIn
 		info.SendResponseCount++
 		return true
 	})
+	if deliveredRefusal != nil {
+		return usage, deliveredRefusal
+	}
+	return usage, err
 }
 
-// pendingStreamRefusal reads the event stream ahead of the first write and
-// returns the error of an upstream that refuses the request for its image
-// count inside it: the event stream opens with the ceiling, or delivers an
-// event before it. Only a 200 is examined, because a refusal carried by
-// another status is read from the response body as the non-200 handlers do.
+// streamRefusalErrorFor returns the error of the image refusal an event carries,
+// or nil for every other event.
+func streamRefusalErrorFor(data string) *types.NewAPIError {
+	if streamRefusalError == nil || streamRefusalNamesCeiling == nil {
+		return nil
+	}
+	if !errorObjectNamesImageCeiling(data, streamRefusalNamesCeiling) {
+		return nil
+	}
+	return streamRefusalError(data)
+}
+
+// pendingStreamRefusal reads the first event of a stream ahead of the client
+// and returns the error of an upstream that refuses the request for its image
+// count in it. Only a 200 is examined, because a refusal carried by another
+// status is read from the response body as the non-200 handlers do.
 //
-// Only the image ceiling is recognized, because an event carries no marker
-// telling a refusal from a chunk: a refusal the translation does not match is
-// streamed as before. A body that opens with an error object instead of an
-// event is the refusal too.
-//
-// What the look-ahead read is put back before the caller streams on, so every
-// byte of a stream it does not refuse reaches the client.
-func pendingStreamRefusal(c *gin.Context, resp *http.Response, namesCeiling func(string) bool) *types.NewAPIError {
-	if resp == nil || resp.StatusCode != http.StatusOK {
+// The read stops at the first complete event, so a stream that delivers events
+// one at a time is held back by one event and never to its end. The stream is
+// left for the scanner: the bytes the read took are played back ahead of it, so
+// the refusal event and every event after it still reach the client.
+func pendingStreamRefusal(c *gin.Context, resp *http.Response) *types.NewAPIError {
+	if resp == nil || resp.StatusCode != http.StatusOK || streamRefusalNamesCeiling == nil {
 		return nil
 	}
 	reader := bufio.NewReader(resp.Body)
 	lookAhead := new(strings.Builder)
+	event := new(strings.Builder)
 	for {
-		line, err := reader.ReadString('\n')
-		lookAhead.WriteString(line)
+		line, err := reader.ReadSlice('\n')
+		lookAhead.Write(line)
 		if err != nil {
-			// A stream that ends or stalls inside its first line is left to
-			// the scanner, which holds the line once the rest arrives.
+			// The stream ended or failed inside its first event: what was read
+			// is played back and the scanner holds the first line for it.
 			break
 		}
-		text := strings.TrimSpace(line)
+		text := strings.TrimSpace(string(line))
+		if text == "" {
+			// The blank line closes the event, which is all the look-ahead may
+			// hold back.
+			break
+		}
 		data, isEvent := strings.CutPrefix(text, "data:")
-		if !isEvent && !strings.HasPrefix(text, "{") {
+		if !isEvent || event.Len() != 0 {
+			// A comment, a field of another kind, and a second data line that
+			// continues an event are left to the scanner: only one event is
+			// read, and only one line of it carries the payload.
 			continue
 		}
-		if isEvent {
-			data = strings.TrimSpace(data)
-			if data == "" || data == "[DONE]" {
-				continue
-			}
-		} else {
-			data = text
-		}
-		if !errorObjectNamesImageCeiling(data, namesCeiling) {
-			continue
-		}
-		// The refusal of a stream carries no status of its own: the stream is
-		// a 200, so the event is read as the 400 an upstream refuses a request
-		// with. The event is the body RelayErrorHandler reads and closes.
-		resp.StatusCode = http.StatusBadRequest
-		resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(data), reader))
-		return service.RelayErrorHandler(c.Request.Context(), resp, false)
+		event.WriteString(strings.TrimSpace(data))
 	}
-	resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(lookAhead.String()), reader))
-	return nil
+	read := lookAhead.String()
+	restoreStreamBody(resp, read, reader)
+	if event.Len() == 0 || !errorObjectNamesImageCeiling(event.String(), streamRefusalNamesCeiling) {
+		return nil
+	}
+	// The refusal of a stream carries no status of its own: the stream is a
+	// 200, so the event is read as the 400 an upstream refuses a request with.
+	return streamRefusalError(event.String())
+}
+
+// restoreStreamBody puts the bytes a look-ahead read back at the head of the
+// response body. The reader the look-ahead filled holds the rest of the stream,
+// so the two are read in turn; the upstream body is closed by the caller that
+// closes the restored one.
+func restoreStreamBody(resp *http.Response, read string, rest io.Reader) {
+	resp.Body = &restoredStreamBody{
+		read: strings.NewReader(read),
+		rest: rest,
+		body: resp.Body,
+	}
+}
+
+// restoredStreamBody serves the bytes a look-ahead took before the stream they
+// were taken from.
+type restoredStreamBody struct {
+	read io.Reader
+	rest io.Reader
+	body io.ReadCloser
+}
+
+func (b *restoredStreamBody) Read(p []byte) (int, error) {
+	if n, err := b.read.Read(p); n > 0 || err != io.EOF {
+		return n, err
+	}
+	return b.rest.Read(p)
+}
+
+func (b *restoredStreamBody) Close() error {
+	return b.body.Close()
 }
 
 // errorObjectNamesImageCeiling reports whether an event is a JSON object naming

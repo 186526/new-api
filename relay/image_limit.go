@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -114,12 +115,37 @@ func NamesUpstreamImageLimit(text string) bool {
 	return upstreamImageLimitPattern.MatchString(text)
 }
 
-// init hands the ceiling wording to the native Gemini stream, which reads the
-// first event of a stream before its headers go out. The gemini package cannot
-// import this one: this package imports every adaptor, so the adaptor
-// registers the predicate here instead.
+// init hands the ceiling wording and the builder of a refusal to the native
+// Gemini stream, which reads the first event of a stream before its headers go
+// out. The gemini package cannot import this one: this package imports every
+// adaptor, so the adaptor registers both here instead.
 func init() {
 	gemini.SetStreamRefusalNamesCeiling(NamesUpstreamImageLimit)
+	gemini.SetStreamRefusalError(upstreamImageLimitRefusal)
+}
+
+// upstreamImageLimitRefusal builds the image refusal an event of a stream
+// carries. A streaming request starts its keepalive with the upstream's 2xx, so
+// the event cannot carry a status code of its own; it is read as the 400 an
+// upstream refuses a request with and translated like any other refusal, so the
+// controller writes the context overflow into the committed stream and the
+// client compacts the conversation instead of failing on a 400 it cannot act
+// on.
+//
+// The event text is read the way service.RelayErrorHandler reads a refusal
+// body: a refusal carries its sentence inside an envelope, so the sentence is
+// kept on its own and the ceiling reads once in the translated message instead
+// of arriving wrapped in the JSON the event carries. Any other error keeps the
+// event text, which carries every sentence the client may read it by.
+func upstreamImageLimitRefusal(event string) *types.NewAPIError {
+	upstreamErr := types.NewOpenAIError(errors.New(strings.TrimSpace(event)), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest)
+	var errResponse dto.GeneralErrorResponse
+	if err := common.Unmarshal([]byte(event), &errResponse); err == nil {
+		if oaiError := errResponse.TryToOpenAIError(); oaiError != nil && upstreamImageLimitPattern.MatchString(oaiError.Message) {
+			upstreamErr = types.WithOpenAIError(*oaiError, http.StatusBadRequest)
+		}
+	}
+	return TranslateUpstreamImageLimitError(upstreamErr)
 }
 
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image
