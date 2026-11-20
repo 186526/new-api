@@ -73,14 +73,18 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image
 // count into the local image refusal, so the client reads it as a context
 // overflow and compacts the conversation instead of failing on a 400 it cannot
-// act on. The upstream tried and answered, so the rewritten error skips the
-// retry and names no channel fault: the channel stays enabled.
+// act on. It clears the skip-retry flag of a reply it rewrites and leaves a
+// channel fault untouched, so a channel the upstream named stays disabled.
 //
 // The message keeps the upstream wording and its own limit, so the client and
 // the operator both see what the upstream allowed. The wording is read through
 // MaskSensitiveError, so a key the upstream echoes is masked the same way the
 // envelope masks it. An error of another kind, including one that names a
 // channel fault, is returned unchanged.
+//
+// The channel fault needs no guard of its own: RelayErrorSource answers
+// "channel" for it before it looks at anything else, so the source check below
+// has already turned it away.
 func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError {
 	if err == nil || err.StatusCode != http.StatusBadRequest {
 		return err
@@ -88,13 +92,6 @@ func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError
 	// An error new-api raised itself, before or after an upstream answer, is
 	// not the upstream's wording, even when it quotes the request.
 	if service.RelayErrorSource(err) != "upstream" || !upstreamImageLimitPattern.MatchString(err.Error()) {
-		return err
-	}
-	// A body that names a channel fault keeps its own code, so the channel is
-	// still disabled the way the upstream asked for. RelayErrorSource already
-	// answers "channel" for such an error, which the source guard above turns
-	// away, and IsChannelError repeats that answer for a reader of this file.
-	if types.IsChannelError(err) {
 		return err
 	}
 	return types.WithOpenAIError(types.OpenAIError{

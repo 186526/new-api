@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/metrics"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	prometheusmodel "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -508,8 +509,10 @@ func TestTranslateUpstreamImageLimitErrorCompletesAContextOverflow(t *testing.T)
 }
 
 // TestTranslateUpstreamImageLimitErrorKeepsChannelFaults covers a reply that
-// names the image ceiling and also reports a channel fault: the channel code
-// keeps its meaning so the relay can still disable the channel.
+// names the image ceiling and also reports a channel fault. The translation
+// leaves it alone, so the channel code keeps its meaning and the relay can
+// still disable the channel. The source check alone decides this: the test
+// fails if a rewrite ever drops the channel code.
 func TestTranslateUpstreamImageLimitErrorKeepsChannelFaults(t *testing.T) {
 	apiErr := types.WithOpenAIError(types.OpenAIError{
 		Message: "Total number of images exceeds the maximum allowed of 8.",
@@ -520,6 +523,7 @@ func TestTranslateUpstreamImageLimitErrorKeepsChannelFaults(t *testing.T) {
 	translated := TranslateUpstreamImageLimitError(apiErr)
 	assert.Same(t, apiErr, translated, "a channel fault is not rewritten into the client's image count")
 	assert.True(t, types.IsChannelError(translated))
+	assert.Equal(t, "channel", service.RelayErrorSource(translated), "the source check turns it away, no separate guard is needed")
 }
 
 // TestTranslateUpstreamImageLimitErrorMasksTheKeyItRepeats covers an upstream
