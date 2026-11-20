@@ -313,12 +313,16 @@ func writeRelayStreamError(c *gin.Context, format types.RelayFormat, apiError *t
 	}
 	status.MarkFailed(string(apiError.GetErrorCode()), string(apiError.GetErrorType()), apiError.StatusCode)
 	upstreamURLs := common.UpstreamAddresses(c)
-	if format == types.RelayFormatClaude {
+	switch format {
+	case types.RelayFormatClaude:
 		_ = helper.ClaudeData(c, dto.ClaudeResponse{Type: "error", Error: apiError.ToClaudeError(upstreamURLs...)})
-		return
+	case types.RelayFormatOpenAIResponses:
+		// A Responses stream ends on response.failed with its own envelope.
+		_ = helper.ObjectData(c, gin.H{"type": "response.failed", "response": gin.H{"error": apiError.ToOpenAIError(upstreamURLs...)}})
+	default:
+		_ = helper.ObjectData(c, gin.H{"error": apiError.ToOpenAIError(upstreamURLs...)})
+		helper.Done(c)
 	}
-	_ = helper.ObjectData(c, gin.H{"error": apiError.ToOpenAIError(upstreamURLs...)})
-	helper.Done(c)
 }
 
 // CountClaudeTokens implements Anthropic's token-counting utility endpoint.
