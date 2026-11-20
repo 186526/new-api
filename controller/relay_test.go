@@ -121,6 +121,12 @@ func TestRelayErrorFrameAfterCommittedBytes(t *testing.T) {
 				require.Equal(t, relayErrorCommittedContentTypes[scenario], result.committedContentType, "the client received this Content-Type with its first byte")
 				require.Contains(t, result.body, relayErrorCommittedBodies[scenario], "the bytes the client already read stay first")
 				assertOneErrorFrame(t, format, result.body)
+				if scenario != relayErrorCommittedSSE {
+					// A recorder answers what it cannot detect with
+					// text/plain, so the committed type itself cannot be read
+					// back; the frame excludes that answer.
+					require.NotEqual(t, "text/plain", result.contentType, "the error frame is not read as plain text: %q", result.body)
+				}
 			})
 		}
 	}
