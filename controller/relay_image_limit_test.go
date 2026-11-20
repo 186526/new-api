@@ -567,37 +567,148 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 	}
 }
 
-// TestRelayTranslatesAnUpstreamImageCeilingForGemini covers a Gemini channel
-// that streams a native answer to an upstream which refuses the request for
-// its image count with the measured body. The client reads the context
-// overflow the other formats read, and the upstream is attempted once.
-func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
-	cleanup := allowImageCeilingRelay(t)
-	defer cleanup()
+// imageCeilingGeminiChunk is the native Gemini event the upstream of the
+// last case delivers before it refuses the request inside the same stream.
+const imageCeilingGeminiChunk = `{"candidates":[{"content":{"role":"model","parts":[{"text":"look"}]}}]}`
 
-	upstream := newImageCeilingUpstream(t, http.StatusBadRequest, imageCeilingReply)
-	defer upstream.server.Close()
+// geminiImageCeilingPaths names the ways a native Gemini upstream can answer an
+// image refusal: a JSON 400, and a 200 event stream that opens with the refusal
+// or delivers one event before it. The last two commit the response headers
+// before the refusal is readable, which is the case the stream cannot report a
+// status code on.
+var geminiImageCeilingPaths = []struct {
+	name string
+	path string
+	// stream answers with a 200 event stream that carries the refusal after
+	// one event instead of a non-200 body.
+	stream bool
+}{
+	{name: "generateContent", path: "/v1beta/models/gemini-ceiling-test:generateContent"},
+	{name: "streamGenerateContent refused before the first event", path: "/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse"},
+	{name: "streamGenerateContent refused after an event", path: "/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse", stream: true},
+}
+
+// TestRelayTranslatesAnUpstreamImageCeilingForGemini covers a Gemini channel on
+// every path an image refusal arrives on. The client reads the context
+// overflow the other formats read, on the JSON 400 and on the refusal a stream
+// carries before its first chunk and after it, and the upstream is attempted
+// once on every path.
+func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
+	for _, tc := range geminiImageCeilingPaths {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanup := allowImageCeilingRelay(t)
+			defer cleanup()
+			previousTimeout := constant.StreamingTimeout
+			constant.StreamingTimeout = 30
+			defer func() { constant.StreamingTimeout = previousTimeout }()
+
+			var upstream *imageCeilingUpstream
+			if tc.stream {
+				upstream = newStreamImageCeilingUpstream(t, imageCeilingReply)
+			} else {
+				upstream = newImageCeilingUpstream(t, http.StatusBadRequest, imageCeilingReply)
+			}
+			defer upstream.server.Close()
+			gateway := imageCeilingGeminiGateway(t, upstream.server.URL)
+			defer gateway.Close()
+
+			statusCode, payload := postGeminiImageCeiling(t, gateway.URL, tc.path)
+
+			code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, statusCode, payload)
+			assert.Equal(t, "context_length_exceeded", code)
+			assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+			assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
+			assertImageOverflowWording(t, message)
+			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+		})
+	}
+}
+
+// newStreamImageCeilingUpstream answers with a 200 event stream that delivers
+// one event and then the refusal, which is how an upstream that already
+// committed the stream refuses a request.
+func newStreamImageCeilingUpstream(t *testing.T, refusal string) *imageCeilingUpstream {
+	t.Helper()
+	upstream := &imageCeilingUpstream{}
+	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream.attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+imageCeilingGeminiChunk+"\n\n")
+		_, _ = io.WriteString(w, "data: "+refusal+"\n\n")
+	}))
+	t.Cleanup(upstream.server.Close)
+	return upstream
+}
+
+// imageCeilingGeminiGateway serves Relay on a Gemini channel whose base URL is
+// the test upstream.
+func imageCeilingGeminiGateway(t *testing.T, upstreamURL string) *httptest.Server {
+	t.Helper()
 	engine := gin.New()
 	engine.POST("/v1beta/models/:model", func(c *gin.Context) {
-		selectDistributorChannelOfType(c, upstream.server.URL, 0, constant.ChannelTypeGemini)
+		selectDistributorChannelOfType(c, upstreamURL, 0, constant.ChannelTypeGemini)
 		Relay(c, types.RelayFormatGemini)
 	})
-	gateway := httptest.NewServer(engine)
-	defer gateway.Close()
+	return httptest.NewServer(engine)
+}
 
-	path := "/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse"
-	response, err := http.Post(gateway.URL+path, "application/json", strings.NewReader(imageCeilingGeminiBody))
+func postGeminiImageCeiling(t *testing.T, gatewayURL string, path string) (int, []byte) {
+	t.Helper()
+	response, err := http.Post(gatewayURL+path, "application/json", strings.NewReader(imageCeilingGeminiBody))
 	require.NoError(t, err)
 	defer response.Body.Close()
 	payload, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
+	return response.StatusCode, payload
+}
 
-	code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, response.StatusCode, payload)
-	assert.Equal(t, "context_length_exceeded", code)
-	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
-	assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
-	assertImageOverflowWording(t, message)
+// TestRelayKeepsANonImageGeminiStreamError is the counter-case next to the
+// image ceiling: a stream that fails for another reason keeps the error it was
+// raised as, so the rewrite only reaches the refusal it recognizes.
+func TestRelayKeepsANonImageGeminiStreamError(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest,
+		`{"error":{"message":"Invalid model: gemini-unknown","type":"invalid_request_error","code":"1002"}}`)
+	defer upstream.server.Close()
+	gateway := imageCeilingGeminiGateway(t, upstream.server.URL)
+	defer gateway.Close()
+
+	statusCode, payload := postGeminiImageCeiling(t, gateway.URL,
+		"/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse")
+
+	code, message := imageCeilingEnvelope(t, types.RelayFormatOpenAI, statusCode, payload)
+	assert.NotEqual(t, "context_length_exceeded", code, "an error of another kind keeps its own code: %s", payload)
+	assert.Equal(t, "1002", code)
+	assert.Equal(t, "Invalid model: gemini-unknown", message)
 	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// TestRelayKeepsAGeminiStreamThatOpensWithAChunk covers the stream the
+// detection reads ahead of: an upstream that answers with events instead of a
+// refusal is streamed as before, every event reaching the client.
+func TestRelayKeepsAGeminiStreamThatOpensWithAChunk(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	defer func() { constant.StreamingTimeout = previousTimeout }()
+
+	upstream := newImageCeilingUpstream(t, http.StatusOK,
+		"data: "+imageCeilingGeminiChunk+"\n\n"+
+			"data: "+`{"candidates":[{"content":{"role":"model","parts":[{"text":" done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}`+"\n\n")
+	defer upstream.server.Close()
+	gateway := imageCeilingGeminiGateway(t, upstream.server.URL)
+	defer gateway.Close()
+
+	statusCode, payload := postGeminiImageCeiling(t, gateway.URL,
+		"/v1beta/models/gemini-ceiling-test:streamGenerateContent?alt=sse")
+
+	require.Equal(t, http.StatusOK, statusCode, "response body: %s", payload)
+	assert.NotContains(t, string(payload), `"error"`, "the events are streamed, not refused")
+	assert.Contains(t, string(payload), `"look"`, "the event delivered before the detection still reaches the client")
+	assert.Contains(t, string(payload), `" done"`)
 }
 
 // imageCeilingGeminiBody is a native Gemini request carrying a text turn.

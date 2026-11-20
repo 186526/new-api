@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
+	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -105,6 +106,20 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+}
+
+// NamesUpstreamImageLimit reports whether a text names an image ceiling in one
+// of the wordings upstreamImageLimitWordings lists.
+func NamesUpstreamImageLimit(text string) bool {
+	return upstreamImageLimitPattern.MatchString(text)
+}
+
+// init hands the ceiling wording to the native Gemini stream, which reads the
+// first event of a stream before its headers go out. The gemini package cannot
+// import this one: this package imports every adaptor, so the adaptor
+// registers the predicate here instead.
+func init() {
+	gemini.SetStreamRefusalNamesCeiling(NamesUpstreamImageLimit)
 }
 
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image
