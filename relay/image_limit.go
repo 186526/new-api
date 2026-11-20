@@ -16,6 +16,17 @@ import (
 // the conversation is compacted.
 const imageLimitErrorCode types.ErrorCode = "context_length_exceeded"
 
+// ChannelImageLimit returns the max_images_per_request the selected channel
+// carries. The setting must come from the channel settings the distributor
+// stored in the request context: at the point of the image check the channel
+// object is a stub without settings, because getChannel rebuilds it from the
+// context id, and the relay info carries no channel settings either, because
+// the handler fills ChannelMeta after the check. A zero setting leaves the
+// channel unlimited.
+func ChannelImageLimit(settings dto.ChannelSettings) int {
+	return settings.MaxImagesPerRequest
+}
+
 // CheckRequestImageLimit refuses a request that carries more distinct images
 // than the channel's max_images_per_request. The setting is the upstream's own
 // limit, so a request holding exactly that many images still reaches the
