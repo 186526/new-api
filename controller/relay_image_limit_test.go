@@ -651,11 +651,19 @@ func TestRelayTranslatesAClaudeEnvelopeImageCeiling(t *testing.T) {
 
 // TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind is the counter-case next to
 // the ceiling: a Claude envelope that names no ceiling is read the way the relay
-// read it before the envelope reader existed, on both paths. service.
-// RelayErrorHandler unwraps it as a general error object, so the type the client
-// reads is the type that object carries and the status stays the 400 the
-// upstream answered with. An envelope of another kind is not translated, not
-// retried and not disabled: the upstream is attempted once.
+// read it before the envelope reader existed, on both paths. The status stays
+// the 400 the upstream answered with and the message is the one the envelope
+// carries; the type is the one service.RelayErrorHandler's reply carries, not
+// the type the envelope named.
+//
+// That type is the string "<nil>", and it is pinned here because it is what a
+// client reads: RelayErrorHandler decodes the envelope's `error` into
+// types.OpenAIError, whose fields are Message and a Code any with no Type, so
+// the envelope's type lands in Code and Code is empty for a body that names
+// none; NewAPIError.ToClaudeError writes error.type with
+// fmt.Sprintf("%v", openAIError.Code), and fmt.Sprint of an unset any is "<nil>".
+// An error of another kind is not translated, not retried and not disabled, so
+// the upstream is attempted once.
 func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
@@ -670,6 +678,8 @@ func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
 		{name: "streaming", body: func(t *testing.T) string { return imageCeilingClaudeStreamBody(t, 1) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// allowImageCeilingRelay turns channel auto-disable on, so the
+			// decision below is the one the relay makes in production.
 			cleanup := allowImageCeilingRelay(t)
 			defer cleanup()
 
@@ -681,10 +691,30 @@ func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
 			statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, tc.body(t))
 
 			code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
-			assert.NotEqual(t, "invalid_request_error", code, "an envelope that names no ceiling is not raised as one: %s", payload)
-			assert.NotEqual(t, "context_length_exceeded", code)
+			assert.Equal(t, "<nil>", code, "an envelope that names no ceiling keeps the reply the status handler raises: %s", payload)
 			assert.Equal(t, "max_tokens: field required (request id: )", message)
 			assert.Equal(t, int32(1), upstream.attempts.Load(), "an envelope of another kind is never retried")
+
+			// The relay writes its reply and returns the error it settled on
+			// without exposing it, so the error the loop reached at the point
+			// of the reader is rebuilt and settled the way the loop settles
+			// it: the reader leaves this envelope to service.RelayErrorHandler,
+			// which answers the same 400, the translation leaves it unchanged,
+			// and the retry and health decisions are read on that error.
+			httpResp := &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(envelope)),
+			}
+			engine, _ := gin.CreateTestContext(httptest.NewRecorder())
+			engine.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			settled := service.RelayErrorHandler(engine.Request.Context(), httpResp, false)
+			require.Equal(t, http.StatusBadRequest, settled.StatusCode)
+			settled = relay.TranslateUpstreamImageLimitError(settled)
+			require.Equal(t, types.ErrorCode("unknown_error"), settled.GetErrorCode(), "an envelope of another kind is not the ceiling")
+			require.False(t, types.IsSkipRetryError(settled), "the envelope carries no skip-retry flag, so the status decides the rest")
+			assert.Equal(t, "stop", service.DecideRelayRetry(engine, settled, common.RetryTimes).Action, "an envelope of another kind is not retried")
+			assert.False(t, service.ShouldDisableChannel(settled), "a 400 envelope of another kind disables no channel")
 		})
 	}
 }
