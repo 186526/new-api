@@ -27,6 +27,8 @@ func TestCheckRequestImageLimitIgnoresTheStubChannelSettings(t *testing.T) {
 	selected := dto.ChannelSettings{MaxImagesPerRequest: 20}
 	request := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(21))
 
+	assert.Equal(t, 20, selected.MaxImagesPerRequest, "the limit is the configured value")
+	assert.Equal(t, 0, channel.GetSetting().MaxImagesPerRequest, "the stub channel reports no limit")
 	assert.Nil(t, CheckRequestImageLimit(request, types.RelayFormatOpenAI, channel.GetSetting().MaxImagesPerRequest, channel.Id, channel.Name, imageLimitTestModel),
 		"the stub channel's own settings leave the channel unlimited")
 	assert.NotNil(t, CheckRequestImageLimit(request, types.RelayFormatOpenAI, selected.MaxImagesPerRequest, channel.Id, channel.Name, imageLimitTestModel),

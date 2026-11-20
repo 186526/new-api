@@ -51,7 +51,7 @@ func TestRelayRefusesTheImagePastTheChannelLimit(t *testing.T) {
 	defer cleanup()
 
 	upstream := newImageLimitUpstream(t)
-	gateway := imageLimitRelayGateway(t, upstream.server.URL)
+	gateway := imageLimitRelayGateway(t, upstream.server.URL, 20)
 	defer gateway.Close()
 
 	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBody(t, 21)))
@@ -71,15 +71,19 @@ func TestRelayRefusesTheImagePastTheChannelLimit(t *testing.T) {
 	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
 }
 
-// TestRelaySendsTheImagesWithinTheChannelLimit covers the other side of the
+// TestRelaySendsTheImagesWithinTheChannelLimit covers the allowing side of the
 // same path: at exactly the limit the request goes out, so the client gets the
-// upstream's own answer instead of a local refusal.
+// upstream's own answer. A local refusal and an upstream error are told apart
+// by the answer body, not only by the status. This test cannot tell the limit
+// apart from a zero limit: both let the request out. The limit the check reads
+// is asserted in TestRelayRefusesTheImagesPastALowerChannelLimit and in the
+// relay package's unit tests.
 func TestRelaySendsTheImagesWithinTheChannelLimit(t *testing.T) {
 	cleanup := allowImageLimitRelayModel(t)
 	defer cleanup()
 
 	upstream := newImageLimitUpstream(t)
-	gateway := imageLimitRelayGateway(t, upstream.server.URL)
+	gateway := imageLimitRelayGateway(t, upstream.server.URL, 20)
 	defer gateway.Close()
 
 	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBody(t, 20)))
@@ -104,20 +108,61 @@ func TestRelaySendsTheImagesWithinTheChannelLimit(t *testing.T) {
 	assert.Equal(t, "ok", body.Choices[0].Message.Content)
 }
 
-// allowImageLimitRelayModel takes the test off token counting and billing: the
-// model has a zero ratio, so the relay reaches the image check without a wallet
-// pre-consume on a database user. Both settings are restored when the test ends.
+// TestRelayRefusesTheImagesPastALowerChannelLimit proves the configured value
+// reaches the check on the real relay path: the same 20-image request is sent,
+// the channel limit is 19, and the refusal names 19. The request would pass a
+// zero limit and a limit of 20, so this is the case that tells the limit apart.
+func TestRelayRefusesTheImagesPastALowerChannelLimit(t *testing.T) {
+	cleanup := allowImageLimitRelayModel(t)
+	defer cleanup()
+
+	upstream := newImageLimitUpstream(t)
+	gateway := imageLimitRelayGateway(t, upstream.server.URL, 19)
+	defer gateway.Close()
+
+	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBody(t, 20)))
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, response.StatusCode, "response body: %s", payload)
+	var body struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(payload, &body))
+	assert.Equal(t, "context_length_exceeded", body.Error.Code)
+	assert.Contains(t, body.Error.Message, "Total number of images (20) exceeds the maximum allowed of 19")
+	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
+}
+
+// allowImageLimitRelayModel takes the test off token counting, billing and
+// consume logging: the model has a zero ratio, so the relay reaches the image
+// check without a wallet pre-consume on a database user, quota settlement
+// accumulates in memory (BatchUpdateEnabled) instead of writing to a database
+// the test does not open, and no consume log is recorded, which would read the
+// user setting through the user cache. Every setting is restored when the test
+// ends.
 func allowImageLimitRelayModel(t *testing.T) func() {
 	t.Helper()
 	previousCount := constant.CountToken
 	previousRatios := ratio_setting.GetModelRatioCopy()
+	previousBatchUpdate := common.BatchUpdateEnabled
+	previousLogConsume := common.LogConsumeEnabled
 	quotaSetting := operation_setting.GetQuotaSetting()
 	previousFreeModelPreConsume := quotaSetting.EnableFreeModelPreConsume
 	constant.CountToken = false
+	common.BatchUpdateEnabled = true
+	common.LogConsumeEnabled = false
 	quotaSetting.EnableFreeModelPreConsume = false
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"mistral-large-latest": 0}`))
 	return func() {
 		constant.CountToken = previousCount
+		common.BatchUpdateEnabled = previousBatchUpdate
+		common.LogConsumeEnabled = previousLogConsume
 		quotaSetting.EnableFreeModelPreConsume = previousFreeModelPreConsume
 		ratios, err := json.Marshal(previousRatios)
 		if err == nil {
@@ -130,22 +175,22 @@ func allowImageLimitRelayModel(t *testing.T) func() {
 // a selected channel, which is the path whose channel object is a stub. The
 // channel base URL points at the test upstream, so a request that passes the
 // image check really leaves the gateway.
-func imageLimitRelayGateway(t *testing.T, upstreamURL string) *httptest.Server {
+func imageLimitRelayGateway(t *testing.T, upstreamURL string, imageLimit int) *httptest.Server {
 	t.Helper()
 	engine := gin.New()
 	engine.POST("/v1/chat/completions", func(c *gin.Context) {
-		selectDistributorChannel(c, upstreamURL)
+		selectDistributorChannel(c, upstreamURL, imageLimit)
 		Relay(c, types.RelayFormatOpenAI)
 	})
 	return httptest.NewServer(engine)
 }
 
-func selectDistributorChannel(c *gin.Context, upstreamURL string) {
+func selectDistributorChannel(c *gin.Context, upstreamURL string, imageLimit int) {
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, "mistral-large-latest")
 	common.SetContextKey(c, constant.ContextKeyChannelId, imageLimitRelayChannelId)
 	common.SetContextKey(c, constant.ContextKeyChannelName, "mistral")
 	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeMistral)
-	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{MaxImagesPerRequest: 20})
+	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{MaxImagesPerRequest: imageLimit})
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstreamURL)
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "image-limit-test-key")
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, true)
