@@ -113,7 +113,7 @@ func ImageCeilingRefusalFor(relayFormat types.RelayFormat, data string) *types.N
 	return imageCeilingRefusal(relayFormat, data)
 }
 
-func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
+func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string, httpResp *http.Response) *types.NewAPIError {
 	// A refusal the handler translates is returned alone: the controller writes
 	// it as the one error event of the relay, after the events before it. The
 	// handle is asked before the event is read as a Claude response, because a
@@ -130,7 +130,7 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return types.WithClaudeError(*claudeError, claudeEnvelopeStatusCode(httpResp))
 	}
 	if claudeResponse.Type == "message_start" && claudeResponse.Message != nil {
 		info.ObserveResponseModel(claudeResponse.Message.Model)
@@ -385,7 +385,7 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	// writes it as the one error event of the relay after the events before it.
 	// Any other error stops the scanner and is returned the way it always was.
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		err = HandleStreamResponseData(c, info, claudeInfo, data)
+		err = HandleStreamResponseData(c, info, claudeInfo, data, resp)
 		if err != nil {
 			// A translated refusal is the end of the stream, not a fault of it:
 			// the controller writes it as the one error event after the events
@@ -409,6 +409,18 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	return claudeInfo.Usage, nil
 }
 
+// claudeEnvelopeStatusCode is the status an error envelope is raised with: the
+// status the upstream answered with, so a refusal the upstream made with a 400
+// stays a 400 and the retry loop can read it as the image ceiling it is. An
+// envelope read from a 2xx answer keeps the 500 it always had, because such an
+// upstream named no status of its own.
+func claudeEnvelopeStatusCode(httpResp *http.Response) int {
+	if httpResp != nil && httpResp.StatusCode >= http.StatusBadRequest && httpResp.StatusCode <= 599 {
+		return httpResp.StatusCode
+	}
+	return http.StatusInternalServerError
+}
+
 func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
 	err := common.Unmarshal(data, &claudeResponse)
@@ -416,7 +428,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return types.WithClaudeError(*claudeError, claudeEnvelopeStatusCode(httpResp))
 	}
 	info.ObserveResponseModel(claudeResponse.Model)
 	maybeMarkClaudeRefusal(c, info, claudeResponse.StopReason)

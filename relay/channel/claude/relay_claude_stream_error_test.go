@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -54,10 +55,17 @@ func claudeImageCeilingRefusal(t *testing.T) {
 	t.Cleanup(func() { SetImageCeilingRefusal(realTranslation) })
 }
 
-// newClaudeStreamHandlerContext runs ClaudeStreamHandler on an event stream
-// written by the test upstream, with the same relay state the retry loop hands
+// newClaudeStreamHandlerContext runs ClaudeStreamHandler on the event stream a
+// test upstream answers with 200, with the same relay state the retry loop hands
 // the handler.
 func newClaudeStreamHandlerContext(t *testing.T, relayFormat types.RelayFormat, stream string) (*httptest.ResponseRecorder, *types.NewAPIError) {
+	t.Helper()
+	return newClaudeStreamHandlerContextWithStatus(t, http.StatusOK, relayFormat, stream)
+}
+
+// newClaudeStreamHandlerContextWithStatus is the same with the status the
+// upstream answered the stream with.
+func newClaudeStreamHandlerContextWithStatus(t *testing.T, statusCode int, relayFormat types.RelayFormat, stream string) (*httptest.ResponseRecorder, *types.NewAPIError) {
 	t.Helper()
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
@@ -67,7 +75,7 @@ func newClaudeStreamHandlerContext(t *testing.T, relayFormat types.RelayFormat, 
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	resp := &http.Response{
-		StatusCode: http.StatusOK,
+		StatusCode: statusCode,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 		Body:       io.NopCloser(strings.NewReader(stream)),
 	}
@@ -171,6 +179,29 @@ func TestClaudeStreamHandlerKeepsANonImageStreamError(t *testing.T) {
 	assert.Equal(t, types.ErrorTypeClaudeError, apiErr.GetErrorType())
 	assert.Equal(t, types.ErrorCode("api_error"), apiErr.GetErrorCode())
 	assert.Equal(t, "Overloaded", apiErr.Error())
+}
+
+// TestClaudeStreamHandlerKeepsTheStatusOfAnErrorEnvelope covers the error the
+// handler raises from an error event its translation does not answer. The
+// answer it was read from carries the status the upstream refused the request
+// with, so an envelope read from a 400 is raised as a 400: that status is what
+// the retry loop recognizes the image ceiling by, and a 500 keeps it from
+// translating a refusal the translation hook does not catch on its own.
+func TestClaudeStreamHandlerKeepsTheStatusOfAnErrorEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	realTranslation := SetImageCeilingRefusal(nil)
+	t.Cleanup(func() { SetImageCeilingRefusal(realTranslation) })
+
+	for _, statusCode := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			_, apiErr := newClaudeStreamHandlerContextWithStatus(t, statusCode, types.RelayFormatClaude, claudeErrorEvent("invalid_request_error", claudeImageCeilingMessage))
+
+			require.NotNil(t, apiErr)
+			assert.Equal(t, statusCode, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorTypeClaudeError, apiErr.GetErrorType())
+			assert.Equal(t, claudeImageCeilingMessage, apiErr.Error())
+		})
+	}
 }
 
 // TestClaudeStreamHandlerLeavesTheStreamAloneWithoutATranslation covers the

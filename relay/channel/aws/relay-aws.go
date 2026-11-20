@@ -295,7 +295,9 @@ streamLoop:
 			switch v := event.(type) {
 			case *bedrockruntimeTypes.ResponseStreamMemberChunk:
 				info.SetFirstResponseTime()
-				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
+				// An invocation stream answers no HTTP status of its own, so an
+				// error event it carries is raised the way it always was.
+				respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes), nil)
 				if respErr != nil {
 					return respErr, nil
 				}

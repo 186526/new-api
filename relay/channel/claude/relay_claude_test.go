@@ -2,8 +2,10 @@ package claude
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,14 +46,14 @@ func TestClaudeStreamFinalUsageEstimatesOnlyUncountedUsage(t *testing.T) {
 			info.SetEstimatePromptTokens(1200)
 			state := &ClaudeResponseInfo{Usage: &dto.Usage{}}
 			start := fmt.Sprintf(`{"type":"message_start","message":{"id":"msg_1","model":"claude-opus-4-8","usage":%s}}`, tc.startUsage)
-			require.Nil(t, HandleStreamResponseData(c, info, state, start))
+			require.Nil(t, HandleStreamResponseData(c, info, state, start, nil))
 			if tc.streamText {
-				require.Nil(t, HandleStreamResponseData(c, info, state, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`))
+				require.Nil(t, HandleStreamResponseData(c, info, state, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`, nil))
 			}
 			if tc.deltaUsage != "" {
 				delta := fmt.Sprintf(`{"type":"message_delta","delta":{"stop_reason":%q},"usage":%s}`, tc.stopReason, tc.deltaUsage)
-				require.Nil(t, HandleStreamResponseData(c, info, state, delta))
-				require.Nil(t, HandleStreamResponseData(c, info, state, `{"type":"message_stop"}`))
+				require.Nil(t, HandleStreamResponseData(c, info, state, delta, nil))
+				require.Nil(t, HandleStreamResponseData(c, info, state, `{"type":"message_stop"}`, nil))
 			}
 			HandleStreamFinalResponse(c, info, state)
 			assert.Equal(t, tc.wantInput, state.Usage.PromptTokens)
@@ -499,6 +501,68 @@ func TestClaudeResponsePassesInputTransformationsThrough(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
 	event := `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],` +
 		transformations + `,"usage":{"input_tokens":5,"output_tokens":1}}}`
-	require.Nil(t, HandleStreamResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, event))
+	require.Nil(t, HandleStreamResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, event, nil))
 	assert.Contains(t, w.Body.String(), "data: "+event+"\n")
+}
+
+// envelopeRefusalBody is the image ceiling as a Claude upstream wraps it: the
+// measured sentence of api.mistral.ai inside the error envelope of the
+// Anthropic Messages API.
+const envelopeRefusalBody = `{"type":"error","error":{"type":"invalid_request_error","message":"Total number of images exceeds the maximum allowed of 8."}}`
+
+// envelopeUpstreamStatuses are the statuses an upstream can answer an error
+// envelope with. The relay keeps the status it was answered with, so the image
+// ceiling the envelope carries is read as the status the upstream refused it
+// with; 200 is the case an upstream commits before it fails.
+var envelopeUpstreamStatuses = []int{http.StatusOK, http.StatusBadRequest, http.StatusInternalServerError}
+
+// handleClaudeEnvelope runs HandleClaudeResponseData on the envelope as the
+// upstream would have sent it with the given status.
+func handleClaudeEnvelope(t *testing.T, statusCode int, body string) *types.NewAPIError {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatClaude,
+		ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-opus-4-8"},
+	}
+	resp := &http.Response{StatusCode: statusCode, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+	return HandleClaudeResponseData(c, info, &ClaudeResponseInfo{Usage: &dto.Usage{}}, resp, []byte(body))
+}
+
+// TestClaudeEnvelopeKeepsTheUpstreamStatusCode covers the status the non
+// streaming handler raises an error envelope with. The retry loop translates a
+// refusal only when it carries a 400, and a translation is skipped under any
+// other status, so the status the upstream refused the request with is the one
+// the envelope is raised with; an error envelope read from a 2xx answer keeps
+// the 500 it always had.
+func TestClaudeEnvelopeKeepsTheUpstreamStatusCode(t *testing.T) {
+	for _, statusCode := range envelopeUpstreamStatuses {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			apiErr := handleClaudeEnvelope(t, statusCode, envelopeRefusalBody)
+
+			require.NotNil(t, apiErr)
+			wantStatusCode := statusCode
+			if statusCode < http.StatusBadRequest || statusCode > 599 {
+				wantStatusCode = http.StatusInternalServerError
+			}
+			assert.Equal(t, wantStatusCode, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorTypeClaudeError, apiErr.GetErrorType())
+		})
+	}
+}
+
+// TestClaudeEnvelopeKeepsANonImageError is the counter-case next to the
+// ceiling: an error envelope of another kind keeps its own type and status
+// wherever it arrives, so the status is the only thing the handler takes from
+// the upstream and the error is otherwise untouched.
+func TestClaudeEnvelopeKeepsANonImageError(t *testing.T) {
+	apiErr := handleClaudeEnvelope(t, http.StatusBadRequest,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: field required"}}`)
+
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	assert.Equal(t, types.ErrorCode("invalid_request_error"), apiErr.GetErrorCode())
+	assert.Equal(t, "max_tokens: field required", apiErr.Error())
 }

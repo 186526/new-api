@@ -489,6 +489,35 @@ func TestTranslateUpstreamImageLimitErrorRewritesTheUpstreamRefusal(t *testing.T
 	}
 }
 
+// TestTranslateUpstreamImageLimitErrorReadsAClaudeEnvelope covers the refusal a
+// Claude handler raises from the error envelope of the Anthropic Messages API
+// with the status the upstream answered with, the status that is the whole
+// condition the translation reads. The same envelope raised with the 500 the
+// handler used to raise it with stays untranslated, which is why the handler
+// keeps the upstream's status instead of the translation accepting another one.
+func TestTranslateUpstreamImageLimitErrorReadsAClaudeEnvelope(t *testing.T) {
+	envelope := `{"type":"error","error":{"type":"invalid_request_error","message":"Total number of images exceeds the maximum allowed of 8."}}`
+	raised := func(statusCode int) *types.NewAPIError {
+		var claudeResponse dto.ClaudeResponse
+		require.NoError(t, json.Unmarshal([]byte(envelope), &claudeResponse))
+		claudeError := claudeResponse.GetClaudeError()
+		require.NotNil(t, claudeError)
+		return types.WithClaudeError(*claudeError, statusCode)
+	}
+
+	translated := TranslateUpstreamImageLimitError(raised(http.StatusBadRequest))
+	assert.Equal(t, imageLimitErrorCode, translated.GetErrorCode())
+	assert.Equal(t, http.StatusBadRequest, translated.StatusCode)
+	assert.True(t, types.IsSkipRetryError(translated), "the refusal is not retried on another channel")
+	assert.Equal(t, imageLimitMessage("Total number of images exceeds the maximum allowed of 8."), translated.Error())
+	assert.Equal(t, imageLimitErrorCode, types.ErrorCode(translated.ToClaudeError().Type),
+		"a Claude client reads the code from the type of the error it is written as")
+
+	kept := TranslateUpstreamImageLimitError(raised(http.StatusInternalServerError))
+	assert.Equal(t, types.ErrorCode("invalid_request_error"), kept.GetErrorCode(), "another status keeps the error it was raised as")
+	assert.Equal(t, "Total number of images exceeds the maximum allowed of 8.", kept.Error())
+}
+
 // TestTranslateUpstreamImageLimitErrorReadsTheUpstreamJSONBody covers the body
 // measured on Command Code behind channels 3 and 4: a 400 whose error object is
 // the per-turn ceiling. The body is read the way the relay reads every upstream

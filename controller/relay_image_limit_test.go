@@ -584,6 +584,62 @@ func TestRelayTranslatesAnUpstreamImageCeiling(t *testing.T) {
 	}
 }
 
+// claudeImageCeilingReply is the image ceiling as a Claude upstream writes it:
+// the measured sentence inside the error envelope of the Anthropic Messages
+// API. The Claude handler raises its own error from that envelope rather than
+// from the status the upstream answered with, so the status is what decides
+// whether the retry loop recognizes the refusal.
+const claudeImageCeilingReply = `{"type":"error","error":{"type":"invalid_request_error","message":"Total number of images exceeds the maximum allowed of 8."}}`
+
+// TestRelayTranslatesAClaudeEnvelopeImageCeiling covers a Claude client whose
+// non-streaming upstream answers the image ceiling inside the error envelope of
+// the Messages API with a 400. The Claude handler used to raise the envelope as
+// a 500 whatever the status it arrived with, and the retry loop translates a
+// refusal by the status only, so the client read a 500 it could not act on.
+// The envelope keeps the status the upstream refused it with now, so the client
+// reads the context overflow and the upstream is attempted once.
+func TestRelayTranslatesAClaudeEnvelopeImageCeiling(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest, claudeImageCeilingReply)
+	defer upstream.server.Close()
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeBody(t, 1))
+
+	code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
+	assert.Equal(t, "context_length_exceeded", code)
+	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
+	assertImageOverflowWording(t, message)
+	requireImageCeilingMessageToldOnce(t, message)
+	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
+}
+
+// TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind is the counter-case next to
+// the ceiling: an error envelope of another kind keeps the status the upstream
+// answered with and its message, so the change reaches the status only. It is
+// written the way the relay wrote every Claude envelope before this change,
+// which is what the case checks: a translation that widened its status guard
+// would rewrite this reply too.
+func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
+	cleanup := allowImageCeilingRelay(t)
+	defer cleanup()
+
+	upstream := newImageCeilingUpstream(t, http.StatusBadRequest,
+		`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: field required"}}`)
+	defer upstream.server.Close()
+	gateway := imageCeilingGateway(t, upstream.server.URL, types.RelayFormatClaude)
+	defer gateway.Close()
+
+	statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, imageCeilingClaudeBody(t, 1))
+
+	want := `{"error":{"type":"<nil>","message":"max_tokens: field required (request id: )"},"type":"error"}`
+	assert.Equal(t, http.StatusBadRequest, statusCode, "response body: %s", payload)
+	assert.JSONEq(t, want, string(payload))
+}
+
 // imageCeilingGeminiChunk is the native Gemini event the upstream of the
 // last case delivers before it refuses the request inside the same stream.
 const imageCeilingGeminiChunk = `{"candidates":[{"content":{"role":"model","parts":[{"text":"look"}]}}]}`

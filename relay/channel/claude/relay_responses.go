@@ -101,7 +101,7 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 				sr.Stop(streamErr)
 				return
 			}
-			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+			streamErr = types.WithClaudeError(*claudeError, claudeEnvelopeStatusCode(resp))
 			sr.Stop(streamErr)
 			return
 		}
