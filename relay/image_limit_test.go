@@ -261,7 +261,9 @@ func TestUpstreamModelNamesIncludeTheMappingTarget(t *testing.T) {
 	settings := imageLimitModelSettings()
 	for _, name := range []string{imageLimitMappedAlias, imageLimitMappedModel} {
 		t.Run(name, func(t *testing.T) {
-			assert.Contains(t, UpstreamModelNames(settings, imageLimitModelMapping(), name), imageLimitMappedModel)
+			names, err := UpstreamModelNames(settings, imageLimitModelMapping(), name)
+			require.NoError(t, err)
+			assert.Contains(t, names, imageLimitMappedModel)
 			nine := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(9))
 			apiErr := CheckRequestImageLimitForModels(nine, types.RelayFormatOpenAI, settings, imageLimitModelMapping(), 1, "mistral", name)
 			require.NotNil(t, apiErr, "the limit configured for %s applies to a request for %s", imageLimitMappedModel, name)
@@ -285,22 +287,92 @@ func TestCheckRequestImageLimitForModelsFallsBackToTheChannelLimit(t *testing.T)
 
 func TestUpstreamModelNames(t *testing.T) {
 	settings := imageLimitModelSettings()
-	assert.Equal(t, []string{imageLimitMappedAlias, imageLimitMappedModel},
-		UpstreamModelNames(settings, imageLimitModelMapping(), imageLimitMappedAlias))
-	assert.Equal(t, []string{imageLimitMappedModel},
-		UpstreamModelNames(settings, "", imageLimitMappedModel))
-	assert.Equal(t, []string{"plain-model"},
-		UpstreamModelNames(settings, imageLimitModelMapping(), "plain-model"))
-	assert.Equal(t, []string{"plain-model"},
-		UpstreamModelNames(settings, "{not json", "plain-model"))
+	for _, tc := range []struct {
+		name         string
+		modelMapping string
+		model        string
+		want         []string
+	}{
+		{name: "mapping target", modelMapping: imageLimitModelMapping(), model: imageLimitMappedAlias,
+			want: []string{imageLimitMappedAlias, imageLimitMappedModel}},
+		{name: "no mapping", model: imageLimitMappedModel, want: []string{imageLimitMappedModel}},
+		{name: "unmapped model", modelMapping: imageLimitModelMapping(), model: "plain-model", want: []string{"plain-model"}},
+		{name: "unreadable mapping", modelMapping: "{not json", model: "plain-model", want: []string{"plain-model"}},
+		{name: "self mapping", modelMapping: `{"a-model":"a-model"}`, model: "a-model", want: []string{"a-model"}},
+		{name: "chain", modelMapping: `{"first-model":"second-model","second-model":"third-model"}`, model: "first-model",
+			want: []string{"first-model", "third-model"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			names, err := UpstreamModelNames(settings, tc.modelMapping, tc.model)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, names)
+		})
+	}
+
 	cycle := `{"a-model":"b-model","b-model":"a-model"}`
-	assert.Equal(t, []string{"a-model"}, UpstreamModelNames(settings, cycle, "a-model"),
-		"a mapping cycle leaves the requested name in place")
-	self := `{"a-model":"a-model"}`
-	assert.Equal(t, []string{"a-model"}, UpstreamModelNames(settings, self, "a-model"))
-	chain := `{"first-model":"second-model","second-model":"third-model"}`
-	assert.Equal(t, []string{"first-model", "third-model"}, UpstreamModelNames(settings, chain, "first-model"),
-		"a mapping chain is followed to its end")
+	_, err := UpstreamModelNames(settings, cycle, "a-model")
+	require.Error(t, err, "a mapping cycle has no model to send the request under")
+	assert.Contains(t, err.Error(), "model_mapping_contains_cycle")
+	var cycleErr *modelMappingCycleError
+	assert.ErrorAs(t, err, &cycleErr)
+
+	// A model that merely points into a cycle still reports it: the chain it
+	// entered never ends.
+	_, err = UpstreamModelNames(settings, `{"entry-model":"a-model","a-model":"b-model","b-model":"a-model"}`, "entry-model")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model_mapping_contains_cycle")
+}
+
+// A channel whose model_mapping forms a cycle never delivers the request: the
+// relay fails it with model_mapping_contains_cycle. The image check refuses it
+// the same way instead of comparing its images against the channel-wide 20,
+// which would let 9 to 20 images of a model limited to 8 through to that
+// failure.
+func TestCheckRequestImageLimitForModelsRefusesAMappingCycle(t *testing.T) {
+	settings := imageLimitModelSettings()
+	cycle := `{"glm-5.3-flash":"zai-glm-5-3-flash","zai-glm-5-3-flash":"glm-5.3-flash"}`
+	// Nine images of the model limited to 8 would pass the channel-wide 20 and
+	// reach the upstream under a mapping the relay then rejects.
+	for _, tc := range []struct {
+		name         string
+		modelMapping string
+		model        string
+	}{
+		{name: "nine images of the limited model", modelMapping: cycle, model: imageLimitMappedAlias},
+		{name: "cycle entered from another model",
+			modelMapping: `{"entry-model":"glm-5.3-flash","glm-5.3-flash":"zai-glm-5-3-flash","zai-glm-5-3-flash":"glm-5.3-flash"}`,
+			model:        "entry-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, relayFormat := range []types.RelayFormat{
+				types.RelayFormatOpenAI,
+				types.RelayFormatOpenAIResponses,
+				types.RelayFormatClaude,
+				types.RelayFormatGemini,
+			} {
+				t.Run(string(relayFormat), func(t *testing.T) {
+					nine := imageLimitTestRequest(t, relayFormat, imageUrls(9))
+					apiErr := CheckRequestImageLimitForModels(nine, relayFormat, settings, tc.modelMapping, 1, "mistral", tc.model)
+					require.NotNil(t, apiErr, "a mapping cycle refuses the request before its images are compared")
+					assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+					assert.Contains(t, apiErr.Error(), "model_mapping_contains_cycle")
+					assert.True(t, types.IsSkipRetryError(apiErr))
+					assert.False(t, types.IsChannelError(apiErr), "the channel is not at fault for its mapping")
+				})
+			}
+		})
+	}
+
+	// The same channel keeps working for a model outside the cycle: nine
+	// images of the model limited to 20 pass, and the model limited to 8 is
+	// still refused by its own limit.
+	uncycled := `{"glm-5.3-flash":"zai-glm-5-3-flash","zai-glm-5-3-flash":"glm-5.3-flash","deepseek-v4.1-flash":"deepseek-v4-1-flash-1017"}`
+	nine := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(9))
+	assert.Nil(t, CheckRequestImageLimitForModels(nine, types.RelayFormatOpenAI, settings, uncycled, 1, "mistral", "deepseek-v4.1-flash"))
+	twentyOne := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(21))
+	apiErr := CheckRequestImageLimitForModels(twentyOne, types.RelayFormatOpenAI, settings, uncycled, 1, "mistral", "deepseek-v4.1-flash")
+	require.NotNil(t, apiErr, "the model limited to 20 is still judged through its mapping outside the cycle")
+	assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 20")
 }
 
 // The measured upstream limits of the models channel 14 and 15 serve: one

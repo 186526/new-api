@@ -186,6 +186,31 @@ func TestRelayRefusesTheImagePastTheModelLimit(t *testing.T) {
 	assert.Equal(t, int32(0), upstream.attempts.Load())
 }
 
+// TestRelayRefusesARequestTheModelMappingCannotResolve covers a channel whose
+// model_mapping forms a cycle. The relay would fail such a request with
+// model_mapping_contains_cycle after its images passed the channel-wide 20, so
+// the image check must refuse it first and never let it leave the gateway.
+func TestRelayRefusesARequestTheModelMappingCannotResolve(t *testing.T) {
+	cleanup := allowImageLimitRelayModel(t)
+	defer cleanup()
+
+	upstream := newImageLimitUpstream(t)
+	channel := imageLimitRelayChannel{Limit: 20, ModelLimits: map[string]int{imageLimitMappedUpstreamModel: 8}}
+	cycle := `{"` + imageLimitMappedModelAlias + `":"` + imageLimitMappedUpstreamModel + `","` + imageLimitMappedUpstreamModel + `":"` + imageLimitMappedModelAlias + `"}`
+	gateway := imageLimitRelayGatewayWithModel(t, upstream.server.URL, channel, imageLimitMappedModelAlias, cycle)
+	defer gateway.Close()
+
+	response, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(imageLimitRelayBodyForModel(t, 9, imageLimitMappedModelAlias)))
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, response.StatusCode, "response body: %s", payload)
+	assert.Contains(t, string(payload), "model_mapping_contains_cycle")
+	assert.Equal(t, int32(0), upstream.attempts.Load(), "the request never reaches the upstream")
+}
+
 // allowImageLimitRelayModel takes the test off token counting, billing and
 // consume logging: the model has a zero ratio, so the relay reaches the image
 // check without a wallet pre-consume on a database user, quota settlement

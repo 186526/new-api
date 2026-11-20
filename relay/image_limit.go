@@ -56,6 +56,19 @@ func refuseImagesPastLimit(images int, limit int, channelId int, channelName str
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 }
 
+// refuseModelMappingCycle answers a request whose channel model_mapping forms
+// a cycle. The relay turns such a mapping into a failed request before the
+// upstream sees it, so the image check refuses it the same way instead of
+// comparing the images against a limit the request will never be sent with.
+func refuseModelMappingCycle(err error) *types.NewAPIError {
+	return types.NewErrorWithStatusCode(
+		err,
+		types.ErrorCodeInvalidRequest,
+		http.StatusBadRequest,
+		types.ErrOptionWithSkipRetry(),
+	)
+}
+
 // CheckRequestImageLimitForModels refuses a request the same way as
 // CheckRequestImageLimit, but takes the limit of the models the channel
 // settings configure: the requested model, the names its reasoning suffix
@@ -70,8 +83,12 @@ func CheckRequestImageLimitForModels(
 	channelName string,
 	model string,
 ) *types.NewAPIError {
+	names, err := UpstreamModelNames(settings, modelMapping, model)
+	if err != nil {
+		return refuseModelMappingCycle(err)
+	}
 	images := relaycommon.RequestImageCount(relayFormat, request)
-	limit := settings.ImageLimitForModel(UpstreamModelNames(settings, modelMapping, model)...)
+	limit := settings.ImageLimitForModel(names...)
 	if images > limit {
 		return refuseImagesPastLimit(images, limit, channelId, channelName, model)
 	}
@@ -81,8 +98,9 @@ func CheckRequestImageLimitForModels(
 // UpstreamModelNames returns the names a request for the model may reach the
 // upstream under, in the order the per-model image limits are looked up: the
 // requested name, the name its reasoning suffix strips to, and the name the
-// channel's model_mapping sends it under.
-func UpstreamModelNames(settings dto.ChannelSettings, modelMapping string, model string) []string {
+// channel's model_mapping sends it under. A mapping cycle is an error, because
+// the relay refuses such a request before it reaches the upstream.
+func UpstreamModelNames(settings dto.ChannelSettings, modelMapping string, model string) ([]string, error) {
 	names := make([]string, 0, 4)
 	addName := func(name string) {
 		if name == "" || slices.Contains(names, name) {
@@ -92,37 +110,58 @@ func UpstreamModelNames(settings dto.ChannelSettings, modelMapping string, model
 	}
 	addName(strings.TrimSpace(model))
 	if baseName := hostreasoning.BaseModelName(model); baseName != model {
+		mappedBase, err := resolveModelMapping(modelMapping, baseName)
+		if err != nil {
+			return nil, err
+		}
 		addName(baseName)
-		addName(resolveModelMapping(settings, modelMapping, baseName))
+		addName(mappedBase)
 	}
-	addName(resolveModelMapping(settings, modelMapping, model))
-	return names
+	mapped, err := resolveModelMapping(modelMapping, model)
+	if err != nil {
+		return nil, err
+	}
+	addName(mapped)
+	return names, nil
+}
+
+// modelMappingCycleError reports a model_mapping whose chain returns to a
+// model it already passed, which no request can be sent under.
+type modelMappingCycleError struct {
+	model string
+}
+
+func (e *modelMappingCycleError) Error() string {
+	return "model_mapping_contains_cycle: " + e.model
 }
 
 // resolveModelMapping walks the channel's model_mapping the way the relay's
-// ModelMappedHelper does: a chain is followed to its end, a model that maps to
-// itself stays where it is, and a cycle leaves the model unmapped. The mapping
-// string is what the distributor stored for the selected channel.
-func resolveModelMapping(settings dto.ChannelSettings, modelMapping string, model string) string {
+// ModelMappedHelper does, so the limit is read for the model the request is
+// sent under: a chain is followed to its end and a model that maps to itself
+// stays where it is. A chain that returns to a model it already passed is
+// reported as a *modelMappingCycleError, the same condition ModelMappedHelper
+// refuses. The mapping string is what the distributor stored for the selected
+// channel; an unreadable one leaves the model unmapped.
+func resolveModelMapping(modelMapping string, model string) (string, error) {
 	if modelMapping == "" || modelMapping == "{}" {
-		return model
+		return model, nil
 	}
 	modelMap := make(map[string]string)
 	if err := common.UnmarshalJsonStr(modelMapping, &modelMap); err != nil {
-		return model
+		return model, nil
 	}
 	current := model
 	visited := map[string]bool{current: true}
 	for {
 		mapped, exists := modelMap[current]
 		if !exists || mapped == "" {
-			return current
+			return current, nil
 		}
 		if visited[mapped] {
 			if mapped == current {
-				return current
+				return current, nil
 			}
-			return model
+			return "", &modelMappingCycleError{model: model}
 		}
 		visited[mapped] = true
 		current = mapped
