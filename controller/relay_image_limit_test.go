@@ -406,6 +406,22 @@ const commandCodeTurnCeilingReply = `{"error":{"message":"This turn adds 20 imag
 // new-api refused the request itself or translated the upstream's refusal.
 const imageCeilingHint = "Request a smaller batch of images or compact the conversation and retry."
 
+// imageCeilingOverflowHint is the closing sentence of a refusal, appended by
+// imageLimitMessage. It is checked for its count so a refusal translated twice
+// is caught.
+const imageCeilingOverflowHint = "Request exceeds the context length limit; compact the conversation before retrying it."
+
+// requireImageCeilingMessageToldOnce requires the message of a refusal to carry
+// each hint exactly once and the upstream envelope nowhere: an adaptor and the
+// retry loop both translate a refusal, and a translation that is not idempotent
+// appends both hints a second time.
+func requireImageCeilingMessageToldOnce(t *testing.T, message string) {
+	t.Helper()
+	assert.Equal(t, 1, strings.Count(message, imageCeilingHint), "the retry hint is told once: %s", message)
+	assert.Equal(t, 1, strings.Count(message, imageCeilingOverflowHint), "the overflow hint is told once: %s", message)
+	assert.NotContains(t, message, `"object":"error"`, "the upstream envelope stays out of the message: %s", message)
+}
+
 // imageCeilingWording is the phrase that makes a client read a 400 as a context
 // overflow. Kimi Code 2.4.1 on Chat Completions matches its message against
 // /context[ _-]?length/i and never reads error.code, so every image refusal has
@@ -652,6 +668,7 @@ func TestRelayTranslatesAnUpstreamImageCeilingForGemini(t *testing.T) {
 			assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
 			assert.Contains(t, message, imageCeilingHint, "the client is told what to do about the ceiling")
 			assertImageOverflowWording(t, message)
+			requireImageCeilingMessageToldOnce(t, message)
 			assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
 		})
 	}
@@ -852,6 +869,7 @@ func TestRelayKeepsTheGeminiEventBeforeAnImageCeiling(t *testing.T) {
 	assert.Equal(t, "context_length_exceeded", code)
 	assert.Contains(t, message, "Total number of images exceeds the maximum allowed of 8.")
 	assertImageOverflowWording(t, message)
+	requireImageCeilingMessageToldOnce(t, message)
 	assert.Equal(t, int32(1), upstream.attempts.Load(), "the upstream is attempted once and never retried")
 }
 

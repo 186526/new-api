@@ -124,28 +124,26 @@ func init() {
 	gemini.SetStreamRefusalError(upstreamImageLimitRefusal)
 }
 
-// upstreamImageLimitRefusal builds the image refusal an event of a stream
-// carries. A streaming request starts its keepalive with the upstream's 2xx, so
-// the event cannot carry a status code of its own; it is read as the 400 an
-// upstream refuses a request with and translated like any other refusal, so the
-// controller writes the context overflow into the committed stream and the
-// client compacts the conversation instead of failing on a 400 it cannot act
-// on.
+// upstreamImageLimitRefusal builds the error of the image refusal an event of a
+// stream carries. A streaming request starts its keepalive with the upstream's
+// 2xx, so the event cannot carry a status code of its own; it is read as the
+// 400 an upstream refuses a request with, and the retry loop translates it like
+// any other refusal.
 //
 // The event text is read the way service.RelayErrorHandler reads a refusal
 // body: a refusal carries its sentence inside an envelope, so the sentence is
-// kept on its own and the ceiling reads once in the translated message instead
-// of arriving wrapped in the JSON the event carries. Any other error keeps the
-// event text, which carries every sentence the client may read it by.
+// kept on its own and the envelope never reaches the message the client reads.
+// Any other error keeps the event text, which carries every sentence the client
+// may read it by.
 func upstreamImageLimitRefusal(event string) *types.NewAPIError {
-	upstreamErr := types.NewOpenAIError(errors.New(strings.TrimSpace(event)), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest)
+	message := strings.TrimSpace(event)
 	var errResponse dto.GeneralErrorResponse
 	if err := common.Unmarshal([]byte(event), &errResponse); err == nil {
-		if oaiError := errResponse.TryToOpenAIError(); oaiError != nil && upstreamImageLimitPattern.MatchString(oaiError.Message) {
-			upstreamErr = types.WithOpenAIError(*oaiError, http.StatusBadRequest)
+		if sentence := strings.TrimSpace(errResponse.ToMessage()); sentence != "" && upstreamImageLimitPattern.MatchString(sentence) {
+			message = sentence
 		}
 	}
-	return TranslateUpstreamImageLimitError(upstreamErr)
+	return types.NewOpenAIError(errors.New(message), types.ErrorCodeBadResponseStatusCode, http.StatusBadRequest)
 }
 
 // TranslateUpstreamImageLimitError turns an upstream refusal for the image
@@ -167,6 +165,14 @@ func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError
 	if err == nil || err.StatusCode != http.StatusBadRequest {
 		return err
 	}
+	// The translation is reached more than once for a refusal an adaptor
+	// already rewrote, the retry loop translating every error that leaves a
+	// handler. A translated refusal still names the ceiling, so it is told
+	// apart by the closing hint it ends with and returned as it is; translating
+	// it again would append both hints a second time.
+	if IsTranslatedImageLimitError(err) {
+		return err
+	}
 	// An error new-api raised itself, before or after an upstream answer, is
 	// not the upstream's wording, even when it quotes the request.
 	if service.RelayErrorSource(err) != "upstream" || !upstreamImageLimitPattern.MatchString(err.Error()) {
@@ -177,6 +183,18 @@ func TranslateUpstreamImageLimitError(err *types.NewAPIError) *types.NewAPIError
 		Type:    "invalid_request_error",
 		Code:    imageLimitErrorCode,
 	}, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+}
+
+// IsTranslatedImageLimitError reports whether an error is already the local
+// image refusal. The translation runs twice for a refusal an adaptor passes on,
+// and the closing hint tells the second run that the first one has happened;
+// the code does not, because a refusal translated once already carries it, but
+// so may a refusal the upstream wrote itself.
+func IsTranslatedImageLimitError(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	return strings.HasSuffix(strings.TrimSpace(err.Error()), imageLimitContextOverflowHint)
 }
 
 // refuseModelMappingCycle answers a request whose channel model_mapping forms
