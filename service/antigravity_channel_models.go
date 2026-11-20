@@ -71,16 +71,22 @@ func FetchAntigravityChannelModels(ch *model.Channel) ([]string, error) {
 	return models, nil
 }
 
-// usableAntigravityModels 过滤内部模型，并把带档位后缀的模型名折回基础名后去重排序。
+// usableAntigravityModels 丢掉内部模型和上游标记为不可用的模型，
+// 把带档位后缀的模型名折回基础名后去重排序。
+// 不可用的模型（例如只对 Ultra 订阅开放的 gemini-4-carbon）在 payload 里带 disabled: true，
+// 是否可用只看 payload 的 disabled 标记，不看名字。
 func usableAntigravityModels(raw map[string]any) []string {
 	seen := make(map[string]struct{}, len(raw))
 	models := make([]string, 0, len(raw))
-	for name := range raw {
+	for name, entry := range raw {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
 			continue
 		}
 		if _, internal := antigravityInternalModels[trimmed]; internal {
+			continue
+		}
+		if antigravityModelDisabled(entry) {
 			continue
 		}
 		collapsed := modelname.Collapse(trimmed)
@@ -92,4 +98,14 @@ func usableAntigravityModels(raw map[string]any) []string {
 	}
 	sort.Strings(models)
 	return models
+}
+
+// antigravityModelDisabled 读 fetchAvailableModels 里单个模型的 disabled 标记。
+func antigravityModelDisabled(entry any) bool {
+	model, ok := entry.(map[string]any)
+	if !ok {
+		return false
+	}
+	disabled, ok := model["disabled"].(bool)
+	return ok && disabled
 }

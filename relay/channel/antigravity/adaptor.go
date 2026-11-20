@@ -136,7 +136,7 @@ func (a *Adaptor) wrapGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo,
 }
 
 // requestEffort 取客户端的 reasoning 档位：优先用 RelayInfo 里规整过的值，
-// 其次用 Gemini 请求体里的 thinkingLevel，都没有时由 resolveUpstreamModel 用缺省档位。
+// 其次用 Gemini 请求体里的 thinkingLevel，都没有时由 modelname.Resolve 用缺省档位。
 func requestEffort(info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) string {
 	if effort := info.GetReasoningEffort(); effort != "" {
 		return effort
