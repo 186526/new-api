@@ -21,15 +21,20 @@ import (
 )
 
 // claudeErrorEnvelopeRefusal reads a non-200 answer of a channel that speaks
-// the Anthropic Messages API as the native Claude error envelope it is, and
-// raises it with the status the upstream answered with. That status is the whole
+// the Anthropic Messages API as the image-ceiling envelope it may be, and raises
+// it with the status the upstream answered with. That status is the whole
 // condition the image-ceiling translation reads, so a refusal the upstream
 // answered with a 400 stays a 400 instead of the bad_response_status_code
 // service.RelayErrorHandler raises for a body it does not unwrap. It is read by
 // both relays that talk to such a channel: ClaudeHelper for a request already in
 // the Claude format, and ResponsesHelper for a /v1/responses request it converts.
-// It returns nil for every other answer, which service.RelayErrorHandler keeps
-// reading: a reply of another provider, and a body that names no Claude error.
+//
+// Only a message that names the ceiling is read. Every other answer goes back to
+// service.RelayErrorHandler untouched, so an error of another kind keeps the
+// code, the source and the retry and health decisions it had before this reader
+// existed: raising a rate limit or an admission error as the envelope would
+// turn a reply new-api skips into one it retries, and a channel fault into one
+// that disables the channel.
 //
 // An upstream may also write its envelope as an event stream, and that shape is
 // read too, so the answer is taken as a whole and put back: a stream either
@@ -54,7 +59,7 @@ func channelErrorEnvelopeRefusal(httpResp *http.Response, info *relaycommon.Rela
 		return nil
 	}
 	httpResp.Body = io.NopCloser(bytes.NewReader(body))
-	return claudeEnvelopeErrorOf(claudeEnvelopeAnswer(string(body)), httpResp.StatusCode)
+	return claudeImageCeilingEnvelopeErrorOf(claudeEnvelopeAnswer(string(body)), httpResp.StatusCode)
 }
 
 // claudeEnvelopeAnswer is the Claude error envelope an answer carries: the body
@@ -73,15 +78,17 @@ func claudeEnvelopeAnswer(body string) string {
 	return body
 }
 
-// claudeEnvelopeErrorOf raises the error envelope a document carries, or returns
-// nil when the document is not one.
-func claudeEnvelopeErrorOf(document string, statusCode int) *types.NewAPIError {
+// claudeImageCeilingEnvelopeErrorOf raises the error an envelope carries when its
+// message names the upstream image ceiling, and returns nil for every other
+// document: one that does not unpack as an envelope, one without an error type,
+// and one that describes any other failure.
+func claudeImageCeilingEnvelopeErrorOf(document string, statusCode int) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
 	if common.Unmarshal([]byte(document), &claudeResponse) != nil {
 		return nil
 	}
 	claudeError := claudeResponse.GetClaudeError()
-	if claudeError == nil || claudeError.Type == "" {
+	if claudeError == nil || claudeError.Type == "" || !NamesUpstreamImageLimit(claudeError.Message) {
 		return nil
 	}
 	return types.WithClaudeError(*claudeError, statusCode)
@@ -206,10 +213,11 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		httpResp = resp.(*http.Response)
 		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 		if httpResp.StatusCode != http.StatusOK {
-			// A refusal written as a native Claude error envelope is read here,
-			// with the status the upstream answered with, which is what the
-			// retry loop recognizes the image ceiling by; every other failed
-			// answer is read the way it always was.
+			// A refusal written as the image-ceiling envelope of the Messages
+			// API is read here, with the status the upstream answered with,
+			// which is what the retry loop recognizes the ceiling by; every
+			// other failed answer, an envelope of another kind included, is
+			// read the way it always was.
 			newAPIError = claudeErrorEnvelopeRefusal(httpResp, info)
 			if newAPIError == nil {
 				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)

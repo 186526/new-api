@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -649,11 +650,12 @@ func TestRelayTranslatesAClaudeEnvelopeImageCeiling(t *testing.T) {
 }
 
 // TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind is the counter-case next to
-// the ceiling: a Claude error envelope of another kind keeps the status the
-// upstream answered with and its own message, on both paths, so the change
-// reaches the status only. It is read the way a client reads a Claude error, the
-// code from error.type and the sentence from error.message; the refusal of the
-// other cases carries context_length_exceeded there instead.
+// the ceiling: a Claude envelope that names no ceiling is read the way the relay
+// read it before the envelope reader existed, on both paths. service.
+// RelayErrorHandler unwraps it as a general error object, so the type the client
+// reads is the type that object carries and the status stays the 400 the
+// upstream answered with. An envelope of another kind is not translated, not
+// retried and not disabled: the upstream is attempted once.
 func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
@@ -679,8 +681,10 @@ func TestRelayKeepsAClaudeEnvelopeErrorOfAnotherKind(t *testing.T) {
 			statusCode, payload := postImageCeiling(t, gateway.URL, types.RelayFormatClaude, tc.body(t))
 
 			code, message := imageCeilingEnvelope(t, types.RelayFormatClaude, statusCode, payload)
-			assert.Equal(t, "invalid_request_error", code, "an error of another kind keeps its own type: %s", payload)
-			assert.Equal(t, "max_tokens: field required", message)
+			assert.NotEqual(t, "invalid_request_error", code, "an envelope that names no ceiling is not raised as one: %s", payload)
+			assert.NotEqual(t, "context_length_exceeded", code)
+			assert.Equal(t, "max_tokens: field required (request id: )", message)
+			assert.Equal(t, int32(1), upstream.attempts.Load(), "an envelope of another kind is never retried")
 		})
 	}
 }
@@ -1161,13 +1165,13 @@ func imageCeilingEnvelope(t *testing.T, relayFormat types.RelayFormat, statusCod
 		var body struct {
 			Type  string `json:"type"`
 			Error struct {
-				Type    string `json:"type"`
+				Type    any    `json:"type"`
 				Message string `json:"message"`
 			} `json:"error"`
 		}
 		require.NoError(t, json.Unmarshal(payload, &body))
 		require.Equal(t, "error", body.Type)
-		return body.Error.Type, body.Error.Message
+		return fmt.Sprint(body.Error.Type), body.Error.Message
 	}
 	var body struct {
 		Error struct {

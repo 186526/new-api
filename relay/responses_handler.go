@@ -66,9 +66,10 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 		if httpResp.StatusCode != http.StatusOK {
 			// A Claude channel answers with the envelope of the Messages API,
-			// which this relay converts from rather than writes, so it is read
-			// here with the status the upstream answered with; every other
-			// failed answer is read the way it always was.
+			// which this relay converts from rather than writes, so an
+			// image-ceiling envelope is read here with the status the upstream
+			// answered with; every other failed answer is read the way it
+			// always was.
 			newAPIError = channelErrorEnvelopeRefusal(httpResp, info, constant.APITypeAnthropic)
 			if newAPIError == nil {
 				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
