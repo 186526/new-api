@@ -8,65 +8,66 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
-// RequestImageCount returns the number of distinct images the request sends to
-// the upstream. Every relay format has its own image parts, so each is read
-// where that format declares them: the OpenAI Chat image_url, the Responses
+// RequestImageCount returns how many times the request sends an image to the
+// upstream. Every relay format has its own image parts, so each is read where
+// that format declares them: the OpenAI Chat image_url, the Responses
 // input_image, the Claude image blocks of the system prompt, the messages and
-// nested tool results, and the Gemini image parts. Images are compared by their
-// URL or inline data, so a conversation that repeats an image counts it once.
-// A format that carries no images counts zero.
+// nested tool results, and the Gemini image parts. An image that appears again
+// counts again, because the upstream validates the occurrence count of the
+// parts it receives, not how many different images they hold. A format that
+// carries no images counts zero.
 func RequestImageCount(relayFormat types.RelayFormat, request dto.Request) int {
 	switch typed := request.(type) {
 	case *dto.GeneralOpenAIRequest:
 		if relayFormat != types.RelayFormatOpenAI {
 			return 0
 		}
-		return len(distinctChatImages(typed))
+		return countChatImages(typed)
 	case *dto.OpenAIResponsesRequest:
 		if relayFormat != types.RelayFormatOpenAIResponses {
 			return 0
 		}
-		return len(distinctResponseImages(typed))
+		return countResponseImages(typed)
 	case *dto.ClaudeRequest:
 		if relayFormat != types.RelayFormatClaude {
 			return 0
 		}
-		return len(distinctClaudeImages(typed))
+		return countClaudeImages(typed)
 	case *dto.GeminiChatRequest:
 		if relayFormat != types.RelayFormatGemini {
 			return 0
 		}
-		return len(distinctGeminiImages(typed))
+		return countGeminiImages(typed)
 	default:
 		return 0
 	}
 }
 
-func distinctChatImages(request *dto.GeneralOpenAIRequest) map[string]struct{} {
-	images := make(map[string]struct{})
+func countChatImages(request *dto.GeneralOpenAIRequest) int {
+	count := 0
 	for _, message := range request.Messages {
 		for _, part := range message.ParseContent() {
 			if part.Type != dto.ContentTypeImageURL {
 				continue
 			}
 			if image := part.GetImageMedia(); image != nil && image.Url != "" {
-				images[image.Url] = struct{}{}
+				count++
 			}
 		}
 	}
-	return images
+	return count
 }
 
-// distinctGeminiImages collects the inline and file images of a request, also
-// the ones a function response replays to the model.
-func distinctGeminiImages(request *dto.GeminiChatRequest) map[string]struct{} {
-	images := make(map[string]struct{})
+// countGeminiImages counts the inline and file images of a request, also the
+// ones a function response replays to the model.
+func countGeminiImages(request *dto.GeminiChatRequest) int {
+	count := 0
 	collect := func(part dto.GeminiPart) {
 		if part.InlineData != nil && part.InlineData.Data != "" && isImageMimeType(part.InlineData.MimeType) {
-			images[part.InlineData.Data] = struct{}{}
+			count++
 		}
 		if part.FileData != nil && part.FileData.FileUri != "" && isImageMimeType(part.FileData.MimeType) {
-			images[part.FileData.FileUri] = struct{}{}
+			count++
 		}
 	}
 	for _, content := range request.Contents {
@@ -84,39 +85,39 @@ func distinctGeminiImages(request *dto.GeminiChatRequest) map[string]struct{} {
 			}
 		}
 	}
-	return images
+	return count
 }
 
 func isImageMimeType(mimeType string) bool {
 	return strings.HasPrefix(strings.ToLower(mimeType), "image/")
 }
 
-// distinctResponseImages collects the input_image parts of a Responses
-// request. Each item addresses its image through image_url as a string or as
-// an object with a url member.
-func distinctResponseImages(request *dto.OpenAIResponsesRequest) map[string]struct{} {
-	images := make(map[string]struct{})
+// countResponseImages counts the input_image parts of a Responses request.
+// Each item addresses its image through image_url as a string or as an object
+// with a url member.
+func countResponseImages(request *dto.OpenAIResponsesRequest) int {
+	count := 0
 	for _, part := range request.ParseInput() {
 		if part.Type != "input_image" {
 			continue
 		}
 		if part.ImageUrl != "" {
-			images[part.ImageUrl] = struct{}{}
+			count++
 		}
 	}
-	return images
+	return count
 }
 
-// distinctClaudeImages collects the image blocks of a Claude request. Images
+// countClaudeImages counts the image blocks of a Claude request. Images
 // travel inside the system prompt, inside message content, and inside the
 // content of a tool_result block that replays screenshots to the model.
-func distinctClaudeImages(request *dto.ClaudeRequest) map[string]struct{} {
-	images := make(map[string]struct{})
+func countClaudeImages(request *dto.ClaudeRequest) int {
+	count := 0
 	collect := func(blocks []dto.ClaudeMediaMessage) {
 		for _, block := range blocks {
 			if block.Type == "image" {
 				if source := block.ToFileSource(); source != nil {
-					images[source.GetRawData()] = struct{}{}
+					count++
 				}
 				continue
 			}
@@ -128,7 +129,7 @@ func distinctClaudeImages(request *dto.ClaudeRequest) map[string]struct{} {
 					continue
 				}
 				if source := part.ToFileSource(); source != nil {
-					images[source.GetRawData()] = struct{}{}
+					count++
 				}
 			}
 		}
@@ -143,5 +144,5 @@ func distinctClaudeImages(request *dto.ClaudeRequest) map[string]struct{} {
 		blocks, _ := message.ParseContent()
 		collect(blocks)
 	}
-	return images
+	return count
 }

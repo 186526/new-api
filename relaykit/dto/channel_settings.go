@@ -54,11 +54,35 @@ type ChannelSettings struct {
 	// the requests on the API allowance.
 	MistralVibeAttribution *bool `json:"mistral_vibe_attribution,omitempty"`
 	// MaxImagesPerRequest holds the upstream's per-request image limit, which is
-	// how many images one request may carry. A request with more distinct images
-	// is refused locally with context_length_exceeded, so the client compacts
-	// the conversation instead of the upstream rejecting the request. Zero keeps
-	// the channel unlimited.
+	// how many images one request may carry. A request carrying more image
+	// occurrences is refused locally with context_length_exceeded, so the client
+	// compacts the conversation instead of the upstream rejecting the request.
+	// When MaxImagesPerModel names the requested model, its value applies
+	// instead. Zero leaves the channel unlimited.
 	MaxImagesPerRequest int `json:"max_images_per_request,omitempty"`
+	// MaxImagesPerModel holds the per-request image limit of single upstream
+	// models, keyed by the model name the client requests or by the name the
+	// channel's model_mapping turns it into. One channel often serves models
+	// with different limits, so the channel-wide MaxImagesPerRequest cannot
+	// cover all of them. A model missing here falls back to
+	// MaxImagesPerRequest.
+	MaxImagesPerModel map[string]int `json:"max_images_per_model,omitempty"`
+}
+
+// ImageLimitForModel returns the image limit for a request to any of the given
+// model names, which are the names the same request may be sent under, such as
+// the requested name and its mapping target. A configured model wins over the
+// channel-wide limit; without either, the channel is unlimited.
+func (s ChannelSettings) ImageLimitForModel(modelNames ...string) int {
+	for _, name := range modelNames {
+		if name == "" {
+			continue
+		}
+		if limit, ok := s.MaxImagesPerModel[name]; ok {
+			return limit
+		}
+	}
+	return s.MaxImagesPerRequest
 }
 
 // UsesMistralVibeAttribution reports whether a Mistral channel tags its requests
@@ -105,7 +129,7 @@ const (
 )
 
 // ValidateHTTPTransport validates save-time HTTP transport channel settings
-// and the per-request image limit.
+// and the per-request image limits.
 func (s *ChannelSettings) ValidateHTTPTransport() error {
 	if s == nil {
 		return nil
@@ -127,6 +151,19 @@ func (s *ChannelSettings) ValidateHTTPTransport() error {
 	}
 	if s.MaxImagesPerRequest < 0 {
 		return fmt.Errorf("invalid max_images_per_request: %d", s.MaxImagesPerRequest)
+	}
+	modelNames := make([]string, 0, len(s.MaxImagesPerModel))
+	for name := range s.MaxImagesPerModel {
+		modelNames = append(modelNames, name)
+	}
+	slices.Sort(modelNames)
+	for _, name := range modelNames {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("invalid max_images_per_model: empty model name")
+		}
+		if limit := s.MaxImagesPerModel[name]; limit < 0 {
+			return fmt.Errorf("invalid max_images_per_model[%s]: %d", name, limit)
+		}
 	}
 	if protocol == HTTPProtocolHTTP1 && s.HTTP2ConnectionShards > 1 {
 		return fmt.Errorf("http2_connection_shards must be 1 when http_protocol is http1")

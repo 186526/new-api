@@ -123,25 +123,32 @@ func TestRequestImageCountCountsEveryRelayFormat(t *testing.T) {
 	}
 }
 
-func TestRequestImageCountDeduplicatesRepeatedImages(t *testing.T) {
+// The upstream counts image occurrences, not distinct images: the Mistral API
+// refuses nine parts that hold three different images, so a repeated image
+// must count again here.
+func TestRequestImageCountCountsRepeatedImagesEveryTime(t *testing.T) {
 	cases := []struct {
 		name        string
 		relayFormat types.RelayFormat
 		request     dto.Request
+		want        int
 	}{
-		{name: "openai chat", relayFormat: types.RelayFormatOpenAI, request: openAIChatRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta)},
-		{name: "openai responses", relayFormat: types.RelayFormatOpenAIResponses, request: responsesRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta)},
-		{name: "claude messages", relayFormat: types.RelayFormatClaude, request: claudeRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta)},
-		{name: "gemini generate content", relayFormat: types.RelayFormatGemini, request: geminiRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta)},
+		{name: "openai chat", relayFormat: types.RelayFormatOpenAI, request: openAIChatRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta), want: 3},
+		{name: "openai responses", relayFormat: types.RelayFormatOpenAIResponses, request: responsesRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta), want: 3},
+		{name: "claude messages", relayFormat: types.RelayFormatClaude, request: claudeRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta), want: 3},
+		{name: "claude system prompt", relayFormat: types.RelayFormatClaude, request: claudeRequestWithSystemImage(testImageAlpha, testImageAlpha), want: 2},
+		{name: "claude tool result", relayFormat: types.RelayFormatClaude, request: claudeRequestWithToolResultImage(testImageBeta, testImageBeta), want: 2},
+		{name: "gemini generate content", relayFormat: types.RelayFormatGemini, request: geminiRequestWithImages(testImageAlpha, testImageAlpha, testImageBeta), want: 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, 2, RequestImageCount(tc.relayFormat, tc.request))
+			assert.Equal(t, tc.want, RequestImageCount(tc.relayFormat, tc.request),
+				"a repeated image counts once per occurrence")
 		})
 	}
 }
 
-func TestRequestImageCountDeduplicatesAcrossMessages(t *testing.T) {
+func TestRequestImageCountCountsTheSameImageAcrossMessages(t *testing.T) {
 	request := &dto.ClaudeRequest{
 		Model: "claude-sonnet-4.5",
 		Messages: []dto.ClaudeMessage{
@@ -155,7 +162,7 @@ func TestRequestImageCountDeduplicatesAcrossMessages(t *testing.T) {
 			}}},
 		},
 	}
-	assert.Equal(t, 1, RequestImageCount(types.RelayFormatClaude, request))
+	assert.Equal(t, 2, RequestImageCount(types.RelayFormatClaude, request))
 }
 
 func TestRequestImageCountIgnoresNonImageParts(t *testing.T) {
@@ -234,6 +241,6 @@ func TestRequestImageCountCountsGeminiFunctionResponseImages(t *testing.T) {
 			}}},
 		},
 	}
-	assert.Equal(t, 2, RequestImageCount(types.RelayFormatGemini, request),
-		"the two distinct screenshots replayed by the tool are counted once each")
+	assert.Equal(t, 3, RequestImageCount(types.RelayFormatGemini, request),
+		"the tool replayed three image parts, one of them a repeat")
 }

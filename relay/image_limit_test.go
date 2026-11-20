@@ -126,8 +126,9 @@ func TestCheckRequestImageLimitRejectsPastTheLimit(t *testing.T) {
 	}
 }
 
-func TestCheckRequestImageLimitCountsDistinctImages(t *testing.T) {
-	urls := []string{imageData("a"), imageData("a"), imageData("a")}
+// The upstream refuses a request whose image parts repeat, so a limit of 20
+// refuses 21 copies of one image.
+func TestCheckRequestImageLimitCountsRepeatedImages(t *testing.T) {
 	for _, relayFormat := range []types.RelayFormat{
 		types.RelayFormatOpenAI,
 		types.RelayFormatOpenAIResponses,
@@ -135,9 +136,18 @@ func TestCheckRequestImageLimitCountsDistinctImages(t *testing.T) {
 		types.RelayFormatGemini,
 	} {
 		t.Run(string(relayFormat), func(t *testing.T) {
-			request := imageLimitTestRequest(t, relayFormat, urls)
-			assert.Nil(t, CheckRequestImageLimit(request, relayFormat, 2, 1, "mistral", imageLimitTestModel),
-				"three copies of one image are one image")
+			repeated := make([]string, 21)
+			for i := range repeated {
+				repeated[i] = imageData("same")
+			}
+			request := imageLimitTestRequest(t, relayFormat, repeated)
+			apiErr := CheckRequestImageLimit(request, relayFormat, 20, 1, "mistral", imageLimitTestModel)
+			require.NotNil(t, apiErr, "21 copies of one image are past the limit of 20")
+			assert.Contains(t, apiErr.Error(), "Total number of images (21)")
+
+			within := imageLimitTestRequest(t, relayFormat, repeated[:20])
+			assert.Nil(t, CheckRequestImageLimit(within, relayFormat, 20, 1, "mistral", imageLimitTestModel),
+				"20 copies of one image stay within the limit of 20")
 		})
 	}
 }
@@ -225,4 +235,109 @@ func TestCheckRequestImageLimitAnswersWithTopLevelErrorCode(t *testing.T) {
 	assert.Equal(t, "invalid_request_error", body.Error.Type)
 	assert.Equal(t, "Total number of images (21) exceeds the maximum allowed of 20. "+
 		"Request a smaller batch of images or compact the conversation and retry.", body.Error.Message)
+}
+
+func TestCheckRequestImageLimitForModelsPrefersTheModelLimit(t *testing.T) {
+	settings := imageLimitModelSettings()
+	for _, relayFormat := range []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatOpenAIResponses,
+		types.RelayFormatClaude,
+		types.RelayFormatGemini,
+	} {
+		t.Run(string(relayFormat), func(t *testing.T) {
+			nine := imageLimitTestRequest(t, relayFormat, imageUrls(9))
+			apiErr := CheckRequestImageLimitForModels(nine, relayFormat, settings, imageLimitModelMapping(), 1, "mistral", imageLimitMappedAlias)
+			require.NotNil(t, apiErr, "the model limit of 8 refuses the ninth image, the channel limit of 20 would not")
+			assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 8")
+
+			eight := imageLimitTestRequest(t, relayFormat, imageUrls(8))
+			assert.Nil(t, CheckRequestImageLimitForModels(eight, relayFormat, settings, imageLimitModelMapping(), 1, "mistral", imageLimitMappedAlias))
+		})
+	}
+}
+
+func TestUpstreamModelNamesIncludeTheMappingTarget(t *testing.T) {
+	settings := imageLimitModelSettings()
+	for _, name := range []string{imageLimitMappedAlias, imageLimitMappedModel} {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, UpstreamModelNames(settings, imageLimitModelMapping(), name), imageLimitMappedModel)
+			nine := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(9))
+			apiErr := CheckRequestImageLimitForModels(nine, types.RelayFormatOpenAI, settings, imageLimitModelMapping(), 1, "mistral", name)
+			require.NotNil(t, apiErr, "the limit configured for %s applies to a request for %s", imageLimitMappedModel, name)
+			assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 8")
+		})
+	}
+}
+
+func TestCheckRequestImageLimitForModelsFallsBackToTheChannelLimit(t *testing.T) {
+	settings := imageLimitModelSettings()
+	request := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(15))
+	assert.Nil(t, CheckRequestImageLimitForModels(request, types.RelayFormatOpenAI, settings, "", 1, "mistral", "qwen-vl-max"),
+		"a model without its own limit keeps the channel limit of 20")
+
+	withoutModels := dto.ChannelSettings{MaxImagesPerRequest: 8}
+	over := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(10))
+	apiErr := CheckRequestImageLimitForModels(over, types.RelayFormatOpenAI, withoutModels, imageLimitModelMapping(), 1, "mistral", imageLimitMappedAlias)
+	require.NotNil(t, apiErr, "without per-model limits the channel limit applies to the mapped model too")
+	assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 8")
+}
+
+func TestUpstreamModelNames(t *testing.T) {
+	settings := imageLimitModelSettings()
+	assert.Equal(t, []string{imageLimitMappedAlias, imageLimitMappedModel},
+		UpstreamModelNames(settings, imageLimitModelMapping(), imageLimitMappedAlias))
+	assert.Equal(t, []string{imageLimitMappedModel},
+		UpstreamModelNames(settings, "", imageLimitMappedModel))
+	assert.Equal(t, []string{"plain-model"},
+		UpstreamModelNames(settings, imageLimitModelMapping(), "plain-model"))
+	assert.Equal(t, []string{"plain-model"},
+		UpstreamModelNames(settings, "{not json", "plain-model"))
+	cycle := `{"a-model":"b-model","b-model":"a-model"}`
+	assert.Equal(t, []string{"a-model"}, UpstreamModelNames(settings, cycle, "a-model"),
+		"a mapping cycle leaves the requested name in place")
+	self := `{"a-model":"a-model"}`
+	assert.Equal(t, []string{"a-model"}, UpstreamModelNames(settings, self, "a-model"))
+	chain := `{"first-model":"second-model","second-model":"third-model"}`
+	assert.Equal(t, []string{"first-model", "third-model"}, UpstreamModelNames(settings, chain, "first-model"),
+		"a mapping chain is followed to its end")
+}
+
+// The measured upstream limits of the models channel 14 and 15 serve: one
+// channel carries two models whose limits differ.
+const (
+	imageLimitMappedAlias = "glm-5.3-flash"
+	imageLimitMappedModel = "zai-glm-5-3-flash"
+)
+
+func imageLimitModelMapping() string {
+	return `{"` + imageLimitMappedAlias + `":"` + imageLimitMappedModel + `"}`
+}
+
+// imageLimitModelSettings is what a Mistral channel looks like once the
+// measured limits are configured: the channel-wide limit of 20 covers the
+// models measured at 20, and the models measured at 8 carry their own limit.
+func imageLimitModelSettings() dto.ChannelSettings {
+	return dto.ChannelSettings{
+		MaxImagesPerRequest: 20,
+		MaxImagesPerModel: map[string]int{
+			imageLimitMappedModel:            8,
+			imageLimitMeasuredWideLimitModel: 20,
+		},
+	}
+}
+
+const imageLimitMeasuredWideLimitModel = "deepseek-v4-1-flash-1017"
+
+// TestCheckRequestImageLimitForModelsKeepsTheWiderModelLimit covers the model
+// measured at 20 on the same channel: its limit is the channel-wide 20, so a
+// request of 20 images passes and the 21st is refused.
+func TestCheckRequestImageLimitForModelsKeepsTheWiderModelLimit(t *testing.T) {
+	settings := imageLimitModelSettings()
+	atLimit := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(20))
+	assert.Nil(t, CheckRequestImageLimitForModels(atLimit, types.RelayFormatOpenAI, settings, imageLimitModelMapping(), 1, "mistral", imageLimitMeasuredWideLimitModel))
+	over := imageLimitTestRequest(t, types.RelayFormatOpenAI, imageUrls(21))
+	apiErr := CheckRequestImageLimitForModels(over, types.RelayFormatOpenAI, settings, imageLimitModelMapping(), 1, "mistral", imageLimitMeasuredWideLimitModel)
+	require.NotNil(t, apiErr)
+	assert.Contains(t, apiErr.Error(), "exceeds the maximum allowed of 20")
 }

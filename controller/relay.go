@@ -216,11 +216,15 @@ relayAttempts:
 		// getChannel rebuilds it from the context id, and relayInfo carries no
 		// channel settings here either, because the handler fills ChannelMeta
 		// only after this check. Reading channel.GetSetting() is always zero.
+		// The upstream's limit belongs to the model, not to the channel, so a
+		// model the settings name takes its own limit; the model_mapping the
+		// distributor stored is what the request will be sent under.
 		channelSetting, _ := common.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting)
-		if limitErr := relay.CheckRequestImageLimit(
+		if limitErr := relay.CheckRequestImageLimitForModels(
 			relayInfo.Request,
 			relayFormat,
-			channelSetting.MaxImagesPerRequest,
+			channelSetting,
+			common.GetContextKeyString(c, constant.ContextKeyChannelModelMapping),
 			channel.Id,
 			channel.Name,
 			relayInfo.OriginModelName,

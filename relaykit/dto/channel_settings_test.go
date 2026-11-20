@@ -729,6 +729,39 @@ func TestChannelSettingsValidateHTTPTransport(t *testing.T) {
 	err = (&ChannelSettings{MaxImagesPerRequest: -1}).ValidateHTTPTransport()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "max_images_per_request")
+
+	require.NoError(t, (&ChannelSettings{MaxImagesPerModel: map[string]int{"zai-glm-5-3-flash": 8}}).ValidateHTTPTransport())
+
+	err = (&ChannelSettings{MaxImagesPerModel: map[string]int{"zai-glm-5-3-flash": -1}}).ValidateHTTPTransport()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_images_per_model")
+
+	err = (&ChannelSettings{MaxImagesPerModel: map[string]int{"": 8}}).ValidateHTTPTransport()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_images_per_model")
+
+	err = (&ChannelSettings{MaxImagesPerModel: map[string]int{"  ": 8}}).ValidateHTTPTransport()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_images_per_model")
+}
+
+func TestChannelSettingsImageLimitForModel(t *testing.T) {
+	settings := ChannelSettings{
+		MaxImagesPerRequest: 20,
+		MaxImagesPerModel:   map[string]int{"zai-glm-5-3-flash": 8},
+	}
+	assert.Equal(t, 8, settings.ImageLimitForModel("requested-alias", "zai-glm-5-3-flash"),
+		"a configured model wins over the channel-wide limit")
+	assert.Equal(t, 20, settings.ImageLimitForModel("unlisted-model"),
+		"a model without its own limit falls back to the channel-wide limit")
+	assert.Equal(t, 0, ChannelSettings{}.ImageLimitForModel("unlisted-model"),
+		"a channel without either limit is unlimited")
+	assert.Equal(t, 20, settings.ImageLimitForModel("", "other"),
+		"an empty name is skipped and the channel-wide limit applies")
+
+	encoded, err := json.Marshal(ChannelSettings{MaxImagesPerModel: map[string]int{"zai-glm-5-3-flash": 8}})
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"max_images_per_model":{"zai-glm-5-3-flash":8}`)
 }
 
 func TestChannelOtherSettingsValidateToolLossPolicy(t *testing.T) {
