@@ -281,9 +281,8 @@ func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool
 		}
 		return task, true, nil
 	}
-	if c.GetInt("token_id") == 0 && c.GetInt("role") >= common.RoleAdminUser {
-		return model.GetByOnlyTaskId(taskID)
-	}
+	// Capabilities are the only cross-owner path; every other caller, dashboard
+	// admin sessions included, reads only the tasks it owns.
 	return model.GetByTaskId(c.GetInt("id"), taskID)
 }
 

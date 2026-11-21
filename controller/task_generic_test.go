@@ -111,31 +111,102 @@ func TestGetTaskArtifactsReturnsEmptyForLegacyTask(t *testing.T) {
 	assert.Empty(t, response.Artifacts)
 }
 
+// Every signed-in caller that is not the owner reads nothing, whichever way it
+// authenticated. Dashboard auth (middleware/auth.go setDashboardAuthContext)
+// sets id and role but never token_id, so a dashboard session must not be able
+// to turn its role into a cross-owner read.
 func TestTaskArtifactAuthorizationKeepsForeignTasksHidden(t *testing.T) {
 	task := setupGenericTaskTest(t)
 
-	commonUser, _ := gin.CreateTestContext(httptest.NewRecorder())
-	commonUser.Set("id", 8)
-	commonUser.Set("role", common.RoleCommonUser)
-	_, exists, err := getTaskForArtifactRequest(commonUser, task.TaskID)
-	require.NoError(t, err)
-	assert.False(t, exists)
+	callers := []struct {
+		name   string
+		userID int
+		role   int
+		token  int
+		want   bool
+	}{
+		{"common user dashboard session", 8, common.RoleCommonUser, 0, false},
+		{"admin dashboard session", 8, common.RoleAdminUser, 0, false},
+		{"root dashboard session", 8, common.RoleRootUser, 0, false},
+		{"admin api token", 8, common.RoleAdminUser, 99, false},
+		{"owner dashboard session", task.UserId, common.RoleCommonUser, 0, true},
+		{"owner api token", task.UserId, common.RoleCommonUser, 99, true},
+	}
+	for _, caller := range callers {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("id", caller.userID)
+		c.Set("role", caller.role)
+		c.Set("token_id", caller.token)
+		found, exists, err := getTaskForArtifactRequest(c, task.TaskID)
+		require.NoError(t, err, caller.name)
+		assert.Equal(t, caller.want, exists, caller.name)
+		if caller.want {
+			require.NotNil(t, found, caller.name)
+			assert.Equal(t, task.TaskID, found.TaskID, caller.name)
+		}
+	}
+}
 
-	admin, _ := gin.CreateTestContext(httptest.NewRecorder())
-	admin.Set("id", 8)
-	admin.Set("role", common.RoleAdminUser)
-	found, exists, err := getTaskForArtifactRequest(admin, task.TaskID)
-	require.NoError(t, err)
-	require.True(t, exists)
-	assert.Equal(t, task.TaskID, found.TaskID)
+// The dashboard endpoint hands out freshly signed capability URLs, so a foreign
+// session reaching it would also be handed the video bytes. Neither the
+// artifacts endpoint nor the video content endpoint may answer for a foreign
+// caller, and the owner must still get both.
+func TestTaskArtifactsAndVideoStayWithTheOwner(t *testing.T) {
+	task := setupGenericTaskTest(t)
+	task.Action = constant.TaskActionTextToVideo
+	task.FailReason = "https://upstream.invalid/private-video.mp4"
+	require.NoError(t, model.DB.Save(task).Error)
 
-	apiToken, _ := gin.CreateTestContext(httptest.NewRecorder())
-	apiToken.Set("id", 8)
-	apiToken.Set("role", common.RoleRootUser)
-	apiToken.Set("token_id", 99)
-	_, exists, err = getTaskForArtifactRequest(apiToken, task.TaskID)
-	require.NoError(t, err)
-	assert.False(t, exists)
+	dashboardArtifacts := func(userID int, role int) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("id", userID)
+		c.Set("role", role)
+		c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/task/"+task.TaskID+"/artifacts", nil)
+		GetDashboardTaskArtifacts(c)
+		return recorder
+	}
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+		recorder := dashboardArtifacts(8, role)
+		assert.Equal(t, http.StatusNotFound, recorder.Code, "dashboard role %d", role)
+		assert.NotContains(t, recorder.Body.String(), "private-video", "dashboard role %d", role)
+		assert.NotContains(t, recorder.Body.String(), task.TaskID, "dashboard role %d", role)
+	}
+	ownerRecorder := dashboardArtifacts(task.UserId, common.RoleCommonUser)
+	assert.Equal(t, http.StatusOK, ownerRecorder.Code)
+	assert.Contains(t, ownerRecorder.Body.String(), task.TaskID)
+	assert.Contains(t, ownerRecorder.Body.String(), "/artifacts/video/content")
+
+	videoProxy := func(userID int, role int, tokenID int) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Set("id", userID)
+		c.Set("role", role)
+		c.Set("token_id", tokenID)
+		c.Params = gin.Params{{Key: "task_id", Value: task.TaskID}}
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+task.TaskID, nil)
+		VideoProxy(c)
+		return recorder
+	}
+	for _, caller := range []struct {
+		name   string
+		userID int
+		role   int
+		token  int
+	}{
+		{"common user dashboard session", 8, common.RoleCommonUser, 0},
+		{"admin dashboard session", 8, common.RoleAdminUser, 0},
+		{"root dashboard session", 8, common.RoleRootUser, 0},
+		{"admin api token", 8, common.RoleAdminUser, 99},
+	} {
+		recorder := videoProxy(caller.userID, caller.role, caller.token)
+		assert.Equal(t, http.StatusNotFound, recorder.Code, caller.name)
+		assert.NotContains(t, recorder.Body.String(), "private-video", caller.name)
+	}
+	ownerVideo := videoProxy(task.UserId, common.RoleCommonUser, 99)
+	assert.NotEqual(t, http.StatusNotFound, ownerVideo.Code)
 }
 
 func TestDashboardTaskArtifactsReturnsLegacyCapabilityWithoutUpstreamURL(t *testing.T) {
