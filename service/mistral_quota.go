@@ -186,7 +186,9 @@ func LoadMistralQuotaAccounts() ([]MistralQuotaAccount, error) {
 	return valid, nil
 }
 
-// MistralQuotaClient reads the monthly allowance of a signed-in account.
+// MistralQuotaClient reads the monthly allowance of an account: from the public
+// billing endpoint with an API key, and from the console trpc endpoint or the
+// Vibe app with a session cookie for an account that names no key.
 type MistralQuotaClient struct {
 	AdminBaseURL string
 	VibeBaseURL  string
