@@ -21,6 +21,11 @@ import { queryOptions, type QueryClient } from '@tanstack/react-query'
 import { getStatus } from '@/lib/api'
 import { DEFAULT_SYSTEM_NAME, DEFAULT_LOGO } from '@/lib/constants'
 import {
+  STATUS_STORAGE_KEY,
+  readStatusSnapshot,
+  writeStatusSnapshot,
+} from '@/lib/status-snapshot'
+import {
   useSystemConfigStore,
   type CurrencyConfig,
   type CurrencyDisplayType,
@@ -34,9 +39,20 @@ import {
  * `/api/status` varies on `Authorization`: the backend returns
  * `SidebarModulesAdmin` only to a signed-in caller and marks that variant
  * `no-store, private`. One cache entry therefore describes the credentials it
- * was fetched with, not the site in general, which is why the entry is dropped
- * whenever the dashboard session changes — see `subscribeSignedInCacheReset` in
- * `lib/auth-session`.
+ * was fetched with, not the site in general. Three mechanisms keep the two
+ * apart, and each is needed for a different ordering:
+ *
+ * - `subscribeSignedInCacheReset` drops the entry when the session id changes,
+ *   which covers a variant already cached under the old credential.
+ * - The same subscription re-reads status from a hook that runs after the
+ *   session has landed in the store, so the replacement request carries the
+ *   bearer token. A refill started from the store notification would go out
+ *   while the token was still absent.
+ * - `fetchStatus` skips its writes when React Query aborted the read, because
+ *   clearing the cache cancels a pending request but does not stop its
+ *   response from arriving.
+ *
+ * The persisted snapshot follows the same rule — see `lib/status-snapshot`.
  *
  * Anything that needs status must go through `statusQueryOptions` so React
  * Query can dedupe. Calling `getStatus()` directly re-introduces the duplicate
@@ -46,7 +62,7 @@ export const STATUS_QUERY_KEY = ['status'] as const
 
 export const STATUS_STALE_TIME = 5 * 60 * 1000
 
-export const STATUS_STORAGE_KEY = 'status'
+export { STATUS_STORAGE_KEY }
 
 /** Status payload shape — loose on purpose; the backend map is open-ended. */
 export type StatusData = Record<string, unknown>
@@ -109,24 +125,12 @@ export function mapStatusDataToConfig(
 
 /** Read the last known status from localStorage (survives reload, may be stale). */
 export function readCachedStatus(): StatusData | null {
-  try {
-    if (typeof window === 'undefined') return null
-    const raw = window.localStorage.getItem(STATUS_STORAGE_KEY)
-    return raw ? (JSON.parse(raw) as StatusData) : null
-  } catch {
-    return null
-  }
+  return readStatusSnapshot()
 }
 
 /** Persist the latest status so the next cold start can render before fetching. */
 function writeCachedStatus(status: StatusData | null): void {
-  try {
-    if (typeof window !== 'undefined' && status) {
-      window.localStorage.setItem(STATUS_STORAGE_KEY, JSON.stringify(status))
-    }
-  } catch {
-    /* Storage can be unavailable in private mode. */
-  }
+  if (status) writeStatusSnapshot(status)
 }
 
 /**

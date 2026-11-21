@@ -275,6 +275,48 @@ test('an anonymous status read still in flight at sign-in refills the cache with
   expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(false)
 })
 
+test('an anonymous response released after the signed-in refill cannot overwrite it', async () => {
+  const releaseAnonymous = stubBackend({
+    refresh: { status: 200 },
+    holdAnonymousStatus: true,
+  })
+
+  const { queryClient, primed } = await bootApp()
+  await waitForAnonymousRequest()
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+
+  // The refill reaches the stub and lands while the anonymous request is still
+  // held; only then is the anonymous response released. This is the slower
+  // half of the same race — the dropped read resolving last — and the ordering
+  // that makes a missing guard observable: the read still carries the anonymous
+  // variant but its signal is already aborted.
+  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } = await import(
+    '@/lib/status-query'
+  )
+  await vi.waitFor(() => {
+    expect(
+      queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
+        ?.SidebarModulesAdmin
+    ).toBe(adminSidebarConfig)
+  })
+
+  releaseAnonymous()
+  await primed
+  // Give the released response every turn it needs to try to write.
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
+
+  const cached = queryClient.getQueryData<Record<string, unknown>>(
+    STATUS_QUERY_KEY
+  )
+  expect(cached?.SidebarModulesAdmin).toBe(adminSidebarConfig)
+  expect(cached?.system_name).toBe('signed in')
+  expect(window.localStorage.getItem(STATUS_STORAGE_KEY)).toContain(
+    'SidebarModulesAdmin'
+  )
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(false)
+})
+
 test('the signed-in refill carries the session credential, not the anonymous one', async () => {
   const releaseAnonymous = stubBackend({
     refresh: { status: 200 },
@@ -326,6 +368,65 @@ test('signing out clears the cache without reading status for the closed session
   const { STATUS_QUERY_KEY } = await import('@/lib/status-query')
   expect(queryClient.getQueryData(STATUS_QUERY_KEY)).toBeUndefined()
   expect(statusRequests.length).toBe(requestsBeforeSignOut)
+})
+
+test('signing out drops the sidebar config the signed-in variant persisted', async () => {
+  stubBackend({ refresh: { status: 200 } })
+  const { queryClient } = await bootApp()
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+
+  const { STATUS_STORAGE_KEY } = await import('@/lib/status-query')
+  await vi.waitFor(() => {
+    expect(window.localStorage.getItem(STATUS_STORAGE_KEY)).toContain(
+      'SidebarModulesAdmin'
+    )
+  })
+
+  auth.clearAuthenticatedClientState(queryClient, false)
+
+  // The snapshot outlives the tab, and `SidebarModulesAdmin` is the field the
+  // backend only answers to a signed-in caller and marks `no-store, private`.
+  // Left behind, the next visitor on this browser reads the previous admin's
+  // sidebar switches as their own until their own status read lands.
+  const persisted = JSON.parse(
+    window.localStorage.getItem(STATUS_STORAGE_KEY) ?? '{}'
+  ) as Record<string, unknown>
+  expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
+  // Branding is the anonymous variant's too, so a signed-out cold start still
+  // renders the site name instead of the built-in default.
+  expect(persisted.system_name).toBe('signed in')
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
+})
+
+test('a different session replacing the old one drops the old sidebar config at once', async () => {
+  stubBackend({ refresh: { status: 200 } })
+  const { queryClient } = await bootApp()
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+
+  const { STATUS_STORAGE_KEY } = await import('@/lib/status-query')
+  await vi.waitFor(() => {
+    expect(window.localStorage.getItem(STATUS_STORAGE_KEY)).toContain(
+      'SidebarModulesAdmin'
+    )
+  })
+
+  // A second account signing in without the first one signing out: the refill
+  // for the new session has not landed yet, so only the removal protects the
+  // gates in between.
+  const { applyAuthBundle } = await import('@/lib/auth-session')
+  applyAuthBundle({
+    ...bundle,
+    access_token: 'second-account-token',
+    session: { ...bundle.session, sid: 'second-session' },
+  })
+
+  const persisted = JSON.parse(
+    window.localStorage.getItem(STATUS_STORAGE_KEY) ?? '{}'
+  ) as Record<string, unknown>
+  expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
+  // The query cache keeps the old entry until its own reset path runs; assert
+  // the snapshot contract only, which is what the gates read first.
+  void queryClient
 })
 
 test('an anonymous boot keeps the anonymous variant', async () => {

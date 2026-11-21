@@ -22,6 +22,7 @@ import { t } from 'i18next'
 
 import { publishAuthSessionEvent } from '@/lib/auth-session-sync'
 import { hasSessionHint } from '@/lib/session-hint'
+import { forgetSignedInStatus } from '@/lib/status-snapshot'
 import {
   useAuthStore,
   type AuthBootstrapState,
@@ -178,6 +179,12 @@ export function applyAuthBundle(
   useAuthStore.getState().auth.setBundle(bundle)
   if (previousSID === bundle.session.sid) return
 
+  // A different session replaced the old one. The snapshot still holds the
+  // fields the previous session's status read persisted, and the refill below
+  // only overwrites them once it lands; until then the gates would read the
+  // previous account's sidebar switches.
+  if (previousSID) forgetSignedInStatus()
+
   if (synchronizeTabs) {
     publishAuthSessionEvent('authenticated', bundle.session.sid)
   }
@@ -228,7 +235,10 @@ export function clearAuthentication(
   if (synchronizeTabs && sid) {
     publishAuthSessionEvent('signed_out', sid)
   }
-  if (sid) publishSessionEnded()
+  if (sid) {
+    forgetSignedInStatus()
+    publishSessionEnded()
+  }
 }
 
 export function clearAuthenticatedClientState(
