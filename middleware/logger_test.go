@@ -60,6 +60,108 @@ func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 	}
 }
 
+// TestAccessLogDropsASignatureDecodedIntoAPaymentCallbackPath pins the form
+// where an escaped query lands in the path: gin hands the formatter a decoded
+// path, so "sign%3D..." arrives with "=" and "&" decoded while RawQuery stays
+// empty. The route segment is no longer the last one, which is what made both
+// guards read the target as an ordinary path and write the signature verbatim.
+func TestAccessLogDropsASignatureDecodedIntoAPaymentCallbackPath(t *testing.T) {
+	const (
+		canary     = "PATHSECRETSIGNATUREVALUE"
+		merchantID = "path-epay-id"
+	)
+	for _, route := range []string{"/api/user/epay/notify", "/api/subscription/epay/notify"} {
+		// The second suffix is the combination: the signature is decoded into the
+		// path and the request also carries a query of its own. The "?" then
+		// splits the target before the signature, so the first guard still sees a
+		// route ending in "sign=" and the second one has to catch it.
+		for _, suffix := range []string{"", "?page=2"} {
+			t.Run(route+suffix, func(t *testing.T) {
+				gin.SetMode(gin.TestMode)
+				previousWriter := gin.DefaultWriter
+				var output bytes.Buffer
+				gin.DefaultWriter = &output
+				t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+				router := gin.New()
+				SetUpLogger(router)
+				router.POST(route, func(c *gin.Context) { c.Status(http.StatusOK) })
+
+				request := httptest.NewRequest(http.MethodPost,
+					route+"/sign%3D"+canary+"%26pid%3D"+merchantID+suffix, nil)
+				require.Equal(t, route+"/sign="+canary+"&pid="+merchantID, request.URL.Path,
+					"the escaped query is decoded into the path, which is the case under test")
+				require.Equal(t, strings.TrimPrefix(suffix, "?"), request.URL.RawQuery)
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				require.Equal(t, http.StatusNotFound, response.Code)
+				logged := output.String()
+				require.Contains(t, logged, "POST "+route, "the route stays in the line")
+				assert.NotContains(t, logged, canary, "the signature may not reach the log")
+				assert.NotContains(t, logged, merchantID)
+				assert.NotContains(t, logged, "sign=")
+			})
+		}
+	}
+}
+
+// TestAccessLogDropsASignatureDecodedIntoAPathOnlyForAPaymentCallback pins what
+// the decoded-path guard must not change. The normal query form still drops the
+// query whole, a non-payment page keeps its readable query and masks only the
+// credential-looking value, and a path that merely carries "=" without a payment
+// key keeps its target, because nothing there looks like a callback or a
+// signature.
+func TestAccessLogDropsASignatureDecodedIntoAPathOnlyForAPaymentCallback(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		target     string
+		loggedPath string
+	}{
+		{
+			"a normal callback query still drops the query whole",
+			"/api/user/epay/notify?sign=PATHSECRETSIGNATUREVALUE&pid=x",
+			"/api/user/epay/notify",
+		},
+		{
+			"a non-payment query masks only the credential-looking value",
+			"/usage-logs?token=PATHSECRETSIGNATUREVALUE&page=2",
+			"/usage-logs?page=2&token=%2A%2A%2Amasked%2A%2A%2A",
+		},
+		{
+			"an equals outside a payment segment keeps the target",
+			"/files/a=b",
+			"/files/a=b",
+		},
+		{
+			"a decoded signature in the root segment keeps only the root",
+			"/sign=PATHSECRETSIGNATUREVALUE%26pid%3Dx",
+			"/",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			previousWriter := gin.DefaultWriter
+			var output bytes.Buffer
+			gin.DefaultWriter = &output
+			t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+			router := gin.New()
+			SetUpLogger(router)
+			router.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tc.target, nil))
+
+			logged := strings.TrimSuffix(output.String(), "\n")
+			_, loggedPath, found := strings.Cut(logged, "GET ")
+			require.True(t, found)
+			assert.Equal(t, tc.loggedPath, loggedPath)
+			if tc.name != "an equals outside a payment segment keeps the target" {
+				assert.NotContains(t, logged, "PATHSECRETSIGNATUREVALUE")
+			}
+		})
+	}
+}
+
 func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
 	previousMode, previousWriter, previousErrorWriter := gin.Mode(), gin.DefaultWriter, gin.DefaultErrorWriter
 	previousLogDir := *common.LogDir
