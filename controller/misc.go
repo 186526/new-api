@@ -38,7 +38,28 @@ func TestStatus(c *gin.Context) {
 	return
 }
 
+// statusCallerIsSignedIn reports whether the request carries a live dashboard
+// session. GetStatus has no auth middleware because the login page and the
+// public pages read it anonymously, so an optional credential is resolved here
+// instead. Any failure reads as anonymous.
+func statusCallerIsSignedIn(c *gin.Context) bool {
+	raw, ok := dashboardBearer(c.GetHeader("Authorization"))
+	if !ok {
+		return false
+	}
+	identity, internal, err := service.ParseDashboardAccessToken(raw)
+	if err != nil || !internal {
+		return false
+	}
+	_, _, err = service.ValidateLoginSession(identity)
+	return err == nil
+}
+
 func GetStatus(c *gin.Context) {
+
+	// Resolved before the option lock: validating a session reads the user
+	// cache and must not hold the lock option writers need.
+	callerIsSignedIn := statusCallerIsSignedIn(c)
 
 	cs := console_setting.GetConsoleSetting()
 	passkeySetting := system_setting.PasskeySettingsSnapshot()
@@ -107,8 +128,7 @@ func GetStatus(c *gin.Context) {
 		"faq_enabled":           cs.FAQEnabled,
 
 		// 模块管理配置
-		"HeaderNavModules":    common.OptionMap["HeaderNavModules"],
-		"SidebarModulesAdmin": common.OptionMap["SidebarModulesAdmin"],
+		"HeaderNavModules": common.OptionMap["HeaderNavModules"],
 
 		"oidc_enabled":                system_setting.GetOIDCSettings().Enabled,
 		"oidc_client_id":              system_setting.GetOIDCSettings().ClientId,
@@ -140,6 +160,17 @@ func GetStatus(c *gin.Context) {
 	}
 	if cs.FAQEnabled {
 		data["faq"] = console_setting.GetFAQ()
+	}
+
+	// The sidebar module gates also drive signed-in pages outside the admin
+	// console (the playground route reads the chat section), so the value goes
+	// to every signed-in session and to nobody else. Reaching those pages means
+	// the query cache was cleared for the new session, which refetches this
+	// endpoint with the bearer token. The body now varies by credential, so a
+	// shared cache must not store the signed-in variant.
+	if callerIsSignedIn {
+		c.Header("Cache-Control", "no-store, private")
+		data["SidebarModulesAdmin"] = common.OptionMap["SidebarModulesAdmin"]
 	}
 
 	// Add enabled custom OAuth providers
