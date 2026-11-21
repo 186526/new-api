@@ -96,10 +96,31 @@ let auth: AuthModules
 /** Records every `/api/status` request, in the order the server received it. */
 let statusRequests: { url: string; signedIn: boolean }[] = []
 
+/**
+ * The persisted status snapshot as it stood when each refresh request arrived.
+ *
+ * The mismatch retry is a second request inside one refresh, so this records
+ * what the mismatch clear had already done by the time it went out — which the
+ * retry's own rejection cannot show, however that retry ends.
+ */
+let refreshSnapshots: Array<string | null> = []
+
 /** An axios-shaped rejection, which is what the refresh runner inspects. */
-function axiosError(config: AxiosRequest, status: number): Error {
+type AxiosLikeError = Error & {
+  isAxiosError: true
+  config: AxiosRequest
+  response: {
+    status: number
+    statusText: string
+    headers: Record<string, never>
+    config: AxiosRequest
+    data: Record<string, unknown>
+  }
+}
+
+function axiosError(config: AxiosRequest, status: number): AxiosLikeError {
   return Object.assign(new Error('Request failed'), {
-    isAxiosError: true,
+    isAxiosError: true as const,
     config,
     response: { status, statusText: '', headers: {}, config, data: {} },
   })
@@ -115,25 +136,44 @@ function axiosError(config: AxiosRequest, status: number): Error {
  * produces when the refresh exchange wins.
  */
 function stubBackend(options: {
-  refresh: { status: number }
+  /**
+   * Responses for `/api/user/auth/refresh`, one per request in order; the last
+   * entry repeats. A `code` makes the response a 409 with that code.
+   */
+  refresh: Array<{ status: number; code?: string }>
   holdAnonymousStatus?: boolean
+  /** Fail `/api/status` with this HTTP status, as a broken cold start does. */
+  statusError?: number
 }): () => void {
   let releaseAnonymous = () => {}
   const anonymousGate = new Promise<void>((resolve) => {
     releaseAnonymous = resolve
   })
+  let refreshCalls = 0
 
   backend = async (config) => {
     const response = { status: 200, statusText: 'OK', headers: {}, config }
     if (config.url === '/api/user/auth/refresh') {
-      if (options.refresh.status >= 400) {
-        throw axiosError(config, options.refresh.status)
+      const step =
+        options.refresh[Math.min(refreshCalls, options.refresh.length - 1)]
+      refreshCalls += 1
+      refreshSnapshots.push(window.localStorage.getItem('status'))
+      if (step.code) {
+        const error = axiosError(config, step.status)
+        error.response.data = { code: step.code }
+        throw error
+      }
+      if (step.status >= 400) {
+        throw axiosError(config, step.status)
       }
       return { ...response, data: { success: true, data: bundle } }
     }
     if (config.url === '/api/status') {
       const signedIn = Boolean(config.headers.get('Authorization'))
       statusRequests.push({ url: config.url, signedIn })
+      if (options.statusError) {
+        throw axiosError(config, options.statusError)
+      }
       if (!signedIn && options.holdAnonymousStatus) {
         await anonymousGate
       }
@@ -208,6 +248,7 @@ beforeEach(async () => {
   window.localStorage.clear()
   document.cookie = ''
   statusRequests = []
+  refreshSnapshots = []
   backend = async () => {
     throw new Error('no backend stub installed')
   }
@@ -215,9 +256,8 @@ beforeEach(async () => {
   // the status query all hold module state that a reload would have recreated.
   vi.resetModules()
   const { useAuthStore } = await import('@/stores/auth-store')
-  const { resolveAuthentication, clearAuthenticatedClientState } = await import(
-    '@/lib/auth-session'
-  )
+  const { resolveAuthentication, clearAuthenticatedClientState } =
+    await import('@/lib/auth-session')
   const { isSidebarModuleEnabled } = await import('@/lib/nav-modules')
   useAuthStore.getState().auth.reset('idle')
   auth = {
@@ -235,7 +275,7 @@ afterEach(() => {
 
 test('an anonymous status read still in flight at sign-in refills the cache with the signed-in variant', async () => {
   const releaseAnonymous = stubBackend({
-    refresh: { status: 200 },
+    refresh: [{ status: 200 }],
     holdAnonymousStatus: true,
   })
 
@@ -258,13 +298,11 @@ test('an anonymous status read still in flight at sign-in refills the cache with
   //    refill rewrites the snapshot. Reading it here, without a consumer asking
   //    for status, separates a refill from a later consumer fetching from an
   //    empty cache and masking a missing one.
-  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } = await import(
-    '@/lib/status-query'
-  )
+  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } =
+    await import('@/lib/status-query')
   await vi.waitFor(() => {
-    const cached = queryClient.getQueryData<Record<string, unknown>>(
-      STATUS_QUERY_KEY
-    )
+    const cached =
+      queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
     expect(cached?.SidebarModulesAdmin).toBe(adminSidebarConfig)
     // The gates read this snapshot, not the cache entry, so both have to be in
     // place before the assertions below mean anything.
@@ -277,7 +315,7 @@ test('an anonymous status read still in flight at sign-in refills the cache with
 
 test('an anonymous response released after the signed-in refill cannot overwrite it', async () => {
   const releaseAnonymous = stubBackend({
-    refresh: { status: 200 },
+    refresh: [{ status: 200 }],
     holdAnonymousStatus: true,
   })
 
@@ -290,9 +328,8 @@ test('an anonymous response released after the signed-in refill cannot overwrite
   // half of the same race — the dropped read resolving last — and the ordering
   // that makes a missing guard observable: the read still carries the anonymous
   // variant but its signal is already aborted.
-  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } = await import(
-    '@/lib/status-query'
-  )
+  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } =
+    await import('@/lib/status-query')
   await vi.waitFor(() => {
     expect(
       queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
@@ -306,9 +343,8 @@ test('an anonymous response released after the signed-in refill cannot overwrite
   await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
   await new Promise((resolve) => globalThis.setTimeout(resolve, 0))
 
-  const cached = queryClient.getQueryData<Record<string, unknown>>(
-    STATUS_QUERY_KEY
-  )
+  const cached =
+    queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
   expect(cached?.SidebarModulesAdmin).toBe(adminSidebarConfig)
   expect(cached?.system_name).toBe('signed in')
   expect(window.localStorage.getItem(STATUS_STORAGE_KEY)).toContain(
@@ -319,7 +355,7 @@ test('an anonymous response released after the signed-in refill cannot overwrite
 
 test('the signed-in refill carries the session credential, not the anonymous one', async () => {
   const releaseAnonymous = stubBackend({
-    refresh: { status: 200 },
+    refresh: [{ status: 200 }],
     holdAnonymousStatus: true,
   })
   const { primed } = await bootApp()
@@ -340,10 +376,9 @@ test('the signed-in refill carries the session credential, not the anonymous one
 
 test('without the reset subscription the primed anonymous entry survives', async () => {
   // The negative control: this is the regression the subscription prevents.
-  stubBackend({ refresh: { status: 200 } })
-  const { statusQueryOptions, ensureStatus } = await import(
-    '@/lib/status-query'
-  )
+  stubBackend({ refresh: [{ status: 200 }] })
+  const { statusQueryOptions, ensureStatus } =
+    await import('@/lib/status-query')
   const queryClient = createQueryClient()
   await queryClient.ensureQueryData(statusQueryOptions)
   expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
@@ -355,7 +390,7 @@ test('without the reset subscription the primed anonymous entry survives', async
 })
 
 test('signing out clears the cache without reading status for the closed session', async () => {
-  stubBackend({ refresh: { status: 200 } })
+  stubBackend({ refresh: [{ status: 200 }] })
   const { queryClient } = await bootApp()
   expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
   await vi.waitFor(() => {
@@ -371,7 +406,7 @@ test('signing out clears the cache without reading status for the closed session
 })
 
 test('signing out drops the sidebar config the signed-in variant persisted', async () => {
-  stubBackend({ refresh: { status: 200 } })
+  stubBackend({ refresh: [{ status: 200 }] })
   const { queryClient } = await bootApp()
   expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
 
@@ -399,7 +434,7 @@ test('signing out drops the sidebar config the signed-in variant persisted', asy
 })
 
 test('a different session replacing the old one drops the old sidebar config at once', async () => {
-  stubBackend({ refresh: { status: 200 } })
+  stubBackend({ refresh: [{ status: 200 }] })
   const { queryClient } = await bootApp()
   expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
 
@@ -429,8 +464,85 @@ test('a different session replacing the old one drops the old sidebar config at 
   void queryClient
 })
 
+test('a cold start whose expired session cannot refill drops the old sidebar config', async () => {
+  // What the previous signed-in tab on this browser left behind.
+  window.localStorage.setItem(
+    'status',
+    JSON.stringify({
+      system_name: 'site',
+      SidebarModulesAdmin: adminSidebarConfig,
+    })
+  )
+  // A reload whose Refresh Cookie is expired or revoked, and whose anonymous
+  // status read then fails — offline, a proxy error, a 5xx. The self-healing
+  // refill never lands, so nothing but the session end can remove the field.
+  stubBackend({ refresh: [{ status: 401 }], statusError: 500 })
+
+  const { queryClient } = await bootApp()
+  expect(await auth.resolveAuthentication()).toEqual({ kind: 'anonymous' })
+
+  // A cold start has an empty store, so there is no in-memory `sid` to gate on.
+  expect(auth.useAuthStore.getState().auth.session).toBeNull()
+
+  const persisted = JSON.parse(
+    window.localStorage.getItem('status') ?? '{}'
+  ) as Record<string, unknown>
+  expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
+  void queryClient
+})
+
+test('a mismatch retry that ends anonymous drops the old sidebar config', async () => {
+  window.localStorage.setItem(
+    'status',
+    JSON.stringify({
+      system_name: 'site',
+      SidebarModulesAdmin: adminSidebarConfig,
+    })
+  )
+  // The store still names the old session, so the refresh sends its SID; the
+  // server answers AUTH_SESSION_MISMATCH, and the retry without that SID ends
+  // 401. Both steps end a session, and neither may leave the field behind.
+  // The token is expired so `resolveAuthentication` has to reach the server
+  // instead of answering from memory.
+  auth.useAuthStore.getState().auth.setBundle({
+    ...bundle,
+    access_expires_at: Math.floor(Date.now() / 1000) - 60,
+  })
+  const releaseAnonymous = stubBackend({
+    refresh: [{ status: 409, code: 'AUTH_SESSION_MISMATCH' }, { status: 401 }],
+    // Held, so the anonymous status read cannot write its own variant over the
+    // seeded snapshot before the retry goes out; the mismatch clear has to be
+    // what removed the field.
+    holdAnonymousStatus: true,
+  })
+
+  const { queryClient } = await bootApp()
+  expect(await auth.resolveAuthentication()).toEqual({ kind: 'anonymous' })
+
+  // The retry is what isolates this branch: the refusal that ends the session
+  // arrives only after the retry was already sent, so by the second request the
+  // mismatch clear alone had to have dropped the field. Asserting on the final
+  // state would pass even for a bare store reset, because the rejection that
+  // follows would strip it anyway.
+  expect(refreshSnapshots).toHaveLength(2)
+  const beforeRetry = JSON.parse(refreshSnapshots[1] ?? '{}') as Record<
+    string,
+    unknown
+  >
+  expect(beforeRetry).not.toHaveProperty('SidebarModulesAdmin')
+
+  const persisted = JSON.parse(
+    window.localStorage.getItem('status') ?? '{}'
+  ) as Record<string, unknown>
+  expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
+  releaseAnonymous()
+  void queryClient
+})
+
 test('an anonymous boot keeps the anonymous variant', async () => {
-  stubBackend({ refresh: { status: 401 } })
+  stubBackend({ refresh: [{ status: 401 }] })
   const { queryClient, primed } = await bootApp()
   const { ensureStatus } = await import('@/lib/status-query')
   await primed

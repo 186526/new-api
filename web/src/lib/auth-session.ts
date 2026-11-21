@@ -225,20 +225,33 @@ export function applyAuthRotation(value: unknown): void {
   )
 }
 
+/**
+ * Drop the in-memory session together with the status snapshot fields that only
+ * that session could read.
+ *
+ * `authEpoch` and the session listeners are deliberately left to the caller: a
+ * session end supersedes an in-flight refresh, while the `AUTH_SESSION_MISMATCH`
+ * retry is itself in flight and has to stay current.
+ */
+function forgetSessionState(bootstrapState: AuthBootstrapState): void {
+  useAuthStore.getState().auth.reset(bootstrapState)
+  // Unconditional, not gated on a live `sid`: a cold start with an expired
+  // Refresh Cookie starts from an empty store, and the snapshot it inherits was
+  // written by whichever session ran last in this browser.
+  forgetSignedInStatus()
+}
+
 export function clearAuthentication(
   synchronizeTabs = true,
   bootstrapState: AuthBootstrapState = 'complete'
 ): void {
   const sid = useAuthStore.getState().auth.session?.sid
   authEpoch += 1
-  useAuthStore.getState().auth.reset(bootstrapState)
+  forgetSessionState(bootstrapState)
   if (synchronizeTabs && sid) {
     publishAuthSessionEvent('signed_out', sid)
   }
-  if (sid) {
-    forgetSignedInStatus()
-    publishSessionEnded()
-  }
+  if (sid) publishSessionEnded()
 }
 
 export function clearAuthenticatedClientState(
@@ -419,7 +432,10 @@ function runRefresh(refreshEpoch: number): Promise<RefreshOutcome> {
     acceptBundle: (bundle) => applyAuthBundle(bundle, false),
     clear: (synchronizeTabs, bootstrapState) => {
       if (!synchronizeTabs && bootstrapState === 'idle') {
-        useAuthStore.getState().auth.reset('idle')
+        // The mismatch retry runs inside this refresh, so it drops the session
+        // through the shared path without the epoch bump that would supersede
+        // its own retry.
+        forgetSessionState('idle')
         return
       }
       clearAuthentication(synchronizeTabs, bootstrapState)
