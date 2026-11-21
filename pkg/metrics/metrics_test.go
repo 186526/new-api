@@ -233,10 +233,10 @@ func TestParseRedisInfo(t *testing.T) {
 
 func TestObserveChannelBalanceUSDUsesDisplayNameThenID(t *testing.T) {
 	ObserveChannelBalanceUSD("test-balance-named", 7, 12.5)
-	assert.Equal(t, 12.5, testutil.ToFloat64(channelBalanceUSD.WithLabelValues("test-balance-named")))
+	assert.Equal(t, 12.5, testutil.ToFloat64(channelBalanceUSD.WithLabelValues("test-balance-named", channelConfiguredValue(true))))
 
 	ObserveChannelBalanceUSD("", 42, 3.25)
-	assert.Equal(t, 3.25, testutil.ToFloat64(channelBalanceUSD.WithLabelValues("42")))
+	assert.Equal(t, 3.25, testutil.ToFloat64(channelBalanceUSD.WithLabelValues("42", channelConfiguredValue(true))))
 }
 
 func TestObserveChannelBalanceUSDSkipsUnidentifiedChannel(t *testing.T) {

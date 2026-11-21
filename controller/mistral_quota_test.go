@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	"github.com/QuantumNous/new-api/service"
 )
 
@@ -124,4 +125,99 @@ func TestMistralQuotaRefreshPublishesTheAllowanceOfAnAccountWithoutAChannel(t *t
 	vibe := windows[1]
 	assert.Equal(t, service.MistralBudgetScopeVibe, vibe.Scope)
 	assert.InDelta(t, 0.75, vibe.RemainingRatio, 1e-9)
+}
+
+// upstreamQuotaLabels returns the channel_configured value of every published
+// series of one metric whose channel label is the given name, keyed by
+// scope|window (empty for a metric without those labels).
+func upstreamQuotaLabels(t *testing.T, metricName, channel string) map[string]bool {
+	t.Helper()
+	gathered, err := appmetrics.Registry().Gather()
+	require.NoError(t, err)
+	labels := make(map[string]bool)
+	for _, family := range gathered {
+		if family.GetName() != metricName {
+			continue
+		}
+		for _, sample := range family.GetMetric() {
+			channelName, configured, scope, window := "", "", "", ""
+			for _, label := range sample.GetLabel() {
+				switch label.GetName() {
+				case "channel":
+					channelName = label.GetValue()
+				case "channel_configured":
+					configured = label.GetValue()
+				case "scope":
+					scope = label.GetValue()
+				case "window":
+					window = label.GetValue()
+				}
+			}
+			if channelName != channel {
+				continue
+			}
+			labels[scope+"|"+window] = configured == "true"
+		}
+	}
+	return labels
+}
+
+// TestMistralQuotaRefreshLabelsAConfiguredAccountWithoutAChannel requires the
+// refresh to tell the two cases apart on the metric itself: an account whose
+// channel exists publishes channel_configured="true" and an account that no
+// channel carries publishes "false". The orphan keeps its series, so the figure
+// stays readable, and only the label separates it from a live channel.
+func TestMistralQuotaRefreshLabelsAConfiguredAccountWithoutAChannel(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captureMistralServerLog(t)
+	server := newMistralBillingServer(t, 25, 150)
+	live := "Mistral (label live)"
+	orphan := "Mistral (label orphan)"
+	setMistralQuotaEnv(t, server.URL, `[`+
+		`{"channel":"`+live+`","cookie":"ory_session_x=1","vibeKey":"mstrl_live","monthlyLimitUsd":150},`+
+		`{"channel":"`+orphan+`","cookie":"ory_session_y=1","vibeKey":"mstrl_orphan","monthlyLimitUsd":150}]`)
+	liveChannel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_live", Name: live}
+	require.NoError(t, model.DB.Create(liveChannel).Error)
+
+	require.False(t, refreshMistralQuotas().failed)
+
+	ratios := upstreamQuotaLabels(t, "newapi_upstream_quota_remaining_ratio", live)
+	require.Contains(t, ratios, "vibe|monthly")
+	assert.True(t, ratios["vibe|monthly"], "a channel that carries the account name must publish channel_configured=true")
+
+	orphanRatios := upstreamQuotaLabels(t, "newapi_upstream_quota_remaining_ratio", orphan)
+	require.Contains(t, orphanRatios, "vibe|monthly", "the orphan keeps its series so the figure stays readable")
+	assert.False(t, orphanRatios["vibe|monthly"], "an account no channel carries must publish channel_configured=false")
+
+	orphanRefreshes := upstreamQuotaLabels(t, "newapi_upstream_quota_refresh_timestamp_seconds", orphan)
+	assert.False(t, orphanRefreshes["|"], "the refresh timestamp of an orphan carries the same label")
+	liveRefreshes := upstreamQuotaLabels(t, "newapi_upstream_quota_refresh_timestamp_seconds", live)
+	assert.True(t, liveRefreshes["|"])
+
+	balances := upstreamQuotaLabels(t, "newapi_channel_balance_usd", live)
+	assert.True(t, balances["|"], "a balance series belongs to a channel and stays configured")
+}
+
+// TestMistralQuotaRefreshKeepsALiveChannelWhenTheTableCannotBeRead requires an
+// unreadable channel table to leave every account labelled as configured. The
+// table says nothing about a channel being gone, so hiding a live channel
+// behind an orphan label would be the worse failure, and naming every account in
+// the missing-channel line would be worse still.
+func TestMistralQuotaRefreshKeepsALiveChannelWhenTheTableCannotBeRead(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captured := captureMistralServerLog(t)
+	server := newMistralBillingServer(t, 25, 150)
+	account := "Mistral (unreadable)"
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"`+account+`","cookie":"ory_session_x=1","vibeKey":"mstrl_unreadable","monthlyLimitUsd":150}]`)
+	sqlDB, err := model.DB.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+
+	require.False(t, refreshMistralQuotas().failed)
+
+	labels := upstreamQuotaLabels(t, "newapi_upstream_quota_remaining_ratio", account)
+	require.Contains(t, labels, "vibe|monthly")
+	assert.True(t, labels["vibe|monthly"], "an unreadable channel table must not label a live account as an orphan")
+	assert.NotContains(t, captured.String(),
+		"no Mistral channel carries the name of the configured quota accounts "+account)
 }

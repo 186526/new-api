@@ -10,7 +10,7 @@ var (
 	channelBalanceUSD = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "newapi_channel_balance_usd",
 		Help: "Remaining upstream credit of a channel, in US dollars.",
-	}, []string{"channel"})
+	}, []string{"channel", "channel_configured"})
 
 	upstreamCreditsUsedUSD = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "newapi_upstream_credits_used_usd",
@@ -55,7 +55,10 @@ func setChannelBalance(channel string, remainingUSD float64) {
 	if channel == "" {
 		return
 	}
-	channelBalanceUSD.WithLabelValues(channel).Set(remainingUSD)
+	// Every balance series is published from a channel New API holds, so the
+	// channel_configured label keeps its single value here. The label exists so a
+	// dashboard can filter the whole upstream-allowance family the same way.
+	channelBalanceUSD.WithLabelValues(channel, channelConfiguredValue(true)).Set(remainingUSD)
 }
 
 // ObserveChannelBalanceUSD publishes the remaining balance of a channel whose

@@ -11,6 +11,51 @@ import (
 	"github.com/QuantumNous/new-api/service"
 )
 
+// mistralChannelIndex answers which Mistral channel carries the name of a
+// configured quota account. A refresh reads the channel table once per tick and
+// resolves every account against that read, so the accounts of one tick cannot
+// disagree about which channels exist.
+type mistralChannelIndex struct {
+	byName map[string]*model.Channel
+	names  []string
+	// readErr is the failure to read the channel table. Every account of the
+	// tick then stays labelled as configured: an unreadable table says nothing
+	// about a channel being gone, and hiding a live channel is worse than
+	// showing an orphan until the next tick reads the table again.
+	readErr error
+}
+
+func loadMistralChannelIndex() mistralChannelIndex {
+	index := mistralChannelIndex{byName: make(map[string]*model.Channel)}
+	channels, err := model.GetAllChannels(0, 0, true, true)
+	if err != nil {
+		index.readErr = err
+		return index
+	}
+	for _, channel := range channels {
+		if channel.Type != constant.ChannelTypeMistral {
+			continue
+		}
+		index.names = append(index.names, channel.Name)
+		if _, exists := index.byName[channel.Name]; !exists {
+			index.byName[channel.Name] = channel
+		}
+	}
+	return index
+}
+
+// resolve returns the channel that carries the account name together with
+// whether the account's allowance has lost its channel. The second value is the
+// channel_configured label: false only when the table was read and no channel
+// carries the name.
+func (i mistralChannelIndex) resolve(name string) (*model.Channel, bool) {
+	if i.readErr != nil {
+		return nil, false
+	}
+	channel, ok := i.byName[name]
+	return channel, !ok
+}
+
 // updateChannelMistralBalance reports what is left of the allowance the channel
 // consumes as the channel balance. The percentages live in the admin console and
 // not behind the API key, so the account is matched by channel name; when the
@@ -28,31 +73,17 @@ func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 	return applyMistralChannelBalance(channel, account, quota)
 }
 
-// refreshMistralChannelBalance stores the allowance of a channel whose quota was
+// storeMistralChannelBalance stores the allowance of a channel whose quota was
 // already fetched by the quota refresh, so the balance does not depend on the
-// channel balance sweep, which only visits enabled channels. It reports whether a
-// channel carries the account name, and the names of the Mistral channels it
-// read: the quota refresh records an account without a channel, and writes its
-// log line once per configuration rather than per tick.
-func refreshMistralChannelBalance(account service.MistralQuotaAccount, quota *service.MistralQuota) (stored bool, mistralChannels []string, err error) {
-	channels, err := model.GetAllChannels(0, 0, true, true)
-	if err != nil {
-		return false, nil, err
+// channel balance sweep, which only visits enabled channels. A nil channel is an
+// account without a channel: its allowance is still published as the upstream
+// quota, but there is no channel balance to store.
+func storeMistralChannelBalance(channel *model.Channel, account service.MistralQuotaAccount, quota *service.MistralQuota) error {
+	if channel == nil {
+		return nil
 	}
-	for _, channel := range channels {
-		if channel.Type != constant.ChannelTypeMistral {
-			continue
-		}
-		mistralChannels = append(mistralChannels, channel.Name)
-		if channel.Name != account.Channel {
-			continue
-		}
-		if _, err := applyMistralChannelBalance(channel, account, quota); err != nil {
-			return false, mistralChannels, err
-		}
-		return true, mistralChannels, nil
-	}
-	return false, mistralChannels, nil
+	_, err := applyMistralChannelBalance(channel, account, quota)
+	return err
 }
 
 // applyMistralChannelBalance picks the allowance the channel key consumes and

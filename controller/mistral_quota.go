@@ -40,7 +40,12 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 
 	client := service.NewMistralQuotaClient()
 	result := mistralQuotaRefreshResult{}
+	channels := loadMistralChannelIndex()
+	if channels.readErr != nil {
+		common.SysError(common.LogText("failed to list channels for the Mistral quota refresh: %s", channels.readErr.Error()))
+	}
 	missing := newMistralMissingChannels(accounts)
+	missing.recordChannels(channels)
 	for _, account := range accounts {
 		quota, err := client.Fetch(context.Background(), account)
 		if err != nil {
@@ -52,18 +57,25 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 			common.SysLog(common.LogText("failed to refresh Mistral quota: channel=%s, error=%v", account.Channel, err))
 			continue
 		}
+		// The channel is resolved before the allowance is published, so the
+		// series of an account whose channel is gone is labelled
+		// channel_configured="false" instead of reading as a live channel.
+		channel, orphaned := channels.resolve(account.Channel)
 		appmetrics.ObserveUpstreamQuota(appmetrics.UpstreamQuota{
-			Channel:     quota.Channel,
-			Windows:     mistralQuotaWindows(quota),
-			RefreshedAt: quota.FetchedAt,
+			Channel:         quota.Channel,
+			Windows:         mistralQuotaWindows(quota),
+			RefreshedAt:     quota.FetchedAt,
+			ChannelOrphaned: orphaned,
 		})
+		if orphaned {
+			missing.recordAbsent(account.Channel)
+		}
 		// The channel balance shows the allowance the channel key consumes, and
 		// the balance sweep skips a disabled channel, so it is refreshed here for
-		// every configured channel instead.
-		stored, channels, balanceErr := refreshMistralChannelBalance(account, quota)
-		missing.recordBalance(account.Channel, stored, channels, balanceErr)
-		if balanceErr != nil {
-			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, balanceErr))
+		// every configured channel instead. An account without a channel has no
+		// balance to store.
+		if err := storeMistralChannelBalance(channel, account, quota); err != nil {
+			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, err))
 		}
 		time.Sleep(common.RequestInterval)
 	}
@@ -71,15 +83,15 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 	return result
 }
 
-// mistralMissingChannels collects the configured accounts whose allowance could
-// not be stored because no channel carries their name. The accounts are known
-// before the channels are read, so a failure to read the channels does not turn
-// every account into a missing channel.
+// mistralMissingChannels reports the configured accounts whose allowance has no
+// channel behind it, so a channel deleted by mistake is named in the log instead
+// of only losing its balance. The channels are read once per tick and every
+// account of that tick is resolved against the same read.
 type mistralMissingChannels struct {
-	names           map[string]struct{}
-	absent          []string
-	mistralChannels []string
-	loadError       string
+	names    map[string]struct{}
+	absent   []string
+	channels []string
+	loadErr  string
 }
 
 func newMistralMissingChannels(accounts []service.MistralQuotaAccount) *mistralMissingChannels {
@@ -90,24 +102,26 @@ func newMistralMissingChannels(accounts []service.MistralQuotaAccount) *mistralM
 	return missing
 }
 
-// recordBalance notes how storing the balance of an account went: the Mistral
-// channels that were read, the account among them that has no channel, and the
-// error that kept the balance from being stored. A name that is not a configured
-// account is ignored, so only the quota configuration can add an account to the
-// list.
-func (m *mistralMissingChannels) recordBalance(account string, stored bool, channels []string, loadErr error) {
-	if loadErr != nil {
-		m.loadError = loadErr.Error()
-	}
-	if len(channels) > 0 {
-		m.mistralChannels = channels
-	}
-	if stored {
+// recordChannels keeps the Mistral channels of the tick and, when the table
+// could not be read, the error that kept them from being resolved. An unreadable
+// table turns no account into a missing one: the report would otherwise name
+// every account as lost.
+func (m *mistralMissingChannels) recordChannels(channels mistralChannelIndex) {
+	if channels.readErr != nil {
+		m.loadErr = channels.readErr.Error()
 		return
 	}
-	if _, ok := m.names[account]; ok {
-		m.absent = append(m.absent, account)
+	m.channels = channels.names
+}
+
+// recordAbsent adds the account whose allowance was published without a channel
+// behind it. The names come from the quota configuration, so only a configured
+// account can reach the list.
+func (m *mistralMissingChannels) recordAbsent(account string) {
+	if _, ok := m.names[account]; !ok {
+		return
 	}
+	m.absent = append(m.absent, account)
 }
 
 // logOnce writes one line for the accounts that have no channel. The line is
@@ -120,10 +134,10 @@ func (m *mistralMissingChannels) logOnce() {
 		return
 	}
 	slices.Sort(m.absent)
-	slices.Sort(m.mistralChannels)
+	slices.Sort(m.channels)
 	absent := slices.Compact(slices.Clone(m.absent))
 	report := strings.Join(absent, ", ") + "|" +
-		strings.Join(slices.Compact(m.mistralChannels), ", ") + "|" + m.loadError
+		strings.Join(slices.Compact(m.channels), ", ") + "|" + m.loadErr
 	mistralMissingChannelLog.mu.Lock()
 	defer mistralMissingChannelLog.mu.Unlock()
 	if mistralMissingChannelLog.reported == report {
