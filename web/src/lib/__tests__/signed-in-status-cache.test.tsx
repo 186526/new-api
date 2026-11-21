@@ -87,6 +87,7 @@ const bundle = {
 type AuthModules = {
   useAuthStore: typeof import('@/stores/auth-store').useAuthStore
   resolveAuthentication: typeof import('@/lib/auth-session').resolveAuthentication
+  bootstrapAuthentication: typeof import('@/lib/auth-session').bootstrapAuthentication
   clearAuthenticatedClientState: typeof import('@/lib/auth-session').clearAuthenticatedClientState
   isSidebarModuleEnabled: typeof import('@/lib/nav-modules').isSidebarModuleEnabled
 }
@@ -256,13 +257,17 @@ beforeEach(async () => {
   // the status query all hold module state that a reload would have recreated.
   vi.resetModules()
   const { useAuthStore } = await import('@/stores/auth-store')
-  const { resolveAuthentication, clearAuthenticatedClientState } =
-    await import('@/lib/auth-session')
+  const {
+    resolveAuthentication,
+    bootstrapAuthentication,
+    clearAuthenticatedClientState,
+  } = await import('@/lib/auth-session')
   const { isSidebarModuleEnabled } = await import('@/lib/nav-modules')
   useAuthStore.getState().auth.reset('idle')
   auth = {
     useAuthStore,
     resolveAuthentication,
+    bootstrapAuthentication,
     clearAuthenticatedClientState,
     isSidebarModuleEnabled,
   }
@@ -538,6 +543,38 @@ test('a mismatch retry that ends anonymous drops the old sidebar config', async 
   expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
   expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
   releaseAnonymous()
+  void queryClient
+})
+
+test('an anonymous boot with no session hint drops the previous session snapshot', async () => {
+  // A session that expired while the browser was closed: `ClearRefreshCookie`
+  // expires the hint cookie in lockstep with the Refresh Cookie, so the next
+  // cold start has neither cookie and an untouched snapshot. Nothing about this
+  // boot reaches the server — the hint says a refresh would only 401.
+  window.localStorage.setItem(
+    'status',
+    JSON.stringify({
+      system_name: 'site',
+      SidebarModulesAdmin: adminSidebarConfig,
+    })
+  )
+  document.cookie = ''
+  stubBackend({ refresh: [{ status: 200 }], statusError: 500 })
+
+  const { queryClient } = await bootApp()
+  expect(await auth.bootstrapAuthentication()).toEqual({ kind: 'anonymous' })
+
+  // The early return is what this asserts, not a failed exchange: a refresh here
+  // would have proved the hint was ignored.
+  expect(refreshSnapshots).toHaveLength(0)
+
+  const persisted = JSON.parse(
+    window.localStorage.getItem('status') ?? '{}'
+  ) as Record<string, unknown>
+  expect(persisted).not.toHaveProperty('SidebarModulesAdmin')
+  // The site-wide fields are the anonymous variant's too, so they survive.
+  expect(persisted.system_name).toBe('site')
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
   void queryClient
 })
 

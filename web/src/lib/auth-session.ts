@@ -528,11 +528,21 @@ export async function resolveAuthentication(): Promise<RefreshOutcome> {
  * anonymous check. `resolveAuthentication` therefore still reaches the network
  * later, which is what lets a hintless visitor holding a valid Refresh Cookie
  * recover the moment authentication actually matters.
+ *
+ * The skip is still a session end for this browser. `ClearRefreshCookie` expires
+ * the hint in lockstep with the Refresh Cookie, so a session that lapsed while
+ * the tab was closed arrives here with neither cookie and the previous session's
+ * snapshot still persisted; without the strip that snapshot keeps
+ * `SidebarModulesAdmin` and the gates read it for this visitor.
  */
 export async function bootstrapAuthentication(): Promise<RefreshOutcome> {
   if (!currentValidAuthBundle() && !hasSessionHint()) {
     const auth = useAuthStore.getState().auth
     if (!auth.user && !auth.session) {
+      // Reveals no session, so it is none: the snapshot on disk is not this
+      // visitor's. `forgetSessionState` is not used because there is no store
+      // state to reset and no epoch to supersede.
+      forgetSignedInStatus()
       return { kind: 'anonymous' }
     }
   }
