@@ -198,7 +198,7 @@ git clone https://github.com/QuantumNous/new-api.git
 cd new-api
 ```
 
-起動前に `docker-compose.yml` を編集し、データベースと Redis のサービスおよび接続文字列にあるサンプルパスワードを変更します。永続的に使うランダムな `SESSION_SECRET` も設定してください（`openssl rand -hex 32` で生成可能）。HTTPS の管理画面には `SESSION_COOKIE_SECURE=true` を設定し、公開 HTTPS オリジンを `SESSION_COOKIE_TRUSTED_URL` に正確に指定します。
+起動前に `docker-compose.yml` を編集し、データベースと Redis のサービスおよび接続文字列にあるサンプルパスワードを変更します。永続的に使うランダムな `SESSION_SECRET` と、それとは別のランダムな `CRYPTO_SECRET` も設定してください（それぞれ `openssl rand -hex 32` で生成可能）。`CRYPTO_SECRET` が未設定のあいだプロセスは起動を拒否します。これを既定で `SESSION_SECRET` にしていた版から更新する環境では、発行済みのタスク成果物 URL と認証キャッシュの項目を有効なまま保つため、`CRYPTO_SECRET` に同じ値を設定する必要があります。HTTPS の管理画面には `SESSION_COOKIE_SECURE=true` を設定し、公開 HTTPS オリジンを `SESSION_COOKIE_TRUSTED_URL` に正確に指定します。
 
 ```bash
 docker compose up -d
@@ -220,7 +220,7 @@ docker compose logs -f new-api
 | `LOG_SQL_DSN` | 任意の独立ログデータベースへの接続 |
 | `REDIS_CONN_STRING` | Redis 接続文字列 |
 | `SESSION_SECRET` | 永続的な認証用シークレット。全ノードで同じ値を使用 |
-| `CRYPTO_SECRET` | 既定は `SESSION_SECRET`。Redis を共有するノードは同じ実効値を使用 |
+| `CRYPTO_SECRET` | 必須：タスク成果物 URL と認証キャッシュの項目を署名し、キャッシュを共有するノードでは同じ値を使う。ランダムな文字列を設定し、変数が必須になる前に発行した成果物を保つ場合に限り `SESSION_SECRET` を設定 |
 | `SESSION_COOKIE_SECURE` | HTTPS の管理画面では `true`。Secure な更新用 Cookie と、更新・ログアウト時の厳格なオリジン検証を有効化 |
 | `SESSION_COOKIE_TRUSTED_URL` | Secure モードでは必須。パスやワイルドカードを含まない正確な HTTPS オリジンをカンマ区切りで指定。ローカル HTTP では未設定にする |
 | `TRUSTED_PROXIES` | 信頼するリバースプロキシの IP/CIDR、または `none`。実際のネットワークに合わせて明示的に設定 |

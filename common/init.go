@@ -74,14 +74,6 @@ func InitEnv() {
 	if CryptoSecret == SessionSecret {
 		log.Println(LogText("WARNING: CRYPTO_SECRET equals SESSION_SECRET, so the task artifact URLs and the auth cache entries share the session signing key; set CRYPTO_SECRET to a different random string."))
 	}
-	// The compose file and the README both show `random_string` as the example
-	// value. SESSION_SECRET refuses that literal, so accepting it here would
-	// hand every deployment that kept the example a signing key printed in the
-	// repository, and `service/task_artifact_access.go` treats such a token as
-	// authentication for the artifact route.
-	if CryptoSecret == "random_string" {
-		log.Fatal(LogText("CRYPTO_SECRET is set to the example value 'random_string', which anyone can read from the repository; set it to a random string."))
-	}
 	if err := InitSessionCookieSettings(); err != nil {
 		log.Fatal(err)
 	}

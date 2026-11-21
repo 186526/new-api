@@ -197,7 +197,7 @@ git clone https://github.com/QuantumNous/new-api.git
 cd new-api
 ```
 
-啟動前編輯 `docker-compose.yml`：同時替換資料庫、Redis 服務及對應連線字串中的範例密碼，並設定固定的隨機 `SESSION_SECRET`（可用 `openssl rand -hex 32` 產生）。透過 HTTPS 存取控制台時，設定 `SESSION_COOKIE_SECURE=true`，並在 `SESSION_COOKIE_TRUSTED_URL` 中填寫控制台對外的精確 HTTPS Origin。
+啟動前編輯 `docker-compose.yml`：同時替換資料庫、Redis 服務及對應連線字串中的範例密碼，並設定固定的隨機 `SESSION_SECRET` 與另一個獨立的隨機 `CRYPTO_SECRET`（分別用 `openssl rand -hex 32` 產生）。`CRYPTO_SECRET` 為空時行程拒絕啟動；從將它預設為 `SESSION_SECRET` 的版本升級的部署，必須把 `CRYPTO_SECRET` 設為同一個值，否則已產生的任務產物 URL 與驗證快取項目會失效。透過 HTTPS 存取控制台時，設定 `SESSION_COOKIE_SECURE=true`，並在 `SESSION_COOKIE_TRUSTED_URL` 中填寫控制台對外的精確 HTTPS Origin。
 
 ```bash
 docker compose up -d
@@ -219,7 +219,7 @@ docker compose logs -f new-api
 | `LOG_SQL_DSN` | 可選的獨立日誌資料庫連線字串 |
 | `REDIS_CONN_STRING` | Redis 連線字串 |
 | `SESSION_SECRET` | 持久保存的驗證金鑰，所有節點必須一致 |
-| `CRYPTO_SECRET` | 預設使用 `SESSION_SECRET`；共享 Redis 的節點必須使用相同的有效值 |
+| `CRYPTO_SECRET` | 必填：簽署任務產物 URL 與驗證快取項目，共享快取的節點必須使用相同的值；設為隨機字串，只有為保留變數改為必填之前產生的產物時才設為 `SESSION_SECRET` |
 | `SESSION_COOKIE_SECURE` | HTTPS 控制台設為 `true`，啟用 Secure 更新 Cookie 和嚴格的更新／登出來源驗證 |
 | `SESSION_COOKIE_TRUSTED_URL` | Secure 模式必填：以逗號分隔的精確 HTTPS Origin，不含路徑或萬用字元；本機 HTTP 模式不設定 |
 | `TRUSTED_PROXIES` | 可信反向代理 IP/CIDR，或 `none`；依實際網路明確設定 |
