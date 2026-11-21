@@ -107,6 +107,17 @@ func redactRequestTarget(request *http.Request) string {
 	return target
 }
 
+// paymentSplitSegmentLimit caps how many "="-bearing segments the decoded-path
+// split tests before it falls back. The guard runs in the gin formatter for
+// every request, so its cost is chosen by an unauthenticated client; each
+// candidate hands the rest of the path to the predicates, and an unbounded
+// count would make that quadratic in the request line. A real callback URL has
+// a handful of segments, so the limit only binds on a crafted path. Reaching it
+// returns the first candidate instead of the path: that route half ends before
+// the first "="-bearing segment, so it holds no literal "=" and cannot print a
+// value that arrived after one.
+const paymentSplitSegmentLimit = 64
+
 // splitQueryDecodedIntoPath splits a path that carries a decoded query in one of
 // its segments: "sign%3DSECRET%26pid%3DID" reaches the log as
 // "sign=SECRET&pid=ID", so the endpoint sits before the "=" and the query text
@@ -119,34 +130,47 @@ func redactRequestTarget(request *http.Request) string {
 // carry a decoded "=" of its own, and splitting there would leave a route half
 // without the callback segment while the query half starts with that earlier
 // name, so neither predicate would fire. The first split either predicate
-// accepts is the one returned.
+// accepts is the one returned. The segments are walked forward once, so a path
+// that is one long "="-bearing segment costs one pass rather than a backward
+// rescan per "=".
 //
-// A double-encoded "=" ("%253D") stays a known limit: it decodes once to "%3D",
-// so the path holds no literal "=", found is false, and the value keeps its
-// percent-encoding. It is not plaintext in the log, but it is recoverable by
-// decoding the line. found is false when no segment is accepted, and path is
-// then returned unchanged with an empty query half.
+// At most paymentSplitSegmentLimit segments are tested; past that the first
+// candidate is returned (see that constant for why). A double-encoded "="
+// ("%253D") stays a known limit: it decodes once to "%3D", so the path holds no
+// literal "=", found is false, and the value keeps its percent-encoding. It is
+// not plaintext in the log, but it is recoverable by decoding the line. found is
+// false when no segment is accepted, and path is then returned unchanged with an
+// empty query half.
 func splitQueryDecodedIntoPath(path string) (routePath, queryText string, found bool) {
-	searchFrom := 0
-	for {
-		equalsAt := strings.IndexByte(path[searchFrom:], '=')
-		if equalsAt < 0 {
-			return path, "", false
+	var firstCandidateRoutePath string
+	tested := 0
+	for segmentStart := 0; segmentStart < len(path); {
+		segmentEnd := strings.IndexByte(path[segmentStart:], '/')
+		if segmentEnd < 0 {
+			segmentEnd = len(path) - segmentStart
 		}
-		equalsAt += searchFrom
-		// The segment holding this "=" is where that decoded query starts. The
-		// key name sits in that segment, so the query text keeps it.
-		segmentStart := strings.LastIndexByte(path[:equalsAt], '/') + 1
-		routePath = strings.TrimSuffix(path[:segmentStart], "/")
-		if routePath == "" {
-			// The query took the whole first segment, so no route precedes it. "/"
-			// says the request reached no route, which is what the log should show.
-			routePath = "/"
+		if strings.IndexByte(path[segmentStart:segmentStart+segmentEnd], '=') >= 0 {
+			// The segment holding this "=" is where that decoded query starts. The
+			// key name sits in that segment, so the query text keeps it.
+			routePath = strings.TrimSuffix(path[:segmentStart], "/")
+			if routePath == "" {
+				// The query took the whole first segment, so no route precedes it. "/"
+				// says the request reached no route, which is what the log should show.
+				routePath = "/"
+			}
+			queryText = path[segmentStart:]
+			if tested == 0 {
+				firstCandidateRoutePath = routePath
+			}
+			if relaycommon.IsPaymentCallbackPath(routePath) || relaycommon.IsPaymentCallbackQueryText(queryText) {
+				return routePath, queryText, true
+			}
+			tested++
+			if tested == paymentSplitSegmentLimit {
+				return firstCandidateRoutePath, "", true
+			}
 		}
-		queryText = path[segmentStart:]
-		if relaycommon.IsPaymentCallbackPath(routePath) || relaycommon.IsPaymentCallbackQueryText(queryText) {
-			return routePath, queryText, true
-		}
-		searchFrom = equalsAt + 1
+		segmentStart += segmentEnd + 1
 	}
+	return path, "", false
 }

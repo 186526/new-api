@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -14,6 +15,30 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// BenchmarkRedactRequestTarget pins the cost of the log-path redaction on a
+// request line an unauthenticated client chooses. The decoded-path guard walks
+// the segments of a path looking for "=", so a path that is one long
+// "="-bearing segment is the input that makes a per-candidate backward scan
+// quadratic; the second case is the same shape split into many segments, where
+// a whole-remainder predicate call per candidate is the cost. Both stay inside
+// a request line the edge allows (~8 KiB in the first case, ~8 KiB in the
+// second), so a regression shows up as microseconds here rather than seconds.
+func BenchmarkRedactRequestTarget(b *testing.B) {
+	for _, tc := range []struct{ name, path string }{
+		{"one equals segment 8000 bytes", "/" + strings.Repeat("=", 8000)},
+		{"many equals segments 2000 times", "/" + strings.Repeat("a=b/", 2000)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			request := &http.Request{Method: http.MethodGet, URL: &url.URL{Path: tc.path}}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				redactRequestTarget(request)
+			}
+		})
+	}
+}
 
 func TestSetUpLoggerMasksQueryCredentials(t *testing.T) {
 	previousMode, previousWriter := gin.Mode(), gin.DefaultWriter
@@ -212,6 +237,36 @@ func TestAccessLogDropsASignatureDecodedIntoAPathOnlyForAPaymentCallback(t *test
 			}
 		})
 	}
+}
+
+// TestAccessLogBoundsTheDecodedPathCandidateScan pins the cost ceiling: the
+// guard runs in the formatter for every request, so a path built from many
+// "="-bearing segments must not hand the remaining path to the predicates once
+// per segment. Past paymentSplitSegmentLimit segments the split returns its
+// first candidate, which drops the query from the log instead of leaking one.
+func TestAccessLogBoundsTheDecodedPathCandidateScan(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousWriter := gin.DefaultWriter
+	var output bytes.Buffer
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+	// One more "=" segment than the limit allows, with the signature in the last
+	// one, which the bounded scan never reaches.
+	path := "/files" + strings.Repeat("/a=b", paymentSplitSegmentLimit+1) + "/sign=" + "BOUNDEDSCANSIGNATUREVALUE"
+	router := gin.New()
+	SetUpLogger(router)
+	router.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, path, nil))
+
+	logged := strings.TrimSuffix(output.String(), "\n")
+	_, loggedPath, found := strings.Cut(logged, "POST ")
+	require.True(t, found)
+	// The bound returns the first candidate, which is the route before the first
+	// "="-bearing segment. Without the bound the walk would reach the trailing
+	// "sign=" segment and log the whole path instead, so this pins the ceiling.
+	assert.Equal(t, "/files", loggedPath)
+	assert.NotContains(t, logged, "BOUNDEDSCANSIGNATUREVALUE", "the bounded scan must not log what it stopped before")
 }
 
 func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
