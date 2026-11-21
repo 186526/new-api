@@ -1,8 +1,12 @@
 package mistral
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"regexp"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -12,166 +16,204 @@ import (
 
 var mistralToolCallIdRegexp = regexp.MustCompile("^[a-zA-Z0-9]{9}$")
 
-// mistralRole maps OpenAI's "developer" role onto Mistral's "system" role.
-// Mistral rejects any other role with HTTP 422.
-func mistralRole(role string) string {
-	if role == "developer" {
-		return "system"
-	}
-	return role
-}
-
-func requestOpenAI2Mistral(c *gin.Context, request *dto.GeneralOpenAIRequest) any {
-	messages := make([]dto.Message, 0, len(request.Messages))
-	idMap := make(map[string]string)
-	for _, message := range request.Messages {
-		// 1. tool_calls.id
-		toolCalls := message.ParseToolCalls()
-		if toolCalls != nil {
-			for i := range toolCalls {
-				if !mistralToolCallIdRegexp.MatchString(toolCalls[i].ID) {
-					if newId, ok := idMap[toolCalls[i].ID]; ok {
-						toolCalls[i].ID = newId
-					} else {
-						newId, err := common.GenerateRandomCharsKey(9)
-						if err == nil {
-							idMap[toolCalls[i].ID] = newId
-							toolCalls[i].ID = newId
-						}
-					}
-				}
-			}
-			message.SetToolCalls(toolCalls)
-		}
-
-		// 2. tool_call_id
-		if message.ToolCallId != "" {
-			if newId, ok := idMap[message.ToolCallId]; ok {
-				message.ToolCallId = newId
-			} else {
-				if !mistralToolCallIdRegexp.MatchString(message.ToolCallId) {
-					newId, err := common.GenerateRandomCharsKey(9)
-					if err == nil {
-						idMap[message.ToolCallId] = newId
-						message.ToolCallId = newId
-					}
-				}
-			}
-		}
-
-		// Mistral accepts only a string as a tool result, so a tool message keeps
-		// its content as text. The empty result of a tool call is the common
-		// case: turned into content parts it becomes [{"type":"text"}] and the
-		// upstream rejects it with 422.
-		if message.Role == "tool" {
-			messages = append(messages, dto.Message{
-				Role:       "tool",
-				Content:    message.StringContent(),
-				ToolCallId: message.ToolCallId,
-			})
-			continue
-		}
-
-		mediaMessages := message.ParseContent()
-		if message.Role == "assistant" && message.ToolCalls != nil && message.StringContent() == "" {
-			mediaMessages = []dto.MediaContent{}
-		}
-		for j, mediaMessage := range mediaMessages {
-			if mediaMessage.Type == dto.ContentTypeImageURL {
-				imageUrl := mediaMessage.GetImageMedia()
-				mediaMessage.ImageUrl = imageUrl.Url
-				mediaMessages[j] = mediaMessage
-			}
-		}
-		message.SetMediaContent(mediaMessages)
-		messages = append(messages, dto.Message{
-			Role:       mistralRole(message.Role),
-			Content:    message.Content,
-			ToolCalls:  message.ToolCalls,
-			ToolCallId: message.ToolCallId,
-		})
-	}
-	out := &dto.GeneralOpenAIRequest{
-		Model:       request.Model,
-		Stream:      request.Stream,
-		Messages:    messages,
-		Temperature: request.Temperature,
-		TopP:        request.TopP,
-		Tools:       request.Tools,
-		ToolChoice:  request.ToolChoice,
-		// The metadata carries the allowance tag, so the rebuilt request keeps it.
-		Metadata: request.Metadata,
-	}
-	if request.MaxTokens != nil || request.MaxCompletionTokens != nil {
-		maxTokens := request.GetMaxTokens()
-		out.MaxTokens = &maxTokens
-	}
-	return carryUnmodelledFields(c, request, out)
-}
-
-// carryUnmodelledFields copies every top-level member the conversion above
-// does not rebuild, so a field the client sends but this struct does not
-// declare (a sampler extension, for example) still reaches Mistral. Both are
-// marshalled through their JSON tags, so the typed fields and the raw ones
-// share one member list and a carried member never duplicates a typed one.
-func carryUnmodelledFields(c *gin.Context, request *dto.GeneralOpenAIRequest, out *dto.GeneralOpenAIRequest) any {
-	if c == nil || c.Request == nil {
-		return out
-	}
-	storage, err := common.GetBodyStorage(c)
-	if err != nil {
-		return out
-	}
-	raw, err := storage.Bytes()
-	if err != nil {
-		return out
-	}
-	var original map[string]json.RawMessage
-	if err := common.Unmarshal(raw, &original); err != nil {
-		return out
-	}
-	converted, err := common.Marshal(request)
-	if err != nil {
-		return out
-	}
-	var modelled map[string]json.RawMessage
-	if err := common.Unmarshal(converted, &modelled); err != nil {
-		return out
-	}
-	unmodelled := make(map[string]json.RawMessage)
-	for name, value := range original {
-		if _, ok := modelled[name]; !ok {
-			unmodelled[name] = value
-		}
-	}
-	if len(unmodelled) == 0 {
-		return out
-	}
-	return &carriedRequest{GeneralOpenAIRequest: out, extra: unmodelled}
-}
-
-// carriedRequest marshals the converted request together with the members the
-// conversion did not model.
-type carriedRequest struct {
-	*dto.GeneralOpenAIRequest
-	extra map[string]json.RawMessage
-}
-
-func (r *carriedRequest) MarshalJSON() ([]byte, error) {
-	modelled, err := common.Marshal(r.GeneralOpenAIRequest)
+// requestOpenAI2Mistral forwards the body the client sent and rewrites only the
+// members Mistral rejects. The upstream prompt cache is keyed on the request
+// body, so rebuilding the request with this struct's member order and defaults
+// misses the cache on every call, and an uncached prompt is billed at ten times
+// the input rate.
+//
+// The rewritten members are: a tool_calls[].id or tool_call_id that is not nine
+// alphanumerics, a role of "developer", which becomes "system", the content of a
+// tool message, which becomes the string of its text parts, and the empty
+// content of an assistant message that carries tool calls, which becomes null.
+// Every other member keeps its value and its position in the body.
+func requestOpenAI2Mistral(c *gin.Context, request *dto.GeneralOpenAIRequest) ([]byte, error) {
+	raw, err := clientRequestBody(c, request)
 	if err != nil {
 		return nil, err
 	}
+	body, err := mistralRequestBody(raw, request)
+	if err != nil {
+		return nil, err
+	}
+	return common.Marshal(body)
+}
+
+// clientRequestBody is the body the client sent. A channel tried without a
+// stored body falls back to the body the caller parsed.
+func clientRequestBody(c *gin.Context, request *dto.GeneralOpenAIRequest) ([]byte, error) {
+	if c != nil && c.Request != nil {
+		storage, err := common.GetBodyStorage(c)
+		if err == nil {
+			return storage.Bytes()
+		}
+	}
+	if request == nil {
+		return nil, errors.New("the request body is neither stored nor parsed")
+	}
+	return common.Marshal(request)
+}
+
+// mistralRequestBody parses the client body and rewrites the members Mistral
+// rejects. Each member stays a json.RawMessage, which keeps both its value and
+// its order.
+func mistralRequestBody(raw []byte, request *dto.GeneralOpenAIRequest) (json.RawMessage, error) {
+	var body map[string]json.RawMessage
+	if err := common.Unmarshal(raw, &body); err != nil {
+		return nil, err
+	}
+	var messages []json.RawMessage
+	if err := common.Unmarshal(body["messages"], &messages); err != nil {
+		return nil, err
+	}
+	for i := range messages {
+		rewritten, err := rewriteMistralMessage(messages[i])
+		if err != nil {
+			return nil, err
+		}
+		messages[i] = rewritten
+	}
+	encoded, err := common.Marshal(messages)
+	if err != nil {
+		return nil, err
+	}
+	body["messages"] = encoded
+	// The metadata carries the allowance tag. It is absent from a body read
+	// from a channel test or a retry, so the tag the adaptor applied survives.
+	if _, ok := body["metadata"]; !ok && request != nil && len(request.Metadata) > 0 {
+		body["metadata"] = request.Metadata
+	}
+	return common.Marshal(body)
+}
+
+// rewriteMistralMessage rewrites one message member of the messages array and
+// leaves the other members where they are.
+func rewriteMistralMessage(message json.RawMessage) (json.RawMessage, error) {
 	var members map[string]json.RawMessage
-	if err := common.Unmarshal(modelled, &members); err != nil {
+	if err := common.Unmarshal(message, &members); err != nil {
 		return nil, err
 	}
-	for name, value := range r.extra {
-		if _, exists := members[name]; !exists {
-			members[name] = value
+	role := jsonString(members["role"])
+	if role == "developer" {
+		members["role"] = json.RawMessage(`"system"`)
+		role = "system"
+	}
+	switch role {
+	case "tool":
+		content, err := toolResultText(members["content"])
+		if err != nil {
+			return nil, err
 		}
+		members["content"] = content
+	case "assistant":
+		if hasToolCalls(members["tool_calls"]) && strings.TrimSpace(jsonString(members["content"])) == "" {
+			members["content"] = json.RawMessage(`null`)
+		}
+	}
+	if toolCallId, ok := members["tool_call_id"]; ok {
+		newId, err := mistralToolCallId(jsonString(toolCallId))
+		if err != nil {
+			return nil, err
+		}
+		members["tool_call_id"] = jsonStringValue(newId)
+	}
+	if toolCalls, ok := members["tool_calls"]; ok {
+		rewritten, err := rewriteToolCallIds(toolCalls)
+		if err != nil {
+			return nil, err
+		}
+		members["tool_calls"] = rewritten
 	}
 	return common.Marshal(members)
+}
+
+// rewriteToolCallIds rewrites the id of every tool call in place.
+func rewriteToolCallIds(toolCalls json.RawMessage) (json.RawMessage, error) {
+	var calls []json.RawMessage
+	if err := common.Unmarshal(toolCalls, &calls); err != nil {
+		return nil, err
+	}
+	for i := range calls {
+		var call map[string]json.RawMessage
+		if err := common.Unmarshal(calls[i], &call); err != nil {
+			return nil, err
+		}
+		id, ok := call["id"]
+		if !ok {
+			continue
+		}
+		newId, err := mistralToolCallId(jsonString(id))
+		if err != nil {
+			return nil, err
+		}
+		call["id"] = jsonStringValue(newId)
+		rewritten, err := common.Marshal(call)
+		if err != nil {
+			return nil, err
+		}
+		calls[i] = rewritten
+	}
+	return common.Marshal(calls)
+}
+
+// toolResultText is a tool message content Mistral accepts: a string. Mistral
+// rejects anything else with 422 "Input should be a valid string", and the empty
+// result of a tool call arrives as an empty array or as content parts.
+func toolResultText(content json.RawMessage) (json.RawMessage, error) {
+	var text string
+	if err := common.Unmarshal(content, &text); err == nil {
+		return content, nil
+	}
+	var parts []json.RawMessage
+	if err := common.Unmarshal(content, &parts); err != nil {
+		return nil, err
+	}
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		var member map[string]json.RawMessage
+		if err := common.Unmarshal(part, &member); err != nil {
+			continue
+		}
+		if jsonString(member["type"]) == "text" {
+			texts = append(texts, jsonString(member["text"]))
+		}
+	}
+	return jsonStringValue(strings.Join(texts, "")), nil
+}
+
+func hasToolCalls(toolCalls json.RawMessage) bool {
+	var calls []json.RawMessage
+	return common.Unmarshal(toolCalls, &calls) == nil && len(calls) > 0
+}
+
+// mistralToolCallId is the tool call id Mistral accepts: an id that is already
+// nine alphanumerics is kept, and any other id is replaced by nine characters
+// derived from it. Deriving the replacement keeps the request body identical
+// across calls, so the upstream prompt cache still matches the conversation.
+func mistralToolCallId(id string) (string, error) {
+	if mistralToolCallIdRegexp.MatchString(id) {
+		return id, nil
+	}
+	digest := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(digest[:])[:9], nil
+}
+
+func jsonStringValue(value string) json.RawMessage {
+	encoded, err := common.Marshal(value)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return encoded
+}
+
+// jsonString reads a JSON member as the text it holds. A member of another type
+// reads as the empty string.
+func jsonString(member json.RawMessage) string {
+	var text string
+	if err := common.Unmarshal(member, &text); err != nil {
+		return ""
+	}
+	return text
 }
 
 // mistralResponsesInput rewrites the "developer" role in a Responses API input

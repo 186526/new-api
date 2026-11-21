@@ -9,14 +9,7 @@ import (
 )
 
 func TestConvertOpenAIRequestAttributesRequestToVibeAllowance(t *testing.T) {
-	converted, err := (&Adaptor{}).ConvertOpenAIRequest(nil, vibeRelayInfo("mstrl_vibe_key"), &dto.GeneralOpenAIRequest{
-		Model:    "deepseek-v4.1-flash",
-		Messages: []dto.Message{{Role: "user", Content: "hello"}},
-	})
-	if err != nil {
-		t.Fatalf("ConvertOpenAIRequest() error: %v", err)
-	}
-	metadata := requestMetadata(t, converted)
+	metadata := requestMetadata(t, convertedWithSelectedKey(t, vibeRelayInfo("mstrl_vibe_key")))
 	if got := metadata["call_source"]; got != "vibe_code" {
 		t.Errorf("call_source = %v, want %q", got, "vibe_code")
 	}
@@ -63,9 +56,9 @@ func TestConvertOpenAIRequestLeavesOtherKeysUntagged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConvertOpenAIRequest() error: %v", err)
 	}
-	request := converted.(*dto.GeneralOpenAIRequest)
-	if string(request.Metadata) != `{"trace":"abc"}` {
-		t.Errorf("metadata = %s, want the client's own metadata untouched", request.Metadata)
+	members := bodyMembers(t, converted)
+	if string(members["metadata"]) != `{"trace":"abc"}` {
+		t.Errorf("metadata = %s, want the client's own metadata untouched", members["metadata"])
 	}
 }
 
@@ -85,21 +78,51 @@ func TestConvertOpenAIRequestSkipsAttributionWhenTheChannelDisablesIt(t *testing
 	if err != nil {
 		t.Fatalf("ConvertOpenAIRequest() error: %v", err)
 	}
-	request := converted.(*dto.GeneralOpenAIRequest)
-	if len(request.Metadata) != 0 {
-		t.Errorf("metadata = %s, want none for a channel that keeps the API allowance", request.Metadata)
+	members := bodyMembers(t, converted)
+	if metadata, ok := members["metadata"]; ok {
+		t.Errorf("metadata = %s, want none for a channel that keeps the API allowance", metadata)
 	}
+}
+
+// selectedKeyBody carries the body a client sends alongside its key, so the
+// attribution is asserted on the body the conversion forwards.
+const selectedKeyBody = `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}],"prompt_cache_key":"a1b2c3","seed":42}`
+
+func convertedWithSelectedKey(t *testing.T, info *relaycommon.RelayInfo) []byte {
+	t.Helper()
+	converted, err := (&Adaptor{}).ConvertOpenAIRequest(clientBodyForTest(t, selectedKeyBody), info, &dto.GeneralOpenAIRequest{
+		Model:    "deepseek-v4.1-flash",
+		Messages: []dto.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ConvertOpenAIRequest() error: %v", err)
+	}
+	body, ok := converted.([]byte)
+	if !ok {
+		t.Fatalf("converted request is %T, want the forwarded body", converted)
+	}
+	return body
+}
+
+func bodyMembers(t *testing.T, converted any) map[string]json.RawMessage {
+	t.Helper()
+	body, ok := converted.([]byte)
+	if !ok {
+		t.Fatalf("converted request is %T, want the forwarded body", converted)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		t.Fatalf("converted body %s is not a JSON object: %v", body, err)
+	}
+	return members
 }
 
 func requestMetadata(t *testing.T, converted any) map[string]any {
 	t.Helper()
-	request, ok := converted.(*dto.GeneralOpenAIRequest)
-	if !ok {
-		t.Fatalf("converted request is %T, want *dto.GeneralOpenAIRequest", converted)
-	}
+	members := bodyMembers(t, converted)
 	var metadata map[string]any
-	if err := json.Unmarshal(request.Metadata, &metadata); err != nil {
-		t.Fatalf("metadata %s is not a JSON object: %v", request.Metadata, err)
+	if err := json.Unmarshal(members["metadata"], &metadata); err != nil {
+		t.Fatalf("metadata %s is not a JSON object: %v", members["metadata"], err)
 	}
 	return metadata
 }

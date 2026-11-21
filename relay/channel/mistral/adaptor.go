@@ -62,7 +62,11 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 		request = converted
 	}
-	return requestOpenAI2Mistral(c, request), nil
+	body, err := requestOpenAI2Mistral(c, request)
+	if err != nil {
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeConvertRequestFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	return body, nil
 }
 
 func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
