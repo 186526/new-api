@@ -24,6 +24,7 @@ import ReactDOM from 'react-dom/client'
 import { installBuildMetadata } from '@/lib/build-metadata'
 import { applyFaviconToDom } from '@/lib/dom-utils'
 import '@/lib/dayjs'
+import { subscribeSignedInCacheReset } from '@/lib/auth-session'
 import { initializeFrontendCache } from '@/lib/frontend-cache'
 import { createAppQueryClient } from '@/lib/query-client'
 import { readCachedStatus, statusQueryOptions } from '@/lib/status-query'
@@ -54,6 +55,11 @@ const router = createRouter({
   defaultPreload: 'intent',
   defaultPreloadStaleTime: 0,
 })
+
+// Watch for session changes before the router resolves its first route, so a
+// reload whose refresh cookie yields a session drops the anonymous `/api/status`
+// entry this module just primed. See `subscribeSignedInCacheReset`.
+subscribeSignedInCacheReset(queryClient)
 
 // Register the router instance for type safety
 declare module '@tanstack/react-router' {

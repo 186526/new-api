@@ -164,10 +164,12 @@ func GetStatus(c *gin.Context) {
 
 	// The sidebar module gates also drive signed-in pages outside the admin
 	// console (the playground route reads the chat section), so the value goes
-	// to every signed-in session and to nobody else. Reaching those pages means
-	// the query cache was cleared for the new session, which refetches this
-	// endpoint with the bearer token. The body now varies by credential, so a
-	// shared cache must not store the signed-in variant.
+	// to every signed-in session and to nobody else. A reloading signed-in
+	// visitor reaches it because the frontend drops its query cache when the
+	// session id changes, which refetches this endpoint with the bearer token.
+	// The body varies by credential from here on, so name the request header a
+	// shared cache would have to key on.
+	c.Header("Vary", "Authorization")
 	if callerIsSignedIn {
 		c.Header("Cache-Control", "no-store, private")
 		data["SidebarModulesAdmin"] = common.OptionMap["SidebarModulesAdmin"]

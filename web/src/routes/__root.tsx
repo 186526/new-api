@@ -62,18 +62,6 @@ function RootComponent() {
 
   useEffect(
     () =>
-      useAuthStore.subscribe((state, previousState) => {
-        const sid = state.auth.session?.sid
-        const previousSID = previousState.auth.session?.sid
-        if (sid !== previousSID) {
-          queryClient.clear()
-        }
-      }),
-    [queryClient]
-  )
-
-  useEffect(
-    () =>
       subscribeAuthSessionEvents((event) => {
         const currentSID = useAuthStore.getState().auth.session?.sid
 

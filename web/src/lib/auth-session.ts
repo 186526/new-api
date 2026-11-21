@@ -204,6 +204,54 @@ export function clearAuthenticatedClientState(
   clearAuthentication(synchronizeTabs)
 }
 
+let registeredSessionSID: string | null = null
+let sessionCacheSubscription: (() => void) | null = null
+
+/**
+ * Clear the query cache whenever the dashboard session id changes.
+ *
+ * This lives at module scope, not in a React effect, because the first
+ * `/api/status` read happens before any component mounts: `main.tsx` primes
+ * `['status']` at module evaluation, and the root route resolves the refresh
+ * cookie in `beforeLoad`. A reloading signed-in visitor therefore stores the
+ * anonymous variant of `/api/status` — no `SidebarModulesAdmin` — into a cache
+ * entry that stays fresh for five minutes. A subscriber installed by a mounted
+ * component is registered after that resolution and never observes the change,
+ * so the admin sidebar gates stay fail-open for the whole session.
+ *
+ * Registered from `main.tsx` right after `createRouter`, which runs before the
+ * router resolves the first route. Replacing the RootComponent effect with a
+ * module subscription also makes the reset independent of which route renders:
+ * any route mounting a status consumer would otherwise decide whether stale
+ * credentials survive.
+ *
+ * Returns an unsubscribe function; calling it also drops the remembered session
+ * so a later re-registration re-baselines instead of clearing once.
+ */
+export function subscribeSignedInCacheReset(
+  queryClient: QueryClient
+): () => void {
+  sessionCacheSubscription?.()
+  registeredSessionSID = useAuthStore.getState().auth.session?.sid ?? null
+
+  const unsubscribe = useAuthStore.subscribe((state) => {
+    const sid = state.auth.session?.sid ?? null
+    if (sid === registeredSessionSID) return
+    registeredSessionSID = sid
+    // An empty cache only describes the credentials it was filled with, so
+    // the session change invalidates all of it. The next status read then
+    // reaches the network with whatever credential the new session sent.
+    queryClient.clear()
+  })
+
+  sessionCacheSubscription = () => {
+    unsubscribe()
+    sessionCacheSubscription = null
+    registeredSessionSID = null
+  }
+  return sessionCacheSubscription
+}
+
 function waitForRefreshRace(delay: number): Promise<void> {
   return new Promise((resolve) => globalThis.setTimeout(resolve, delay))
 }

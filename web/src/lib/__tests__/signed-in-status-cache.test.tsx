@@ -1,0 +1,239 @@
+/*
+Copyright (C) 2023-2026 QuantumNous
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+For commercial licensing, please contact support@quantumnous.com
+*/
+import { QueryClient } from '@tanstack/react-query'
+import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+
+/**
+ * Guard the boot order of a reload by a signed-in visitor.
+ *
+ * `main.tsx` primes `['status']` at module evaluation, when memory holds no
+ * credential, and the request interceptor therefore sends the anonymous
+ * variant. The root route resolves the Refresh Cookie afterwards, in
+ * `beforeLoad`. `/api/status` returns the admin sidebar config only to a
+ * signed-in caller, so unless the session change drops that anonymous entry it
+ * stays fresh for five minutes and the admin's sidebar switches read as
+ * unset — every gate then fails open.
+ */
+
+type AxiosRequest = import('axios').InternalAxiosRequestConfig
+type Backend = (config: AxiosRequest) => Promise<unknown>
+
+// The adapter seam. `@/lib/http-client` creates its own axios instance from
+// its own copy of the axios module, so the mock intercepts `create` and gives
+// every instance an adapter that delegates to `backend`. Both clients the boot
+// path uses — the refresh exchange and `api` — answer from `serve`.
+let backend: Backend = async () => {
+  throw new Error('no backend stub installed')
+}
+
+vi.mock('axios', async (orig) => {
+  const actual = await orig<typeof import('axios')>()
+  const create = actual.default.create.bind(actual.default)
+  const adapter = ((config: never) => backend(config as never)) as never
+  const withAdapter = (config?: import('axios').AxiosRequestConfig) => {
+    const instance = create(config)
+    instance.defaults.adapter = adapter
+    return instance
+  }
+  // Instances built after this point get it through `create`; assigning the
+  // module default too covers a client built through `axios(...)` directly.
+  actual.default.defaults.adapter = adapter
+  const mock = Object.assign(
+    (config: import('axios').AxiosRequestConfig) =>
+      actual.default.request({ ...config, adapter }),
+    actual.default,
+    { create: withAdapter }
+  )
+  return { ...actual, default: mock }
+})
+
+const adminSidebarConfig = JSON.stringify({
+  chat: { enabled: true, playground: false, chat: true },
+})
+
+const bundle = {
+  access_token: 'boot-access-token',
+  token_type: 'Bearer',
+  access_expires_at: 4_000_000_000,
+  user: { id: 7, username: 'reloading-admin', role: 10 },
+  session: {
+    sid: 'restored-session',
+    current: true,
+    login_method: 'password',
+    ip: '127.0.0.1',
+    user_agent: 'test',
+    created_at: 100,
+    last_active_at: 100,
+    expires_at: 4_000_000_000,
+  },
+}
+
+type AuthModules = {
+  useAuthStore: typeof import('@/stores/auth-store').useAuthStore
+  resolveAuthentication: typeof import('@/lib/auth-session').resolveAuthentication
+  isSidebarModuleEnabled: typeof import('@/lib/nav-modules').isSidebarModuleEnabled
+}
+
+let auth: AuthModules
+
+/** An axios-shaped rejection, which is what the refresh runner inspects. */
+function axiosError(config: AxiosRequest, status: number): Error {
+  return Object.assign(new Error('Request failed'), {
+    isAxiosError: true,
+    config,
+    response: { status, statusText: '', headers: {}, config, data: {} },
+  })
+}
+
+/**
+ * `/api/user/auth/refresh` stands in for the Refresh Cookie exchange the root
+ * route performs; `/api/status` answers with the variant the request's
+ * Authorization header earned.
+ */
+function stubBackend(refresh: { status: number }): void {
+  backend = async (config) => {
+    const response = { status: 200, statusText: 'OK', headers: {}, config }
+    if (config.url === '/api/user/auth/refresh') {
+      if (refresh.status >= 400) throw axiosError(config, refresh.status)
+      return { ...response, data: { success: true, data: bundle } }
+    }
+    if (config.url === '/api/status') {
+      const signedIn = Boolean(config.headers.get('Authorization'))
+      return {
+        ...response,
+        data: {
+          success: true,
+          data: {
+            system_name: signedIn ? 'signed in' : 'anonymous',
+            ...(signedIn ? { SidebarModulesAdmin: adminSidebarConfig } : {}),
+          },
+        },
+      }
+    }
+    throw new Error(`Unexpected request: ${config.url}`)
+  }
+}
+
+function createQueryClient(): QueryClient {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } })
+}
+
+/**
+ * The boot sequence `main.tsx` performs: create the app-wide client, install
+ * the session reset, then let the deferred anonymous status read land.
+ */
+async function bootApp(): Promise<QueryClient> {
+  const { subscribeSignedInCacheReset } = await import('@/lib/auth-session')
+  const { statusQueryOptions } = await import('@/lib/status-query')
+  const queryClient = createQueryClient()
+  subscribeSignedInCacheReset(queryClient)
+  // `main.tsx` fires this without awaiting it; the assertions below read the
+  // same cache entry afterwards, so awaiting it keeps the order above.
+  await queryClient.ensureQueryData(statusQueryOptions)
+  return queryClient
+}
+
+/**
+ * `main.tsx` runs for its side effects and cannot be imported here, so assert on
+ * its source that the reset is installed after the router exists and before the
+ * first route resolves. Without this, deleting the call leaves the rest of the
+ * suite green.
+ */
+test('main installs the session cache reset before the router resolves', async () => {
+  const { default: source } = await import('../../main.tsx?raw')
+
+  const routerCreated = source.indexOf('const router = createRouter(')
+  const subscribed = source.indexOf('subscribeSignedInCacheReset(queryClient)')
+  const rendered = source.indexOf('root.render(')
+
+  expect(routerCreated).toBeGreaterThan(-1)
+  expect(subscribed).toBeGreaterThan(routerCreated)
+  expect(subscribed).toBeLessThan(rendered)
+  expect(source).toContain('import { subscribeSignedInCacheReset }')
+})
+
+beforeEach(async () => {
+  window.localStorage.clear()
+  document.cookie = ''
+  backend = async () => {
+    throw new Error('no backend stub installed')
+  }
+  // A fresh module graph per test: the auth session, the reset subscription and
+  // the status query all hold module state that a reload would have recreated.
+  vi.resetModules()
+  const { useAuthStore } = await import('@/stores/auth-store')
+  const { resolveAuthentication } = await import('@/lib/auth-session')
+  const { isSidebarModuleEnabled } = await import('@/lib/nav-modules')
+  useAuthStore.getState().auth.reset('idle')
+  auth = { useAuthStore, resolveAuthentication, isSidebarModuleEnabled }
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.resetModules()
+})
+
+test('a reload with a session in the refresh cookie keeps the admin sidebar config', async () => {
+  stubBackend({ status: 200 })
+
+  // 1. Module evaluation: the anonymous status read primes the cache.
+  const queryClient = await bootApp()
+  const { STATUS_QUERY_KEY, ensureStatus } = await import('@/lib/status-query')
+  expect(
+    queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
+      ?.SidebarModulesAdmin
+  ).toBeUndefined()
+
+  // 2. The root route's beforeLoad exchanges the Refresh Cookie for a session.
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+
+  // 3. The first status reader after authentication must see the session's
+  //    variant, not the primed anonymous entry.
+  const status = await ensureStatus(queryClient)
+
+  expect(status?.SidebarModulesAdmin).toBe(adminSidebarConfig)
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(false)
+})
+
+test('without the reset subscription the primed anonymous entry survives', async () => {
+  // The negative control: this is the regression the subscription prevents.
+  stubBackend({ status: 200 })
+  const { statusQueryOptions, ensureStatus } = await import(
+    '@/lib/status-query'
+  )
+  const queryClient = createQueryClient()
+  await queryClient.ensureQueryData(statusQueryOptions)
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+
+  const status = await ensureStatus(queryClient)
+
+  expect(status?.SidebarModulesAdmin).toBeUndefined()
+  expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
+})
+
+test('an anonymous boot keeps the anonymous variant', async () => {
+  stubBackend({ status: 401 })
+  const queryClient = await bootApp()
+  const { ensureStatus } = await import('@/lib/status-query')
+
+  expect((await auth.resolveAuthentication()).kind).toBe('anonymous')
+  const status = await ensureStatus(queryClient)
+
+  expect(status?.SidebarModulesAdmin).toBeUndefined()
+})

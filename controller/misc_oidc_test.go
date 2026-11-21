@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -16,7 +15,7 @@ import (
 
 // readStatus runs GetStatus against a bare gin context, with an optional
 // dashboard bearer token, so the anonymous and signed-in bodies can be compared.
-func readStatus(t *testing.T, authorization string) map[string]any {
+func readStatus(t *testing.T, authorization string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	response := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(response)
@@ -33,7 +32,7 @@ func readStatus(t *testing.T, authorization string) map[string]any {
 	}
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
 	require.True(t, payload.Success)
-	return payload.Data
+	return response, payload.Data
 }
 
 // The admin sidebar-module config is not for anonymous readers: it is admin
@@ -43,7 +42,7 @@ func TestGetStatusKeepsSidebarModulesAdminFromAnonymousCallers(t *testing.T) {
 	common.OptionMap = map[string]string{}
 	t.Cleanup(func() { common.OptionMap = previousMap })
 
-	data := readStatus(t, "")
+	_, data := readStatus(t, "")
 
 	assert.NotContains(t, data, "SidebarModulesAdmin")
 	// HeaderNavModules stays public: the top navigation renders on the
@@ -51,24 +50,35 @@ func TestGetStatusKeepsSidebarModulesAdminFromAnonymousCallers(t *testing.T) {
 	assert.Contains(t, data, "HeaderNavModules")
 }
 
+// The body depends on the Authorization header, so a shared cache has to key on
+// it. The anonymous variant stays cacheable; only the signed-in one is private.
+func TestGetStatusVariesItsResponseOnTheAuthorizationHeader(t *testing.T) {
+	previousMap := common.OptionMap
+	common.OptionMap = map[string]string{}
+	t.Cleanup(func() { common.OptionMap = previousMap })
+
+	anonymous, _ := readStatus(t, "")
+	assert.Equal(t, "Authorization", anonymous.Header().Get("Vary"))
+	assert.Empty(t, anonymous.Header().Get("Cache-Control"))
+}
+
 // A signed-in session still reads the value, because signed-in pages outside
 // the admin console gate themselves on it (the playground route reads the chat
 // section).
 func TestGetStatusReturnsSidebarModulesAdminToSignedInCallers(t *testing.T) {
-	user, identity := setupSecurityEnrollmentTest(t)
-	require.NoError(t, model.DB.Model(user).Update("role", common.RoleAdminUser).Error)
-	require.NoError(t, model.PublishUserAuthCache(user.Id))
+	user, _ := setupSecurityEnrollmentTest(t)
 	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "status-test")
 	require.NoError(t, err)
-	require.NotEmpty(t, identity.SessionID)
 
 	previousMap := common.OptionMap
 	common.OptionMap = map[string]string{"SidebarModulesAdmin": `{"admin":{"enabled":false}}`}
 	t.Cleanup(func() { common.OptionMap = previousMap })
 
-	data := readStatus(t, "Bearer "+bundle.AccessToken)
+	response, data := readStatus(t, "Bearer "+bundle.AccessToken)
 
 	assert.Equal(t, `{"admin":{"enabled":false}}`, data["SidebarModulesAdmin"])
+	assert.Equal(t, "no-store, private", response.Header().Get("Cache-Control"))
+	assert.Equal(t, "Authorization", response.Header().Get("Vary"))
 }
 
 // A bearer token that is well-formed but not a live dashboard session must not
@@ -78,7 +88,7 @@ func TestGetStatusKeepsSidebarModulesAdminFromAStaleToken(t *testing.T) {
 	common.OptionMap = map[string]string{"SidebarModulesAdmin": `{"admin":{"enabled":false}}`}
 	t.Cleanup(func() { common.OptionMap = previousMap })
 
-	data := readStatus(t, "Bearer not-a-dashboard-token")
+	_, data := readStatus(t, "Bearer not-a-dashboard-token")
 
 	assert.NotContains(t, data, "SidebarModulesAdmin")
 }
