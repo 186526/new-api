@@ -13,23 +13,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// userCacheSchemaVersion 3 adds the signed quota ledger described on UserBase;
-// a hash written under version 2 carries none and is reloaded from the database.
-const userCacheSchemaVersion = 3
+// userCacheSchemaVersion 4 adds the signed quota ledger described on UserBase;
+// a hash written under an earlier version carries none (or an older layout) and
+// is reloaded from the database.
+const userCacheSchemaVersion = 4
 
 // UserBase is the cached user snapshot. Quota is a mirror of the signed quota
 // ledger, never an authority: a writer holding only Redis access can set the
 // mirror to anything. The ledger is
 //
 //	QuotaCredited  every quota credited into the hash since it was published
-//	QuotaSpent     every quota reserved out of it; moves on each reservation
-//	QuotaSpentBase QuotaSpent when the ledger was last signed
+//	QuotaSpent     every quota reserved out of it
 //
-// and Quota = QuotaCredited - QuotaSpent. The ledger MAC covers the identity,
-// the authentication version and the two fields that only a credit or an
-// exhausted reservation changes, so a reservation can move QuotaSpent without
-// re-signing. The script refuses a counter below QuotaSpentBase or above
-// QuotaCredited, which are both signed.
+// and Quota = QuotaCredited - QuotaSpent. Both counters are signed, together
+// with the identity, the authentication version and the expiry, so a writer can
+// move neither counter without the secret. Signing the live counter rather than
+// a baseline is what makes a rollback fail: every write signs the exact value it
+// leaves behind, so no earlier value of QuotaSpent carries a signature that
+// still matches, whether the writer rolls back part of the spend or all of it.
 type UserBase struct {
 	Id             int    `json:"id"`
 	Group          string `json:"group"`
@@ -37,7 +38,6 @@ type UserBase struct {
 	Quota          int    `json:"quota"`
 	QuotaCredited  int64  `json:"-"`
 	QuotaSpent     int64  `json:"-"`
-	QuotaSpentBase int64  `json:"-"`
 	QuotaLedgerMAC string `json:"-"`
 	QuotaLedgerExp int64  `json:"-"`
 	Status         int    `json:"status"`
@@ -50,19 +50,19 @@ type UserBase struct {
 	CacheMAC       string `json:"-"`
 }
 
-// quotaLedgerMAC signs the fields a reservation must trust. It binds the user,
-// the authentication version and the two fields a reservation may not move,
-// together with the expiry, which every write advances so a copy taken earlier
-// always presents an expiry the live hash has already passed.
+// quotaLedgerMAC signs the fields a reservation must trust: the identity, the
+// authentication version, both counters and the expiry. Every write advances
+// the expiry, so a copy taken earlier always presents one the live hash has
+// moved past.
 func (user UserBase) quotaLedgerMAC() (string, error) {
 	return authCacheMAC(getUserCacheKey(user.Id), struct {
-		Id             int
-		AuthVersion    int64
-		CacheSchema    int
-		QuotaCredited  int64
-		QuotaSpentBase int64
-		ExpiresAt      int64
-	}{user.Id, user.AuthVersion, user.CacheSchema, user.QuotaCredited, user.QuotaSpentBase, user.QuotaLedgerExp})
+		Id            int
+		AuthVersion   int64
+		CacheSchema   int
+		QuotaCredited int64
+		QuotaSpent    int64
+		ExpiresAt     int64
+	}{user.Id, user.AuthVersion, user.CacheSchema, user.QuotaCredited, user.QuotaSpent, user.QuotaLedgerExp})
 }
 
 // verifiedQuotaLedger checks the ledger this hash carries and returns the
@@ -82,7 +82,7 @@ func (user UserBase) verifiedQuotaLedger() (int, error) {
 	if !validAuthCacheMAC(mac, user.QuotaLedgerMAC, user.QuotaLedgerExp) {
 		return 0, fmt.Errorf("%w: the quota ledger signature does not match", ErrQuotaLedgerUnverified)
 	}
-	if user.QuotaSpentBase < 0 || user.QuotaSpent < user.QuotaSpentBase {
+	if user.QuotaSpent < 0 {
 		return 0, fmt.Errorf("%w: the quota ledger counters contradict each other", ErrQuotaLedgerUnverified)
 	}
 	// QuotaCredited may be negative and QuotaSpent may exceed it: both describe a
@@ -92,15 +92,14 @@ func (user UserBase) verifiedQuotaLedger() (int, error) {
 }
 
 // cacheMAC signs everything a reader trusts except Quota and the ledger: both
-// move between signatures (Quota mirrors the ledger, QuotaSpent advances on
-// every reservation), so signing them would invalidate the hash on the first
-// spend, and the following miss would reload a balance the batch accumulator
-// has not flushed yet.
+// move between metadata writes (Quota mirrors the ledger, and every ledger
+// write re-signs with its own MAC), so signing them here would invalidate the
+// hash on the first spend and the following miss would reload a balance the
+// batch accumulator has not flushed yet.
 func (user UserBase) cacheMAC() (string, error) {
 	user.Quota = 0
 	user.QuotaCredited = 0
 	user.QuotaSpent = 0
-	user.QuotaSpentBase = 0
 	user.QuotaLedgerMAC = ""
 	user.QuotaLedgerExp = 0
 	return authCacheMAC(getUserCacheKey(user.Id), struct {

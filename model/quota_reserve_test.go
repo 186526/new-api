@@ -313,13 +313,13 @@ func TestReserveRefusesAForgedSpentBaseline(t *testing.T) {
 		return reserved
 	}())
 
-	// QuotaSpentBase is signed: moving it re-opens the signed total unless the
-	// writer also re-signs, which they cannot do.
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaSpentBase", 0).Err())
+	// The spent counter is signed: moving it re-opens the signed total unless
+	// the writer also re-signs, which they cannot do.
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaSpent", 0).Err())
 
 	reserved, err := TryReserveUserQuota(user.Id, 5)
 	require.NoError(t, err)
-	assert.False(t, reserved, "a lowered baseline breaks its MAC and cannot re-open the total")
+	assert.False(t, reserved, "a rolled-back counter breaks its MAC and cannot re-open the total")
 	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the wallet records one spend, not two")
 	assert.Zero(t, common.RDB.Exists(t.Context(), getUserCacheKey(user.Id)).Val(), "the unverified hash is discarded")
 }
@@ -339,15 +339,15 @@ func TestReserveRefusesACounterRolledBackToItsBaseline(t *testing.T) {
 	reserved, err := TryReserveUserQuota(user.Id, 10)
 	require.NoError(t, err)
 	require.True(t, reserved)
-	assert.Equal(t, "10", cacheQuotaField(t, key, "QuotaSpentBase"),
-		"spending the signed total raises the baseline to the live counter")
+	assert.Equal(t, "10", cacheQuotaField(t, key, "QuotaSpent"),
+		"the signed counter is the one the wallet now holds")
 
 	// The attack: put the counter and the mirror back to the pre-spend state.
 	require.NoError(t, common.RDB.HSet(t.Context(), key,
 		"QuotaSpent", 0, "Quota", 10).Err())
 	reserved, err = TryReserveUserQuota(user.Id, 10)
 	require.NoError(t, err)
-	assert.False(t, reserved, "a counter rolled back under its baseline cannot be spent again")
+	assert.False(t, reserved, "a counter rolled back from its signed value cannot be spent again")
 	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the database records the one spend, not two")
 	assert.Zero(t, common.RDB.Exists(t.Context(), key).Val(),
 		"the contradicted ledger is discarded, so the reset cannot leave a spendable hash behind")
@@ -390,7 +390,7 @@ func TestReplayedHashThatAgedOutOfItsWindowIsRefused(t *testing.T) {
 	}).quotaLedgerMAC()
 	require.NoError(t, err)
 	require.NoError(t, common.RDB.HSet(t.Context(), key,
-		"QuotaCredited", 10, "QuotaSpent", 0, "QuotaSpentBase", 0, "Quota", 10,
+		"QuotaCredited", 10, "QuotaSpent", 0, "Quota", 10,
 		"QuotaLedgerMAC", staleMAC, "QuotaLedgerExp", expired).Err())
 
 	reserved, err = TryReserveUserQuota(user.Id, 7)
@@ -758,4 +758,117 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	cached, err = cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
 	assert.Equal(t, 100, cached.RemainQuota)
+}
+
+// Property 3 for a partial spend: the attack does not have to exhaust the
+// wallet first. Spending part of the balance and then writing the counter back
+// must not re-open the quota that was already spent.
+func TestReserveRefusesAPartialSpendRolledBack(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 10)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+
+	reserved, err := TryReserveUserQuota(user.Id, 4)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	assert.Equal(t, 6, getUserQuotaFromDB(t, user.Id))
+	spent := cacheQuotaField(t, key, "QuotaSpent")
+
+	// The attack: put the unsigned counter and the mirror back to the pre-spend
+	// state, touching nothing that is signed.
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"QuotaSpent", 0, "Quota", 10).Err())
+
+	reserved, err = TryReserveUserQuota(user.Id, 10)
+	require.NoError(t, err)
+	assert.False(t, reserved, "a counter rolled back from %s cannot authorize a second spend", spent)
+	assert.Equal(t, 6, getUserQuotaFromDB(t, user.Id), "the database records the one spend, not two")
+}
+
+// An exhausting reservation that cannot be persisted has to be refunded in the
+// cache too, on both ledgers. The reservation took the whole balance, so the
+// compensation is the only thing that brings the cached balance back to the
+// database's.
+func TestExhaustingReserveCompensatesCacheWhenPersistenceFails(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 10)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, DB.Delete(&user).Error)
+
+	reserved, err := TryReserveUserQuota(user.Id, 10)
+	assert.False(t, reserved)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	cached, cacheErr := cacheGetUserBase(user.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, 10, cached.Quota, "the refunded reservation leaves the cached balance at the database's")
+
+	token := createReserveTestToken(t, 12)
+	_, err = GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, DB.Delete(&token).Error)
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 12, false)
+	assert.False(t, reserved)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	cachedToken, cacheErr := cacheGetTokenByKey(token.Key)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, 12, cachedToken.RemainQuota, "the refunded token reservation leaves the cached remainder at the database's")
+	assert.Zero(t, cachedToken.UsedQuota)
+}
+
+// A credit built against a snapshot the hash has moved past must not publish a
+// signature that describes another counter. Between the read that verified the
+// ledger and the script that writes it, a committed delta can land; the script
+// has to notice and refuse rather than sign a state it never saw.
+func TestCreditBuiltOnAStaleSnapshotDoesNotPublishAnotherBaseline(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 10)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+
+	ledger, result, err := verifiedUserQuotaLedger(user.Id)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+
+	// The arguments the credit path builds right after that verification.
+	const credit = int64(5)
+	expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
+	nextMAC, err := (UserBase{
+		Id: user.Id, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
+		QuotaCredited: ledger.credited + credit, QuotaSpent: ledger.spent,
+		QuotaLedgerExp: expiresAt,
+	}).quotaLedgerMAC()
+	require.NoError(t, err)
+
+	// A committed spend lands in that gap, through the real path, so the hash
+	// stays internally consistent and only the snapshot the credit was built on
+	// is out of date.
+	deltaResult, deltaErr := cacheApplyUserQuotaDelta(user.Id, -7)
+	require.NoError(t, deltaErr)
+	require.Equal(t, cacheQuotaOK, deltaResult)
+	assert.Equal(t, "7", cacheQuotaField(t, key, "QuotaSpent"))
+
+	raw, evalErr := evalLedgerScript(userQuotaCreditScript, key, userQuotaLedgerArgs{
+		Amount: ledgerDecimal(credit), Id: user.Id, Schema: ledger.schema, AuthVersion: ledger.authVersion,
+		Credited: ledgerDecimal(ledger.credited), Spent: ledgerDecimal(ledger.spent),
+		NextCredited: ledgerDecimal(ledger.credited + credit), NextSpent: ledgerDecimal(ledger.spent),
+		NextExpiry: ledgerDecimal(expiresAt), MAC: ledger.mac, NextMAC: nextMAC,
+	})
+	require.NoError(t, evalErr)
+	assert.NotEqual(t, 1, raw, "a credit that lost the race must not be applied")
+
+	_, result, err = verifiedUserQuotaLedger(user.Id)
+	assert.Equal(t, cacheQuotaOK, result,
+		"whatever the credit wrote must still verify: %v", err)
 }

@@ -45,24 +45,26 @@ var errQuotaLedgerContended = errors.New("cached quota ledger contention")
 // separate ledger with its own signature:
 //
 //	QuotaCredited  every quota credited into the hash since it was published
-//	QuotaSpentBase QuotaSpent at the moment the ledger was last signed
-//	QuotaSpent     every quota reserved out of it; unsigned, monotone
+//	QuotaSpent     every quota reserved out of it
 //
 // The spendable balance is QuotaCredited - QuotaSpent, and Quota only mirrors
-// it. The ledger MAC binds the user, the authentication version, the schema and
-// the two fields a reservation may not move, together with its own expiry. The
-// reserve script enforces the invariants an unsigned counter owes:
+// it. The ledger MAC binds the user, the authentication version, the schema,
+// both counters and the expiry.
 //
-//	spent >= spentBase         a reservation can neither be undone nor roll a
-//	                           counter back past its signature
-//	spent + amount <= credited the signed total covers the reservation
+// Signing the live counter, rather than a baseline it may sit above, is what
+// makes a rollback impossible: every write signs the exact value it leaves
+// behind, so no earlier value of QuotaSpent carries a signature that still
+// matches. A writer holding only Redis access may move the counter to any
+// number, and every number but the current one fails the MAC. That is why there
+// is no separate baseline field: a baseline that only advanced when the balance
+// was exhausted let a partial spend be rolled back to it, and it also refused
+// the refund of an exhausting reservation that failed to persist, because the
+// reservation itself had just moved the baseline past the refund.
 //
-// so a forged Quota is never read, and a forged QuotaCredited or QuotaSpentBase
-// fails the MAC. Those rules alone would let a writer reset QuotaSpent to its
-// signed baseline and spend again, so a reservation may raise the baseline but
-// never lower it: when the balance is exhausted the baseline moves to the live
-// counter and the ledger is re-signed. Re-signing stays off the hot path
-// because it happens only on that last reservation.
+// Each write also passes the counter value it signed, so the script re-signs
+// only a state it actually verified: a committed delta that lands between the
+// read and the write makes the script refuse and the caller retry, instead of
+// publishing a signature that describes another hash.
 //
 // The counters are decimal strings and the scripts never do arithmetic on
 // them: Lua numbers are doubles, and a sum near the wallet ceiling (2^53-1)
@@ -71,8 +73,10 @@ var errQuotaLedgerContended = errors.New("cached quota ledger contention")
 // HINCRBY, which adds inside Redis's own int64 domain. A cap is enforced by
 // applying the increment, comparing the exact counter Redis reported, and
 // rolling it back when it does not fit, so the comparison and the write still
-// happen in one script. The mirror is then rewritten from the exact counters
-// instead of incremented, so it can never keep an offset a forger gave it.
+// happen in one script. A write also refuses to sign a counter other than the
+// one Go signed, which catches an int64 overflow on the Go side as well. The
+// mirror is then rewritten from the exact counters instead of incremented, so
+// it can never keep an offset a forger gave it.
 const quotaLedgerLuaHelpers = `
 local function magnitude(raw)
   if raw == nil then return nil end
@@ -117,25 +121,22 @@ if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= args.id
 end
 local credited = redis.call('HGET', KEYS[1], 'QuotaCredited')
 local spent = redis.call('HGET', KEYS[1], 'QuotaSpent')
-local spentBase = redis.call('HGET', KEYS[1], 'QuotaSpentBase')
 local expiry = redis.call('HGET', KEYS[1], 'QuotaLedgerExp')
 local creditedSign, creditedDigits = magnitude(credited)
 local spentSign, spentDigits = magnitude(spent)
-local baseSign, baseDigits = magnitude(spentBase)
 local expirySign, expiryDigits = magnitude(expiry)
 -- credited may be negative and spent may exceed it: a wallet holds a debt, and
--- the difference is the balance either way. Neither counter may be negative,
--- and spent may not sit below the value the ledger was signed with, so no write
--- can roll the counter back and spend the same quota twice.
-if creditedSign == nil or spentSign == nil or baseSign == nil or expirySign == nil
-  or spentSign == '-' or baseSign == '-' or expirySign == '-' then
+-- the difference is the balance either way. Neither counter may be negative, so
+-- no write can hand out quota by un-spending below zero.
+if creditedSign == nil or spentSign == nil or expirySign == nil
+  or spentSign == '-' or expirySign == '-' then
   return -2
 end
-if compareMagnitude(spentDigits, baseDigits) < 0 then
-  return -2
-end
+-- The caller verified this exact state and signed the counter it is about to
+-- write. Both halves are compared, so a spend that landed since the read is a
+-- refusal rather than a write that signs a state nobody checked.
 if (redis.call('HGET', KEYS[1], 'QuotaLedgerMAC') or '') ~= args.mac
-  or credited ~= args.credited or spentBase ~= args.spentBase then
+  or credited ~= args.credited or spent ~= args.spent then
   return -1
 end
 local amountDigits = positiveMagnitude(args.amount)
@@ -147,6 +148,19 @@ local function advancesExpiry()
 end
 local function rebalance()
   mirrorFrom(KEYS[1], 'Quota', 'QuotaCredited', 'QuotaSpent')
+end
+-- sign publishes the state the caller signed: the counter has to be exactly the
+-- value the caller's next MAC covers, or the write is undone and reported
+-- stale. An int64 overflow on the Go side shows up here as a mismatch. undo is
+-- the HINCRBY amount that reverses the write just made.
+local function sign(field, undo)
+  if redis.call('HGET', KEYS[1], field) ~= args.nextSpent then
+    redis.call('HINCRBY', KEYS[1], field, undo)
+    return false
+  end
+  rebalance()
+  redis.call('HSET', KEYS[1], 'QuotaLedgerMAC', args.nextMAC, 'QuotaLedgerExp', args.nextExpiry)
+  return true
 end
 `
 
@@ -164,42 +178,49 @@ if afterSign == nil or afterSign == '-' or creditedSign == '-'
   rollback(KEYS[1], 'QuotaSpent', amountDigits)
   return 0
 end
-rebalance()
-redis.call('HSET', KEYS[1], 'QuotaLedgerExp', args.nextExpiry)
-if after == credited then
-  redis.call('HSET', KEYS[1], 'QuotaSpentBase', after, 'QuotaLedgerMAC', args.exhaustedMAC)
-else
-  redis.call('HSET', KEYS[1], 'QuotaLedgerMAC', args.nextMAC)
+if not sign('QuotaSpent', '-' .. amountDigits) then
+  return -1
 end
 return 1`
 
-// userQuotaDeltaScript applies a committed spend to the unsigned counter. It
-// does not bound the spend by the signed total: the database already committed
-// this delta, and refusing it would leave the cached balance above the
-// committed one. A debit balance is representable, so spent may pass credited.
+// userQuotaDeltaScript applies a committed spend to the counter. It does not
+// bound the spend by the signed total: the database already committed this
+// delta, and refusing it would leave the cached balance above the committed
+// one. A debit balance is representable, so spent may pass credited.
 const userQuotaDeltaScript = userQuotaLedgerScriptHeader + `
+if not advancesExpiry() then
+  return -1
+end
 redis.call('HINCRBY', KEYS[1], 'QuotaSpent', amountDigits)
-rebalance()
+if not sign('QuotaSpent', '-' .. amountDigits) then
+  return -1
+end
 return 1`
 
 // userQuotaReleaseScript returns a reservation this process took but could not
-// persist. It is not a credit: it only moves the unsigned counter back, and
-// never past the value the ledger was signed with.
+// persist. It moves the counter back and re-signs; it is not a credit, so the
+// signed total is untouched and a release can never widen what the wallet may
+// spend.
 const userQuotaReleaseScript = userQuotaLedgerScriptHeader + `
+if not advancesExpiry() then
+  return -1
+end
 redis.call('HINCRBY', KEYS[1], 'QuotaSpent', '-' .. amountDigits)
 local after = redis.call('HGET', KEYS[1], 'QuotaSpent')
-local afterSign, afterDigits = magnitude(after)
-if afterSign == nil or afterSign == '-' or compareMagnitude(afterDigits, baseDigits) < 0 then
+local afterSign, _ = magnitude(after)
+if afterSign == nil or afterSign == '-' then
   unsubtract(KEYS[1], 'QuotaSpent', amountDigits)
   return -3
 end
-rebalance()
+if not sign('QuotaSpent', amountDigits) then
+  return -1
+end
 return 1`
 
-// userQuotaCreditScript credits quota and re-signs the ledger, re-basing the
-// unsigned counter at the same moment. It applies only while the hash still
-// carries the signature the caller verified, so a concurrent reservation makes
-// the attempt stale and the caller retries instead of losing a spend.
+// userQuotaCreditScript credits quota and re-signs the ledger. It applies only
+// while the hash still carries the counter the caller verified, so a concurrent
+// spend makes the attempt stale and the caller retries instead of publishing a
+// signature that describes another ledger.
 const userQuotaCreditScript = userQuotaLedgerScriptHeader + `
 if not advancesExpiry() then
   return -1
@@ -212,8 +233,7 @@ if redis.call('HGET', KEYS[1], 'QuotaCredited') ~= args.nextCredited then
   return -1
 end
 rebalance()
-redis.call('HSET', KEYS[1], 'QuotaSpentBase', spent,
-  'QuotaLedgerMAC', args.nextMAC, 'QuotaLedgerExp', args.nextExpiry)
+redis.call('HSET', KEYS[1], 'QuotaLedgerMAC', args.nextMAC, 'QuotaLedgerExp', args.nextExpiry)
 return 1`
 
 // userQuotaLedgerSeedScript publishes a ledger for a hash that has none. Only a
@@ -237,14 +257,14 @@ end
 -- credited is the database balance, which a wallet in debt carries as a
 -- negative total. spent starts at zero and only ever grows, so the balance
 -- credited - spent reproduces the snapshot and stays correct afterwards.
-redis.call('HSET', KEYS[1], 'QuotaCredited', args.credited, 'QuotaSpent', 0, 'QuotaSpentBase', 0,
+redis.call('HSET', KEYS[1], 'QuotaCredited', args.credited, 'QuotaSpent', 0,
   'QuotaLedgerExp', args.nextExpiry, 'QuotaLedgerMAC', args.nextMAC, 'Quota', args.credited)
 return 1`
 
-// The token ledger mirrors the user one on the token hash: QuotaGranted and
-// QuotaUsedBase are signed, UsedQuota is the unsigned monotone counter, and
-// RemainQuota only mirrors QuotaGranted - UsedQuota. The token key is part of
-// the MAC, so a signature cannot be replayed onto another token.
+// The token ledger mirrors the user one on the token hash: QuotaGranted and the
+// live UsedQuota are signed, and RemainQuota only mirrors
+// QuotaGranted - UsedQuota. The token key is part of the MAC, so a signature
+// cannot be replayed onto another token.
 const tokenQuotaLedgerScriptHeader = quotaLedgerLuaHelpers + `
 local args = cjson.decode(ARGV[1])
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= args.id then
@@ -252,23 +272,20 @@ if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= args.id then
 end
 local granted = redis.call('HGET', KEYS[1], 'QuotaGranted')
 local used = redis.call('HGET', KEYS[1], 'UsedQuota')
-local usedBase = redis.call('HGET', KEYS[1], 'QuotaUsedBase')
 local expiry = redis.call('HGET', KEYS[1], 'QuotaLedgerExp')
 local grantedSign, grantedDigits = magnitude(granted)
 local usedSign, usedDigits = magnitude(used)
-local baseSign, baseDigits = magnitude(usedBase)
 local expirySign, expiryDigits = magnitude(expiry)
 -- used may exceed granted: the remainder is then a debt, as on the user side,
 -- so only the counters themselves have to stay non-negative.
-if grantedSign == nil or usedSign == nil or baseSign == nil or expirySign == nil
-  or grantedSign == '-' or usedSign == '-' or baseSign == '-' or expirySign == '-' then
+if grantedSign == nil or usedSign == nil or expirySign == nil
+  or grantedSign == '-' or usedSign == '-' or expirySign == '-' then
   return -2
 end
-if compareMagnitude(usedDigits, baseDigits) < 0 then
-  return -2
-end
+-- As on the user side, the caller signed the counter it is about to write, and
+-- a spend that landed since the read is a refusal.
 if (redis.call('HGET', KEYS[1], 'QuotaLedgerMAC') or '') ~= args.mac
-  or granted ~= args.granted or usedBase ~= args.usedBase then
+  or granted ~= args.granted or used ~= args.used then
   return -1
 end
 local amountDigits = positiveMagnitude(args.amount)
@@ -280,6 +297,18 @@ local function advancesExpiry()
 end
 local function rebalance()
   mirrorFrom(KEYS[1], 'RemainQuota', 'QuotaGranted', 'UsedQuota')
+end
+-- sign publishes the counter the caller signed; a mismatch is undone and
+-- reported stale, as on the user side.
+local function sign(field, amount)
+  if redis.call('HGET', KEYS[1], field) ~= args.nextUsed then
+    unsubtract(KEYS[1], field, amount)
+    return false
+  end
+  rebalance()
+  redis.call('HSET', KEYS[1], 'AccessedTime', args.accessedTime,
+    'QuotaLedgerMAC', args.nextMAC, 'QuotaLedgerExp', args.nextExpiry)
+  return true
 end
 `
 
@@ -294,37 +323,41 @@ if afterSign == nil or afterSign == '-' or compareMagnitude(afterDigits, granted
   rollback(KEYS[1], 'UsedQuota', amountDigits)
   return 0
 end
-rebalance()
-redis.call('HSET', KEYS[1], 'AccessedTime', args.accessedTime, 'QuotaLedgerExp', args.nextExpiry)
-if after == granted then
-  redis.call('HSET', KEYS[1], 'QuotaUsedBase', after, 'QuotaLedgerMAC', args.exhaustedMAC)
-else
-  redis.call('HSET', KEYS[1], 'QuotaLedgerMAC', args.nextMAC)
+if not sign('UsedQuota', '-' .. amountDigits) then
+  return -1
 end
 return 1`
 
-// tokenQuotaDeltaScript applies a committed spend to the unsigned counter. As
-// on the user side it does not bound the spend by the signed total: the delta
-// is already committed, and a debit remainder is representable.
+// tokenQuotaDeltaScript applies a committed spend to the counter. As on the
+// user side it does not bound the spend by the signed total: the delta is
+// already committed, and a debit remainder is representable.
 const tokenQuotaDeltaScript = tokenQuotaLedgerScriptHeader + `
+if not advancesExpiry() then
+  return -1
+end
 redis.call('HINCRBY', KEYS[1], 'UsedQuota', amountDigits)
-rebalance()
-redis.call('HSET', KEYS[1], 'AccessedTime', args.accessedTime)
+if not sign('UsedQuota', '-' .. amountDigits) then
+  return -1
+end
 return 1`
 
 // tokenQuotaReleaseScript returns quota the commit recorded as unspent. The
 // token hash has no credit path: IncreaseTokenQuota moves quota from the used
 // counter back to the remainder, so the granted total never changes.
 const tokenQuotaReleaseScript = tokenQuotaLedgerScriptHeader + `
+if not advancesExpiry() then
+  return -1
+end
 redis.call('HINCRBY', KEYS[1], 'UsedQuota', '-' .. amountDigits)
 local after = redis.call('HGET', KEYS[1], 'UsedQuota')
-local afterSign, afterDigits = magnitude(after)
-if afterSign == nil or afterSign == '-' or compareMagnitude(afterDigits, baseDigits) < 0 then
+local afterSign, _ = magnitude(after)
+if afterSign == nil or afterSign == '-' then
   unsubtract(KEYS[1], 'UsedQuota', amountDigits)
   return -3
 end
-rebalance()
-redis.call('HSET', KEYS[1], 'AccessedTime', args.accessedTime)
+if not sign('UsedQuota', amountDigits) then
+  return -1
+end
 return 1`
 
 // quotaLedgerRetryAttempts bounds how often a concurrent credit may make a
@@ -359,14 +392,15 @@ func nextLedgerExpiry(previous int64, ttlSeconds int) int64 {
 // tokenQuotaLedgerMAC signs the fields a token reservation must trust. The
 // token cache key is part of the MAC, so a signature cannot be replayed onto
 // another token, and the expiry is signed so a copy taken earlier presents one
-// the live hash has already passed.
-func tokenQuotaLedgerMAC(key string, id int, granted, usedBase, expiresAt int64) (string, error) {
+// the live hash has already passed. The live used counter is signed, not a
+// baseline, so no earlier value of it verifies.
+func tokenQuotaLedgerMAC(key string, id int, granted, used, expiresAt int64) (string, error) {
 	return authCacheMAC(getTokenCacheKey(key), struct {
-		Id            int
-		QuotaGranted  int64
-		QuotaUsedBase int64
-		ExpiresAt     int64
-	}{id, granted, usedBase, expiresAt})
+		Id           int
+		QuotaGranted int64
+		UsedQuota    int64
+		ExpiresAt    int64
+	}{id, granted, used, expiresAt})
 }
 
 // userQuotaLedgerArgs is the state a user ledger write carries into its script.
@@ -379,12 +413,12 @@ type userQuotaLedgerArgs struct {
 	Schema       int    `json:"schema"`
 	AuthVersion  int64  `json:"authVersion"`
 	Credited     string `json:"credited"`
-	SpentBase    string `json:"spentBase"`
+	Spent        string `json:"spent"`
 	NextCredited string `json:"nextCredited"`
+	NextSpent    string `json:"nextSpent"`
 	NextExpiry   string `json:"nextExpiry"`
 	MAC          string `json:"mac"`
 	NextMAC      string `json:"nextMAC"`
-	ExhaustedMAC string `json:"exhaustedMAC"`
 }
 
 // tokenQuotaLedgerArgs is the state a token ledger write carries into its
@@ -393,12 +427,12 @@ type tokenQuotaLedgerArgs struct {
 	Amount       string `json:"amount"`
 	Id           int    `json:"id"`
 	Granted      string `json:"granted"`
-	UsedBase     string `json:"usedBase"`
+	Used         string `json:"used"`
+	NextUsed     string `json:"nextUsed"`
 	NextExpiry   string `json:"nextExpiry"`
 	AccessedTime int64  `json:"accessedTime"`
 	MAC          string `json:"mac"`
 	NextMAC      string `json:"nextMAC"`
-	ExhaustedMAC string `json:"exhaustedMAC"`
 }
 
 func evalLedgerScript(script string, key string, args any) (int, error) {
@@ -423,10 +457,10 @@ type userQuotaLedger struct {
 	schema      int
 	credited    int64
 	spent       int64
-	spentBase   int64
 	// expiresAt and mac are the signed expiry and signature the hash carried as
-	// read. A write passes the mac back so the script proves the caller
-	// verified this exact ledger, and signs the next expiry strictly later.
+	// read. A write passes the mac and both counters back so the script proves
+	// the caller verified this exact ledger, and signs the next expiry strictly
+	// later.
 	expiresAt int64
 	mac       string
 }
@@ -435,7 +469,6 @@ type tokenQuotaLedger struct {
 	id        int
 	granted   int64
 	used      int64
-	usedBase  int64
 	expiresAt int64
 	mac       string
 }
@@ -527,17 +560,13 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	spentBase, err := requireLedgerInt(fields, "QuotaSpentBase")
-	if err != nil {
-		return nil, cacheQuotaUnverified, err
-	}
 	expiresAt, err := requireLedgerInt(fields, "QuotaLedgerExp")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
 	signed := UserBase{
 		Id: userID, AuthVersion: authVersion, CacheSchema: int(schema),
-		QuotaCredited: credited, QuotaSpent: spent, QuotaSpentBase: spentBase,
+		QuotaCredited: credited, QuotaSpent: spent,
 		QuotaLedgerMAC: fields["QuotaLedgerMAC"], QuotaLedgerExp: expiresAt,
 	}
 	if _, err := signed.verifiedQuotaLedger(); err != nil {
@@ -545,7 +574,7 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 	}
 	return &userQuotaLedger{
 		id: userID, authVersion: authVersion, schema: int(schema),
-		credited: credited, spent: spent, spentBase: spentBase,
+		credited: credited, spent: spent,
 		expiresAt: expiresAt, mac: signed.QuotaLedgerMAC,
 	}, cacheQuotaOK, nil
 }
@@ -576,26 +605,22 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	usedBase, err := requireLedgerInt(fields, "QuotaUsedBase")
-	if err != nil {
-		return nil, cacheQuotaUnverified, err
-	}
 	expiresAt, err := requireLedgerInt(fields, "QuotaLedgerExp")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	expectedMAC, err := tokenQuotaLedgerMAC(key, id, granted, usedBase, expiresAt)
+	expectedMAC, err := tokenQuotaLedgerMAC(key, id, granted, used, expiresAt)
 	if err != nil {
 		return nil, cacheQuotaMiss, err
 	}
 	if !validAuthCacheMAC(expectedMAC, fields["QuotaLedgerMAC"], expiresAt) {
 		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the token ledger signature does not match", ErrQuotaLedgerUnverified)
 	}
-	if granted < 0 || usedBase < 0 || used < usedBase {
+	if granted < 0 || used < 0 {
 		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the token ledger counters contradict each other", ErrQuotaLedgerUnverified)
 	}
 	return &tokenQuotaLedger{
-		id: id, granted: granted, used: used, usedBase: usedBase,
+		id: id, granted: granted, used: used,
 		expiresAt: expiresAt, mac: fields["QuotaLedgerMAC"],
 	}, cacheQuotaOK, nil
 }
@@ -610,16 +635,19 @@ func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error
 			return result, err
 		}
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
-		nextMAC, exhaustedMAC, err := userLedgerMACs(userID, ledger.authVersion, ledger.schema,
-			ledger.credited, ledger.spentBase, ledger.credited, expiresAt)
+		nextSpent := ledger.spent + amount
+		nextMAC, err := (UserBase{
+			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
+			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+		}).quotaLedgerMAC()
 		if err != nil {
 			return cacheQuotaMiss, err
 		}
 		raw, evalErr := evalLedgerScript(userQuotaReserveScript, getUserCacheKey(userID), userQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: userID, Schema: ledger.schema, AuthVersion: ledger.authVersion,
-			Credited: ledgerDecimal(ledger.credited), SpentBase: ledgerDecimal(ledger.spentBase),
-			NextExpiry: ledgerDecimal(expiresAt),
-			MAC:        ledger.mac, NextMAC: nextMAC, ExhaustedMAC: exhaustedMAC,
+			Credited: ledgerDecimal(ledger.credited), Spent: ledgerDecimal(ledger.spent),
+			NextSpent: ledgerDecimal(nextSpent), NextExpiry: ledgerDecimal(expiresAt),
+			MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -636,26 +664,6 @@ func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
-// userLedgerMACs signs the current authority and the exhausted authority a
-// reservation may switch to in the same write.
-func userLedgerMACs(userID int, authVersion int64, schema int,
-	credited, spentBase, exhaustedBase, expiresAt int64) (nextMAC, exhaustedMAC string, err error) {
-	signed := UserBase{
-		Id: userID, AuthVersion: authVersion, CacheSchema: schema,
-		QuotaCredited: credited, QuotaSpentBase: spentBase, QuotaLedgerExp: expiresAt,
-	}
-	nextMAC, err = signed.quotaLedgerMAC()
-	if err != nil {
-		return "", "", err
-	}
-	signed.QuotaSpentBase = exhaustedBase
-	exhaustedMAC, err = signed.quotaLedgerMAC()
-	if err != nil {
-		return "", "", err
-	}
-	return nextMAC, exhaustedMAC, nil
-}
-
 func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResult, error) {
 	for range quotaLedgerRetryAttempts {
 		ledger, result, err := verifiedTokenQuotaLedger(id, key)
@@ -663,19 +671,16 @@ func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResu
 			return result, err
 		}
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, tokenCacheTTLSeconds())
-		nextMAC, err := tokenQuotaLedgerMAC(key, id, ledger.granted, ledger.usedBase, expiresAt)
-		if err != nil {
-			return cacheQuotaMiss, err
-		}
-		exhaustedMAC, err := tokenQuotaLedgerMAC(key, id, ledger.granted, ledger.granted, expiresAt)
+		nextUsed := ledger.used + amount
+		nextMAC, err := tokenQuotaLedgerMAC(key, id, ledger.granted, nextUsed, expiresAt)
 		if err != nil {
 			return cacheQuotaMiss, err
 		}
 		raw, evalErr := evalLedgerScript(tokenQuotaReserveScript, getTokenCacheKey(key), tokenQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: id,
-			Granted: ledgerDecimal(ledger.granted), UsedBase: ledgerDecimal(ledger.usedBase),
-			NextExpiry: ledgerDecimal(expiresAt), AccessedTime: common.GetTimestamp(),
-			MAC: ledger.mac, NextMAC: nextMAC, ExhaustedMAC: exhaustedMAC,
+			Granted: ledgerDecimal(ledger.granted), Used: ledgerDecimal(ledger.used),
+			NextUsed: ledgerDecimal(nextUsed), NextExpiry: ledgerDecimal(expiresAt),
+			AccessedTime: common.GetTimestamp(), MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -711,10 +716,20 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 		if ledger == nil {
 			return result, err
 		}
+		nextSpent := ledger.spent + amount
+		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
+		nextMAC, err := (UserBase{
+			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
+			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+		}).quotaLedgerMAC()
+		if err != nil {
+			return cacheQuotaMiss, err
+		}
 		raw, evalErr := evalLedgerScript(userQuotaDeltaScript, getUserCacheKey(userID), userQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: userID, Schema: ledger.schema, AuthVersion: ledger.authVersion,
-			Credited: ledgerDecimal(ledger.credited), SpentBase: ledgerDecimal(ledger.spentBase),
-			MAC: ledger.mac,
+			Credited: ledgerDecimal(ledger.credited), Spent: ledgerDecimal(ledger.spent),
+			NextSpent: ledgerDecimal(nextSpent), NextExpiry: ledgerDecimal(expiresAt),
+			MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -742,10 +757,20 @@ func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 		if ledger == nil {
 			return result, err
 		}
+		nextSpent := ledger.spent - amount
+		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
+		nextMAC, err := (UserBase{
+			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
+			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+		}).quotaLedgerMAC()
+		if err != nil {
+			return cacheQuotaMiss, err
+		}
 		raw, evalErr := evalLedgerScript(userQuotaReleaseScript, getUserCacheKey(userID), userQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: userID, Schema: ledger.schema, AuthVersion: ledger.authVersion,
-			Credited: ledgerDecimal(ledger.credited), SpentBase: ledgerDecimal(ledger.spentBase),
-			MAC: ledger.mac,
+			Credited: ledgerDecimal(ledger.credited), Spent: ledgerDecimal(ledger.spent),
+			NextSpent: ledgerDecimal(nextSpent), NextExpiry: ledgerDecimal(expiresAt),
+			MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -775,10 +800,17 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 		if ledger == nil {
 			return result, err
 		}
+		nextUsed := ledger.used + amount
+		expiresAt := nextLedgerExpiry(ledger.expiresAt, tokenCacheTTLSeconds())
+		nextMAC, err := tokenQuotaLedgerMAC(key, id, ledger.granted, nextUsed, expiresAt)
+		if err != nil {
+			return cacheQuotaMiss, err
+		}
 		raw, evalErr := evalLedgerScript(tokenQuotaDeltaScript, getTokenCacheKey(key), tokenQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: id,
-			Granted: ledgerDecimal(ledger.granted), UsedBase: ledgerDecimal(ledger.usedBase),
-			AccessedTime: common.GetTimestamp(), MAC: ledger.mac,
+			Granted: ledgerDecimal(ledger.granted), Used: ledgerDecimal(ledger.used),
+			NextUsed: ledgerDecimal(nextUsed), NextExpiry: ledgerDecimal(expiresAt),
+			AccessedTime: common.GetTimestamp(), MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -804,10 +836,17 @@ func cacheReleaseTokenQuota(id int, key string, amount int64) (cacheQuotaResult,
 		if ledger == nil {
 			return result, err
 		}
+		nextUsed := ledger.used - amount
+		expiresAt := nextLedgerExpiry(ledger.expiresAt, tokenCacheTTLSeconds())
+		nextMAC, err := tokenQuotaLedgerMAC(key, id, ledger.granted, nextUsed, expiresAt)
+		if err != nil {
+			return cacheQuotaMiss, err
+		}
 		raw, evalErr := evalLedgerScript(tokenQuotaReleaseScript, getTokenCacheKey(key), tokenQuotaLedgerArgs{
 			Amount: ledgerDecimal(amount), Id: id,
-			Granted: ledgerDecimal(ledger.granted), UsedBase: ledgerDecimal(ledger.usedBase),
-			AccessedTime: common.GetTimestamp(), MAC: ledger.mac,
+			Granted: ledgerDecimal(ledger.granted), Used: ledgerDecimal(ledger.used),
+			NextUsed: ledgerDecimal(nextUsed), NextExpiry: ledgerDecimal(expiresAt),
+			AccessedTime: common.GetTimestamp(), MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -839,7 +878,7 @@ func cacheCreditUserQuota(userID int, delta int64) (cacheQuotaResult, error) {
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
 		nextMAC, err := (UserBase{
 			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
-			QuotaCredited: ledger.credited + delta, QuotaSpentBase: ledger.spent,
+			QuotaCredited: ledger.credited + delta, QuotaSpent: ledger.spent,
 			QuotaLedgerExp: expiresAt,
 		}).quotaLedgerMAC()
 		if err != nil {
@@ -847,9 +886,9 @@ func cacheCreditUserQuota(userID int, delta int64) (cacheQuotaResult, error) {
 		}
 		raw, evalErr := evalLedgerScript(userQuotaCreditScript, getUserCacheKey(userID), userQuotaLedgerArgs{
 			Amount: ledgerDecimal(delta), Id: userID, Schema: ledger.schema, AuthVersion: ledger.authVersion,
-			Credited: ledgerDecimal(ledger.credited), SpentBase: ledgerDecimal(ledger.spentBase),
-			NextCredited: ledgerDecimal(ledger.credited + delta), NextExpiry: ledgerDecimal(expiresAt),
-			MAC: ledger.mac, NextMAC: nextMAC,
+			Credited: ledgerDecimal(ledger.credited), Spent: ledgerDecimal(ledger.spent),
+			NextCredited: ledgerDecimal(ledger.credited + delta), NextSpent: ledgerDecimal(ledger.spent),
+			NextExpiry: ledgerDecimal(expiresAt), MAC: ledger.mac, NextMAC: nextMAC,
 		})
 		if evalErr != nil {
 			return cacheQuotaMiss, evalErr
@@ -896,12 +935,12 @@ func seedUserQuotaLedger(userID int, quota int, authVersion int64) error {
 // snapshot total and usedBase the counter the snapshot was taken at; a hash
 // still holding a higher counter is signed at that counter, so an unflushed
 // batch spend is neither lost nor signed under a baseline it does not match.
-func tokenQuotaLedgerSeedArgs(key string, id int, granted, usedBase int64, ttlSeconds int) (string, int64, error) {
-	if granted < 0 || usedBase < 0 {
+func tokenQuotaLedgerSeedArgs(key string, id int, granted, used int64, ttlSeconds int) (string, int64, error) {
+	if granted < 0 || used < 0 {
 		return "", 0, fmt.Errorf("token %d holds a negative granted quota", id)
 	}
 	expiresAt := nextLedgerExpiry(0, ttlSeconds)
-	mac, err := tokenQuotaLedgerMAC(key, id, granted, usedBase, expiresAt)
+	mac, err := tokenQuotaLedgerMAC(key, id, granted, used, expiresAt)
 	if err != nil {
 		return "", 0, err
 	}

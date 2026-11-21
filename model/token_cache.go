@@ -106,8 +106,18 @@ func cacheInitToken(token Token) (int, error) {
 		return 0, err
 	}
 	granted := int64(token.RemainQuota) + int64(token.UsedQuota)
+	// The used counter the seed signs is the one the hash already carries when
+	// it holds an unflushed spend, because the signature has to cover the value
+	// the script leaves behind. Reading it here and re-checking it in the script
+	// keeps a seed from signing a counter it did not see.
+	seedUsed := int64(token.UsedQuota)
+	if liveUsed, liveErr := common.RDB.HGet(context.Background(), cacheKey, "UsedQuota").Result(); liveErr == nil {
+		if value, parseErr := strconv.ParseInt(liveUsed, 10, 64); parseErr == nil && value > seedUsed && value <= granted {
+			seedUsed = value
+		}
+	}
 	ledgerMAC, ledgerExp, ledgerErr := tokenQuotaLedgerSeedArgs(token.Key, token.Id,
-		granted, int64(token.UsedQuota), tokenCacheTTLSeconds())
+		granted, seedUsed, tokenCacheTTLSeconds())
 	if ledgerErr != nil {
 		ledgerMAC = ""
 	}
@@ -120,25 +130,20 @@ local seedLedger = function()
   if args.seed.mac == '' or redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
     return
   end
-  local used = args.seed.usedBase
+  -- The signature covers args.seed.used, so the seed only runs while the hash
+  -- still holds that counter. A spend that landed since Go read it leaves the
+  -- hash without a ledger instead of signing a value nobody verified.
   local liveUsed = redis.call('HGET', KEYS[1], 'UsedQuota')
-  local liveSign, liveDigits = magnitude(liveUsed)
-  local baseSign, baseDigits = magnitude(used)
-  local grantedSign, grantedDigits = magnitude(args.seed.granted)
-  if liveSign ~= nil and liveSign ~= '-' and baseSign ~= nil and grantedSign ~= nil
-    and compareMagnitude(liveDigits, baseDigits) > 0
-    and compareMagnitude(liveDigits, grantedDigits) <= 0 then
-    used = liveUsed
+  if liveUsed ~= nil and liveUsed ~= args.seed.used then
+    return
   end
-  -- QuotaUsedBase keeps the baseline the signature covers; only the unsigned
-  -- counters move to the live value, so an unflushed batch spend is neither
-  -- lost nor signed under a baseline that does not match. The remainder is
-  -- derived with HINCRBY because Lua would round a sum near 2^53.
+  -- The remainder is derived with HINCRBY because Lua would round a sum near
+  -- 2^53.
   redis.call('HSET', KEYS[1],
-    'QuotaGranted', args.seed.granted, 'QuotaUsedBase', args.seed.usedBase, 'UsedQuota', used,
+    'QuotaGranted', args.seed.granted, 'UsedQuota', args.seed.used,
     'RemainQuota', args.seed.granted,
     'QuotaLedgerMAC', args.seed.mac, 'QuotaLedgerExp', args.seed.expiresAt)
-  redis.call('HINCRBY', KEYS[1], 'RemainQuota', '-' .. used)
+  redis.call('HINCRBY', KEYS[1], 'RemainQuota', '-' .. args.seed.used)
 end
 local exists = redis.call('EXISTS', KEYS[1])
 if exists == 1 and (ARGV[21] ~= 'true' or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[22]) then
@@ -169,16 +174,16 @@ return 1`
 	ledgerArgs, err := common.Marshal(struct {
 		Seed struct {
 			Granted   string `json:"granted"`
-			UsedBase  string `json:"usedBase"`
+			UsedBase  string `json:"used"`
 			ExpiresAt string `json:"expiresAt"`
 			MAC       string `json:"mac"`
 		} `json:"seed"`
 	}{struct {
 		Granted   string `json:"granted"`
-		UsedBase  string `json:"usedBase"`
+		UsedBase  string `json:"used"`
 		ExpiresAt string `json:"expiresAt"`
 		MAC       string `json:"mac"`
-	}{ledgerDecimal(granted), ledgerDecimal(int64(token.UsedQuota)), ledgerDecimal(ledgerExp), ledgerMAC}})
+	}{ledgerDecimal(granted), ledgerDecimal(seedUsed), ledgerDecimal(ledgerExp), ledgerMAC}})
 	if err != nil {
 		return 0, err
 	}
