@@ -81,7 +81,11 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	return requestOpenAI2Dify(c, info, *request), nil
+	converted, err := requestOpenAI2Dify(c, info, *request)
+	if err != nil {
+		return nil, asUploadRejectionError(err)
+	}
+	return converted, nil
 }
 
 func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
