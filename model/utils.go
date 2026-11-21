@@ -187,6 +187,12 @@ func FlushBatchUpdates() []BatchUpdateFlushSummary {
 func addNewRecord(type_ int, id int, value int) {
 	batchUpdateLocks[type_].Lock()
 	defer batchUpdateLocks[type_].Unlock()
+	addToStoreLocked(type_, id, value)
+}
+
+// addToStoreLocked folds value into the accumulator for this id. The caller holds
+// this kind's lock.
+func addToStoreLocked(type_ int, id int, value int) {
 	old, ok := batchUpdateStores[type_][id]
 	if !ok {
 		batchUpdateStores[type_][id] = value
@@ -205,6 +211,11 @@ func addNewRecord(type_ int, id int, value int) {
 	batchUpdateStores[type_][id] = sum
 }
 
+// flushWriteAttempts bounds how many times one flush writes before it gives up and
+// leaves the remaining deltas to the next tick. A write that fails for a persistent
+// reason would otherwise keep the flush lock held while it retried the same rows.
+const flushWriteAttempts = 3
+
 // batchUpdate drains every accumulator and writes what it drained, reporting one
 // summary per accumulator that held data. Callers are serialised by
 // batchUpdateFlushLock: two concurrent callers would otherwise each drain a
@@ -222,10 +233,44 @@ func batchUpdate() []BatchUpdateFlushSummary {
 		return nil
 	}
 	common.SysLog(common.LogText("batch update started"))
-	summaries := writeBatchUpdateStores(stores)
+	accepted := make([]int, BatchUpdateTypeCount)
+	unwritten := stores
+	for attempt := 0; attempt < flushWriteAttempts && !emptyDeltaStores(unwritten); attempt++ {
+		unwritten = writeBatchUpdateStoresInto(unwritten, accepted)
+	}
+	// Whatever still failed goes back into the queue, so the next flush and the
+	// reservation check both still see it owed to its row.
+	requeueUnwrittenDeltas(unwritten)
 	clearBatchUpdateInFlight()
 	common.SysLog(common.LogText("batch update finished"))
+	return summarizeBatchUpdateStores(stores, accepted)
+}
+
+// summarizeBatchUpdateStores builds one summary per accumulator that held entries,
+// describing what the flush found and how much of it the database accepted.
+func summarizeBatchUpdateStores(stores []map[int]int, accepted []int) []BatchUpdateFlushSummary {
+	summaries := make([]BatchUpdateFlushSummary, 0, BatchUpdateTypeCount)
+	for i, store := range stores {
+		if len(store) == 0 {
+			continue
+		}
+		summary := BatchUpdateFlushSummary{Type: batchUpdateTypeNames[i], Entries: len(store), Accepted: accepted[i]}
+		for _, value := range store {
+			summary.Delta = accumulateFlushDelta(summary.Delta, value)
+		}
+		summaries = append(summaries, summary)
+	}
 	return summaries
+}
+
+// emptyDeltaStores reports whether every per-accumulator map has no entries.
+func emptyDeltaStores(stores []map[int]int) bool {
+	for _, store := range stores {
+		if len(store) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // takeBatchUpdateStores swaps the accumulators out and reports whether there was
@@ -257,11 +302,25 @@ func takeBatchUpdateStores() ([]map[int]int, bool) {
 	return stores, true
 }
 
-// writeBatchUpdateStores writes the swapped-out maps to their rows and reports one
-// summary per accumulator that held data, counting only the entries the database
-// accepted.
+// writeBatchUpdateStores writes the swapped-out maps to their rows once and reports
+// one summary per accumulator that held data. It is the single-attempt shape the
+// tests drive directly; a delta whose write failed is queued again, so a caller
+// reading the accumulators afterwards still sees it owed.
 func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
 	accepted := make([]int, BatchUpdateTypeCount)
+	requeueUnwrittenDeltas(writeBatchUpdateStoresInto(stores, accepted))
+	return summarizeBatchUpdateStores(stores, accepted)
+}
+
+// writeBatchUpdateStoresInto writes the swapped-out maps to their rows, adding each
+// accepted entry to accepted, and returns the deltas whose write failed for a reason
+// that may pass. An entry whose row no longer exists is counted as neither, because
+// no retry can apply it.
+func writeBatchUpdateStoresInto(stores []map[int]int, accepted []int) []map[int]int {
+	failed := make([]map[int]int, BatchUpdateTypeCount)
+	for i := range failed {
+		failed[i] = make(map[int]int)
+	}
 	for i, store := range stores {
 		if i == BatchUpdateTypeUserQuota || i == BatchUpdateTypeUsedQuota || i == BatchUpdateTypeRequestCount {
 			continue
@@ -277,10 +336,12 @@ func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
 				err := increaseTokenQuota(key, value)
 				if err != nil {
 					common.SysLog(common.LogText("failed to batch update token quota: %s", err.Error()))
+					recordUnwrittenDelta(failed[i], key, value, err)
 					continue
 				}
 			case BatchUpdateTypeChannelUsedQuota:
 				if err := updateChannelUsedQuota(key, value); err != nil {
+					recordUnwrittenDelta(failed[i], key, value, err)
 					continue
 				}
 			}
@@ -306,6 +367,17 @@ func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
 	for key := range userIDs {
 		err := updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
 		if err != nil {
+			// The one write carries all three deltas for this id, so a failure holds
+			// back all three rather than an arbitrary subset of them.
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// The user is gone. Requeueing would retry a write no row can accept.
+				continue
+			}
+			for _, i := range userStoreTypes {
+				if delta, ok := stores[i][key]; ok {
+					recordUnwrittenDelta(failed[i], key, delta, err)
+				}
+			}
 			continue
 		}
 		// One write covers the three user accumulators, so it accepts the entry of
@@ -317,18 +389,34 @@ func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
 		}
 	}
 
-	summaries := make([]BatchUpdateFlushSummary, 0, BatchUpdateTypeCount)
-	for i, store := range stores {
+	return failed
+}
+
+// recordUnwrittenDelta remembers a delta whose row write failed for a reason a later
+// flush might not hit. It is logged at error level rather than log level: the delta
+// stays owed to its row until a flush writes it, so a database that keeps refusing
+// the write keeps this loop alive instead of silently discarding the delta.
+func recordUnwrittenDelta(unwritten map[int]int, id int, value int, err error) {
+	common.SysError(common.LogText("batch update will retry delta for id %d after a failed write: %s", id, err.Error()))
+	unwritten[id] = value
+}
+
+// requeueUnwrittenDeltas returns the deltas whose write failed to the accumulators
+// they came from, leaving the in-flight record as the reader sees it. A delta is
+// either in the queue or in the in-flight record until a flush writes it; dropping
+// this requeue would erase it from both on a write error, and the reservation check
+// would then answer from a row that never received it.
+func requeueUnwrittenDeltas(unwritten []map[int]int) {
+	for i, store := range unwritten {
 		if len(store) == 0 {
 			continue
 		}
-		summary := BatchUpdateFlushSummary{Type: batchUpdateTypeNames[i], Entries: len(store), Accepted: accepted[i]}
-		for _, value := range store {
-			summary.Delta = accumulateFlushDelta(summary.Delta, value)
+		batchUpdateLocks[i].Lock()
+		for id, value := range store {
+			addToStoreLocked(i, id, value)
 		}
-		summaries = append(summaries, summary)
+		batchUpdateLocks[i].Unlock()
 	}
-	return summaries
 }
 
 // clearBatchUpdateInFlight forgets the rows the flush just wrote. Until this

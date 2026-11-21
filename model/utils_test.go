@@ -282,3 +282,57 @@ func TestWaitDetachedQuotaWorkReportsTheTimeout(t *testing.T) {
 	assert.Equal(t, 1, pending, "the count of goroutines still running must reach the caller")
 	assert.False(t, finished, "an expired wait reports that it did not finish")
 }
+
+// A write that fails for a reason a retry might not hit must not erase the delta
+// from every reader's view. Before the requeue, the flush cleared the in-flight
+// record whether or not the row took the delta, so the accumulator and the in-flight
+// record were both empty while the row still lagged, and the reservation check
+// answered from a balance that never received the spend.
+func TestAFlushWhoseWriteFailsKeepsTheDeltaOwed(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 1000)
+
+	// Dropping the table fails the write without making the row look deleted to the
+	// test, so this exercises the retryable branch rather than the gone-row one. The
+	// restore is idempotent because the test calls it mid-run and the cleanup calls
+	// it again.
+	var held Token
+	require.NoError(t, DB.First(&held, token.Id).Error)
+	require.NoError(t, DB.Migrator().DropTable(&Token{}))
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		require.NoError(t, DB.AutoMigrate(&Token{}))
+		require.NoError(t, held.Insert())
+	}
+	t.Cleanup(restore)
+
+	addNewRecord(BatchUpdateTypeTokenQuota, token.Id, -60)
+	summaries := FlushBatchUpdates()
+
+	summary, ok := findFlushSummary(summaries, batchUpdateTypeNames[BatchUpdateTypeTokenQuota])
+	require.True(t, ok, "the accumulator is reported even when its write failed")
+	assert.Equal(t, 1, summary.Entries)
+	assert.Equal(t, 0, summary.Accepted, "the failed write accepted nothing")
+
+	assert.Equal(t, -60, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota),
+		"the delta is still owed to its row after the failed write")
+	assert.Empty(t, batchUpdateInFlight[BatchUpdateTypeTokenQuota], "and the in-flight record no longer holds it")
+
+	restore()
+	assert.Equal(t, 1000, getTokenFromDB(t, token.Id).RemainQuota, "the failed write left the row alone")
+
+	summaries = FlushBatchUpdates()
+	summary, ok = findFlushSummary(summaries, batchUpdateTypeNames[BatchUpdateTypeTokenQuota])
+	require.True(t, ok, "the requeued delta is written by the next flush")
+	assert.Equal(t, 1, summary.Entries)
+	assert.Equal(t, 1, summary.Accepted)
+	assert.Equal(t, 940, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Zero(t, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota), "nothing is owed once the row took it")
+}
