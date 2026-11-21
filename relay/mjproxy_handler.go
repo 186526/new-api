@@ -60,7 +60,7 @@ func RelayMidjourneyImage(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
 	taskId := c.Param("id")
 	if !service.VerifyTaskArtifactAccess(c.Query(service.TaskArtifactAccessQueryParameter), taskId, midjourneyImageCapabilityObject) {
-		if !middleware.AcquireMidjourneyImageAccess(c.ClientIP(), taskId) {
+		if !middleware.AcquireMidjourneyImageAccess(c.ClientIP()) {
 			writeMidjourneyImageAccessLimited(c)
 			return
 		}

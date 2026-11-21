@@ -18,7 +18,7 @@ func midjourneyImageAccessIP(ip string) string {
 // against the caller's per-minute budget. It reports false once that budget is
 // spent, so a caller must then answer 429 instead of the 404 it would otherwise
 // write, exactly as the task artifact route does for the same attempt.
-func AcquireMidjourneyImageAccess(ip, mjId string) bool {
+func AcquireMidjourneyImageAccess(ip string) bool {
 	return taskArtifactAnonymousLimiter.invalidAttempt(time.Now(), midjourneyImageAccessIP(ip)+"\x00"+midjourneyImageInvalidAttempt)
 }
 
