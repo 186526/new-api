@@ -78,6 +78,16 @@ func mistralRequestBody(raw []byte, request *dto.GeneralOpenAIRequest) (json.Raw
 		return nil, err
 	}
 	body["messages"] = encoded
+	// The model the client asked for is not the model the channel maps it to.
+	// The relay layer resolves the mapping before the adaptor runs, so the
+	// mapped name is the one the upstream accepts.
+	if request != nil && request.Model != "" {
+		model, err := common.Marshal(request.Model)
+		if err != nil {
+			return nil, err
+		}
+		body["model"] = model
+	}
 	// The metadata carries the allowance tag. It is absent from a body read
 	// from a channel test or a retry, so the tag the adaptor applied survives.
 	if _, ok := body["metadata"]; !ok && request != nil && len(request.Metadata) > 0 {

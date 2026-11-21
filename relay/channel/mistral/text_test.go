@@ -189,6 +189,25 @@ func TestRequestOpenAI2MistralForwardsTopLevelMembersUntouched(t *testing.T) {
 	}
 }
 
+// The relay layer resolves the channel model mapping before the adaptor runs,
+// so the request carries the upstream name while the stored body still carries
+// the name the client asked for. The body that reaches Mistral must name the
+// upstream model, or the upstream rejects it as an unknown model.
+func TestRequestOpenAI2MistralSendsTheMappedModel(t *testing.T) {
+	c := clientBodyForTest(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`)
+	request := &dto.GeneralOpenAIRequest{Model: "deepseek-v4-1-flash-1017"}
+
+	encoded, err := requestOpenAI2Mistral(c, request)
+	if err != nil {
+		t.Fatalf("convert request: %v", err)
+	}
+
+	body, _ := decodedForTest(t, encoded)
+	if got := jsonString(body["model"]); got != "deepseek-v4-1-flash-1017" {
+		t.Errorf("model = %q, want the mapped upstream model %q", got, "deepseek-v4-1-flash-1017")
+	}
+}
+
 func TestRequestOpenAI2MistralDropsReasoningContent(t *testing.T) {
 	encoded := conversionForTest(t, `{"model":"m","messages":[{"role":"assistant","content":"hi","reasoning_content":"why"}]}`)
 	if strings.Contains(string(encoded), "reasoning_content") {
