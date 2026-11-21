@@ -105,11 +105,12 @@ func TestUploadDeclaresTheLengthItStreams(t *testing.T) {
 }
 
 // TestUploadLengthCountsAWrappedPayloadAlone checks the count the declared
-// length is built from. base64.StdEncoding.DecodedLen counts the line breaks of
-// a wrapped payload as if they decoded, while the decoder skips them, so a
-// length derived from that estimate is longer than the body and the upload
-// fails once the pipe ends early. The payload here is wrapped every 16
-// characters, which makes the two figures differ by 20 bytes.
+// length is built from. base64.StdEncoding.DecodedLen only divides the encoded
+// length, so it counts the CRLF separators of a wrapped payload as if they
+// decoded, while the decoder skips them: a length derived from that estimate is
+// longer than the body and the upload fails once the pipe ends early. The
+// payload here is wrapped every 16 characters, which makes the estimate 342
+// bytes for a 304-byte payload.
 func TestUploadLengthCountsAWrappedPayloadAlone(t *testing.T) {
 	previous := constant.MaxFileDownloadMB
 	constant.MaxFileDownloadMB = 8
