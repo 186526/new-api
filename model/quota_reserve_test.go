@@ -878,6 +878,10 @@ func TestCreditBuiltOnAStaleSnapshotDoesNotPublishAnotherBaseline(t *testing.T) 
 // A committed delta exists in the database already, so the cache must end up
 // holding it. Before this bound the delta shared the reservation's four-attempt
 // CAS budget, and losing it left the cache authorizing the same quota twice.
+// The committed deltas of one burst must all land. This width (64) is exactly
+// the retry budget, so it proves the loop absorbs a burst up to the cap; it does
+// not exercise the cap's failure mode. The 512-wide test below is the one that
+// does.
 func TestCommittedDeltasAllLandInTheCache(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -971,6 +975,131 @@ func TestCommittedTokenDeltasAllLandInTheCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, cached.RemainQuota, "the cached remainder follows the database")
 	assert.Equal(t, width, cached.UsedQuota)
+}
+
+// The width here is well past the retry budget (64), which is where the previous
+// revision's discard fired: at 512 the hash was deleted, 323 of 512 writers were
+// told they succeeded while doing nothing, and a reserve of already-spent quota
+// was then accepted. Batch mode is on because that is what production runs and
+// because it is the case where the database does not hold an unflushed debit, so
+// a discarded hash destroys the only copy. Nothing here may be dropped, and no
+// writer may be told it succeeded without moving the ledger.
+func TestAWideBurstOfCommittedDeltasLeavesNothingBehind(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	const width = 512
+	user := createReserveTestUser(t, width)
+	require.NoError(t, populateUserCache(user))
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		applied  int
+		failed   []error
+		silently int
+	)
+	for range width {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := persistUserQuotaDelta(user.Id, -1); err != nil {
+				mu.Lock()
+				failed = append(failed, err)
+				mu.Unlock()
+				return
+			}
+			result, err := cacheApplyUserQuotaDelta(user.Id, -1)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil && result == cacheQuotaOK:
+				applied++
+			case err == nil:
+				// The failure the review measured: success reported, nothing done.
+				silently++
+			default:
+				failed = append(failed, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Empty(t, failed, "no committed delta may be dropped or reported as contended")
+	assert.Zero(t, silently, "a writer that applied nothing must not report success")
+	assert.Equal(t, width, applied, "every committed delta reaches the cache")
+
+	// The hash still exists and holds the spend, and the cache agrees with the
+	// database once the accumulator has flushed.
+	cached, err := cacheGetUserBase(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cached.Quota, "the cache holds the balance the database holds")
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "every debit reached the row")
+
+	// The unit the burst spent must not be spendable again.
+	reserved, err := TryReserveUserQuota(user.Id, 1)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the spent wallet authorizes nothing more")
+}
+
+// The same at the same width on the token ledger, where the discard had the
+// same shape.
+func TestAWideBurstOfCommittedTokenDeltasLeavesNothingBehind(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	const width = 512
+	token := createReserveTestToken(t, width)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		applied  int
+		failed   []error
+		silently int
+	)
+	for range width {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := persistTokenQuotaDelta(token.Id, -1); err != nil {
+				mu.Lock()
+				failed = append(failed, err)
+				mu.Unlock()
+				return
+			}
+			result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -1)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil && result == cacheQuotaOK:
+				applied++
+			case err == nil:
+				silently++
+			default:
+				failed = append(failed, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Empty(t, failed, "no committed token delta may be dropped or reported as contended")
+	assert.Zero(t, silently, "a writer that applied nothing must not report success")
+	assert.Equal(t, width, applied)
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Zero(t, cached.RemainQuota, "the cached remainder follows the database")
+	assert.Equal(t, width, cached.UsedQuota)
+	batchUpdate()
+	assert.Equal(t, 0, getTokenFromDB(t, token.Id).RemainQuota, "every debit reached the row")
 }
 
 // Contention is a transient, not an empty wallet: a reservation that loses the
@@ -1131,6 +1260,27 @@ func TestVersion3DebtHashKeepsItsOverdraft(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
 	assert.Equal(t, "50", cacheQuotaField(t, key, "QuotaSpent"))
 	assert.Empty(t, cacheQuotaField(t, key, "QuotaSpentBase"))
+}
+
+// A committed delta with no hash to apply it to must be reported, never answered
+// as success. Here the hash is gone and a pending auth fence stops the snapshot
+// from being republished, so there is nowhere to write the delta: a writer told
+// it succeeded would leave the debit applied nowhere while the caller logs
+// nothing.
+func TestACommittedDeltaWithNoHashIsReportedNotSilentlyAccepted(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 10)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+	require.NoError(t, SetUserAuthVersionFence(user.Id, user.AuthVersion+1))
+
+	result, err := cacheApplyUserQuotaDelta(user.Id, -1)
+	assert.Error(t, err, "a delta that cannot be applied is not a success")
+	assert.NotEqual(t, cacheQuotaOK, result)
+	assert.ErrorIs(t, err, errQuotaLedgerHashGone)
 }
 
 // A version 3 hash whose baseline signature does not verify is not migrated: it

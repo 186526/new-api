@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -32,11 +33,37 @@ var ErrQuotaLedgerUnverified = errors.New("cached quota ledger failed verificati
 // committed one until the hash is reloaded from the database.
 var errQuotaLedgerBoundsRefused = errors.New("cached quota ledger cannot hold the committed delta")
 
-// errQuotaLedgerContended reports that every attempt lost the signature race to
-// a concurrent writer. It is a transient the caller retries: answering it as an
-// empty wallet, or from the database, would both be wrong, because the wallet
-// was never consulted and the database row may predate the batch accumulator.
+// errQuotaLedgerContended reports that a reservation lost the signature race to
+// a concurrent writer often enough to give up. The wallet was never consulted,
+// so answering it as an empty wallet is wrong, and answering it from the
+// database is wrong too: under batch accumulation that row predates the debit.
+// No caller retries this, so the read-CAS-write loop is serialized per subject
+// (quotaLedgerStripe) and a write that is going to land does so on the first
+// attempt; this error is the backstop for a subject two replicas are writing at
+// the same instant, not the normal path.
 var errQuotaLedgerContended = errors.New("cached quota ledger contention")
+
+// errQuotaLedgerHashGone reports a committed delta with no signed hash to apply
+// it to. The delta cannot be written anywhere, so it is reported rather than
+// answered as success: a delta the caller is told succeeded while nothing moved
+// leaves the cache authorizing quota the commit already spent.
+var errQuotaLedgerHashGone = errors.New("cached quota ledger is not present")
+
+// quotaLedgerStripe serializes the read-CAS-write loops that touch one subject's
+// ledger. Every one of those loops reads a signed state, computes the next MAC
+// and writes it only if the hash still carries the state it read; two of them
+// interleaving in one process is what turns ordinary concurrent traffic into
+// contention, because the loser has to re-read and try again. Serializing per
+// subject means a write issued in this process never loses to another write in
+// this process, so the retry budget only has to absorb a peer replica. Two
+// subjects that share a stripe only serialize against each other, never against
+// themselves, and a stripe is held only across one loop, never across a call
+// that takes another stripe.
+var quotaLedgerStripes [256]sync.Mutex
+
+func quotaLedgerStripe(subject int) *sync.Mutex {
+	return &quotaLedgerStripes[uint(subject)%uint(len(quotaLedgerStripes))]
+}
 
 // The cached quota counters sit in a hash whose metadata MAC covers neither of
 // them: they move on every spend, and signing them there would invalidate the
@@ -360,19 +387,22 @@ if not sign('UsedQuota', amountDigits) then
 end
 return 1`
 
-// quotaLedgerRetryAttempts bounds how often a concurrent writer may make a
-// verified ledger stale before a reservation reports itself contended. A
-// reservation that gives up is answered as contention, so the bound only costs
-// a retry, which the caller makes.
-const quotaLedgerRetryAttempts = 4
+// quotaLedgerRetryAttempts bounds how often a peer replica may move the ledger
+// between a read and its write before a reservation reports itself contended.
+// Writes issued in this process are serialized by quotaLedgerStripe, so the
+// only writer that can still steal the CAS is another process; the budget is
+// the number of such collisions a burst may absorb, not the concurrency the
+// wallet sees. Measured with the stripe held: 512-way unit reserves against a
+// 1,000,000 wallet are accepted 512 of 512, the same as master.
+const quotaLedgerRetryAttempts = 64
 
 // quotaLedgerDeltaAttempts bounds how many times a committed delta re-reads a
-// ledger another writer moved. A delta already exists in the database, so
-// dropping it would leave the cache authorizing the same quota again: the bound
-// is the churn it will walk through, and the fallback at the end of it
-// republishes the hash from the database instead of dropping anything. Each
-// lost attempt means another writer advanced the ledger, so the cap only binds
-// far past the 64-way concurrency where this many attempts lost none.
+// ledger a peer replica moved between its read and its write. Writes issued in
+// this process are serialized by quotaLedgerStripe, so this cap only absorbs a
+// collision with another process. The delta is never dropped at the end of it:
+// an unapplied spend leaves the signed counter below the spend the commit
+// recorded, which authorizes quota already spent, so the caller is told the
+// delta did not land (errQuotaLedgerContended) instead of being told it did.
 const quotaLedgerDeltaAttempts = 64
 
 // quotaLedgerMinWindowSeconds is the shortest life a signed ledger gets, in
@@ -712,12 +742,11 @@ func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResu
 // positive delta is quota credited and re-signs the ledger; a negative one is a
 // committed spend that moves the signed counter.
 //
-// The delta must land: the database already holds it, so dropping it would let
-// the cache authorize the same quota a second time. Retrying is therefore
-// bounded by progress rather than by a fixed attempt count. Each lost attempt
-// means another writer re-signed the ledger and made progress, so a fresh read
-// always makes the next one win; only a hash that stops changing (nothing moved
-// under us) or contradicts its own signature ends the loop early.
+// A committed spend that does not land leaves the signed counter *below* the
+// spend the commit recorded, which is the direction that authorizes quota
+// already spent, so this path never drops it: it retries under the subject's
+// stripe until it lands, republishes a missing hash from the database first,
+// and reports an error rather than success if neither is possible.
 func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error) {
 	if delta == 0 {
 		return cacheQuotaOK, nil
@@ -728,12 +757,35 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 	if delta > 0 {
 		return cacheCreditUserQuota(userID, delta)
 	}
-	amount := -delta
-	stalledMAC := ""
+	stripe := quotaLedgerStripe(userID)
+	stripe.Lock()
+	defer stripe.Unlock()
+	return applyUserQuotaDebit(userID, -delta)
+}
+
+// applyUserQuotaDebit moves the signed spend counter by amount. The caller holds
+// the subject's stripe, so the only writer that can still steal the CAS is
+// another process.
+func applyUserQuotaDebit(userID int, amount int64) (cacheQuotaResult, error) {
+	hydrated := false
 	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
 		ledger, result, err := verifiedUserQuotaLedger(userID)
 		if ledger == nil {
-			return result, err
+			if err != nil || result == cacheQuotaUnverified {
+				return result, err
+			}
+			// No hash to apply the delta to. Under batch accumulation the
+			// database row does not hold it yet, so reporting success here would
+			// hide a debit the cache should have carried. Republish the snapshot
+			// once and apply it there; if that fails, report it.
+			if hydrated {
+				return cacheQuotaMiss, errQuotaLedgerHashGone
+			}
+			hydrated = true
+			if _, hydrateErr := GetUserCache(userID); hydrateErr != nil {
+				return cacheQuotaMiss, fmt.Errorf("%w: %w", errQuotaLedgerHashGone, hydrateErr)
+			}
+			continue
 		}
 		nextSpent := ledger.spent + amount
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
@@ -759,21 +811,7 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 		case -2:
 			return cacheQuotaUnverified, ledgerRefusalError(raw)
 		}
-		// The ledger moved under the read. If it moved since the previous
-		// attempt, another delta or reservation landed and the retry has a new
-		// state to sign; if it did not, nothing is racing us and retrying would
-		// only spin.
-		if ledger.mac == stalledMAC {
-			break
-		}
-		stalledMAC = ledger.mac
 	}
-	// The loop only ends here after 64 re-reads that each lost to another
-	// writer, which means the ledger was changing on every attempt. Dropping the
-	// hash is the honest answer: the next read republishes it from the database,
-	// which already holds this delta, so it is never authorized twice and the
-	// caller is told the cache entry is gone rather than that the delta landed.
-	discardUnverifiedUserQuotaCache(userID, "kept changing under a committed delta")
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
@@ -784,6 +822,9 @@ func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 	if amount <= 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
 	}
+	stripe := quotaLedgerStripe(userID)
+	stripe.Lock()
+	defer stripe.Unlock()
 	for range quotaLedgerRetryAttempts {
 		ledger, result, err := verifiedUserQuotaLedger(userID)
 		if ledger == nil {
@@ -820,7 +861,8 @@ func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 }
 
 // cacheApplyTokenQuotaDelta mirrors cacheApplyUserQuotaDelta on the token
-// ledger: the delta is already committed, so it retries until it lands.
+// ledger: the delta is already committed, so a spend that does not land is
+// retried under the token's stripe and never dropped.
 func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResult, error) {
 	if delta == 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
@@ -828,12 +870,28 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 	if delta > 0 {
 		return cacheReleaseTokenQuota(id, key, delta)
 	}
-	amount := -delta
-	stalledMAC := ""
+	stripe := quotaLedgerStripe(id)
+	stripe.Lock()
+	defer stripe.Unlock()
+	return applyTokenQuotaDebit(id, key, -delta)
+}
+
+func applyTokenQuotaDebit(id int, key string, amount int64) (cacheQuotaResult, error) {
+	hydrated := false
 	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
 		ledger, result, err := verifiedTokenQuotaLedger(id, key)
 		if ledger == nil {
-			return result, err
+			if err != nil || result == cacheQuotaUnverified {
+				return result, err
+			}
+			if hydrated {
+				return cacheQuotaMiss, errQuotaLedgerHashGone
+			}
+			hydrated = true
+			if _, hydrateErr := GetTokenByKey(key, true); hydrateErr != nil {
+				return cacheQuotaMiss, fmt.Errorf("%w: %w", errQuotaLedgerHashGone, hydrateErr)
+			}
+			continue
 		}
 		nextUsed := ledger.used + amount
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, tokenCacheTTLSeconds())
@@ -856,12 +914,7 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 		case -2:
 			return cacheQuotaUnverified, ledgerRefusalError(raw)
 		}
-		if ledger.mac == stalledMAC {
-			break
-		}
-		stalledMAC = ledger.mac
 	}
-	discardUnverifiedTokenQuotaCache(id, key, "kept changing under a committed delta")
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
@@ -869,6 +922,9 @@ func cacheReleaseTokenQuota(id int, key string, amount int64) (cacheQuotaResult,
 	if amount <= 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
 	}
+	stripe := quotaLedgerStripe(id)
+	stripe.Lock()
+	defer stripe.Unlock()
 	for range quotaLedgerRetryAttempts {
 		ledger, result, err := verifiedTokenQuotaLedger(id, key)
 		if ledger == nil {
@@ -909,6 +965,9 @@ func cacheCreditUserQuota(userID int, delta int64) (cacheQuotaResult, error) {
 	if delta <= 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
 	}
+	stripe := quotaLedgerStripe(userID)
+	stripe.Lock()
+	defer stripe.Unlock()
 	for range quotaLedgerRetryAttempts {
 		ledger, result, err := verifiedUserQuotaLedger(userID)
 		if ledger == nil {
@@ -1065,6 +1124,14 @@ func discardUnverifiedTokenQuotaCache(id int, key string, reason string) {
 // discarded and answered from the database, never from zero: a zero balance
 // would refuse a spend the account can pay for.
 func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err error) {
+	// One writer per subject in this process. Without it, two goroutines holding
+	// the same verified state race for the same CAS and the loser is answered as
+	// contended, which the caller cannot retry away; with it, a write that is
+	// going to land gets the first attempt, and the budget only absorbs a peer
+	// replica (quotaLedgerRetryAttempts).
+	stripe := quotaLedgerStripe(id)
+	stripe.Lock()
+	defer stripe.Unlock()
 	hydrated := false
 	contended := 0
 	for range quotaLedgerRetryAttempts {
@@ -1104,6 +1171,9 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 }
 
 func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, fromDB bool, err error) {
+	stripe := quotaLedgerStripe(id)
+	stripe.Lock()
+	defer stripe.Unlock()
 	hydrated := false
 	contended := 0
 	for range quotaLedgerRetryAttempts {

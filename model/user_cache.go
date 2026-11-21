@@ -15,10 +15,21 @@ import (
 )
 
 // userCacheSchemaVersion 4 adds the signed quota ledger described on UserBase.
-// A hash written under version 3 carries the ledger with a signed baseline
-// instead of a signed live counter; it is migrated in place on the next read so
-// the spend it records is neither lost nor handed back. Version 2 and earlier
-// carry no ledger at all and are rebuilt from the database.
+//
+// Which layout is live matters for the deploy, so it is stated plainly. The
+// deployed build runs version 2 (`sha-0c28a7adb`, and master `456f9db7e`, both
+// `const userCacheSchemaVersion = 2`), and a version 2 hash carries no ledger
+// at all: its only record of a spend is the untrusted Quota mirror. Version 3
+// exists only on this branch's own commits, so the migration below never runs
+// against production. A version 2 hash is rebuilt from the database, and under
+// BATCH_UPDATE_ENABLED the row does not hold the unflushed debit, so the first
+// read after the bump answers from the pre-debit balance.
+//
+// That cannot be fixed from the hash: there is no signed spend to carry across.
+// The deploy mitigation is therefore a drained restart (stop the pods, let the
+// batch accumulator flush, then start the new build), tracked as M80; the
+// schema-version question is M81. This migration is only for a version 3 hash
+// left behind by an earlier build of this same branch.
 const userCacheSchemaVersion = 4
 
 // ledgerV3SchemaVersion is the layout this branch published before the live
@@ -99,11 +110,14 @@ func (user UserBase) verifiedQuotaLedger() (int, error) {
 }
 
 // migrateV3QuotaLedger re-signs a version 3 hash under the current layout,
-// carrying its spend across. The live counter is not signed by the v3 MAC, so
-// the migration keeps it only when it sits at or above the signed baseline; a
-// value below it cannot have come from this ledger and the hash is left to be
-// rebuilt from the database. The counter may sit above the signed total, which
-// is the debt a wallet in arrears holds.
+// carrying its spend across. This covers only a version 3 hash, which only an
+// earlier build of this branch wrote; the deployed build is version 2 and a
+// version 2 hash has no signed spend to carry (see userCacheSchemaVersion). The
+// live counter is not signed by the v3 MAC, so the migration keeps it only when
+// it sits at or above the signed baseline; a value below it cannot have come
+// from this ledger and the hash is left to be rebuilt from the database. The
+// counter may sit above the signed total, which is the debt a wallet in arrears
+// holds.
 func migrateV3QuotaLedger(fields map[string]string, cached UserBase) error {
 	spentBase, err := strconv.ParseInt(fields["QuotaSpentBase"], 10, 64)
 	if err != nil || spentBase < 0 {
