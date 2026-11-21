@@ -59,10 +59,20 @@ func InitEnv() {
 			SessionSecret = ss
 		}
 	}
-	if os.Getenv("CRYPTO_SECRET") != "" {
-		CryptoSecret = os.Getenv("CRYPTO_SECRET")
-	} else {
-		CryptoSecret = SessionSecret
+	// CryptoSecret signs the auth cache entries and the task artifact URLs. It no
+	// longer falls back to SessionSecret: an unset value used to yield the same
+	// key, so a deployment that forgot the variable silently gave both purposes
+	// one secret and nothing said so.
+	CryptoSecret = os.Getenv("CRYPTO_SECRET")
+	if CryptoSecret == "" {
+		log.Fatal(LogText("CRYPTO_SECRET is required: set it to a random string, or to the value this deployment used while the variable was unset (SESSION_SECRET) so already-issued task artifact URLs and auth cache entries keep verifying"))
+	}
+	// An equal value keeps the upgrade compatible, so it is only warned about:
+	// a deployment that never set CRYPTO_SECRET has already signed its artifact
+	// URLs and cache entries with SessionSecret, and reusing that value is the
+	// only way they survive the upgrade.
+	if CryptoSecret == SessionSecret {
+		log.Println(LogText("WARNING: CRYPTO_SECRET equals SESSION_SECRET, so the task artifact URLs and the auth cache entries share the session signing key; set CRYPTO_SECRET to a different random string."))
 	}
 	if err := InitSessionCookieSettings(); err != nil {
 		log.Fatal(err)
