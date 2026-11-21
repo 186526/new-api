@@ -1,9 +1,11 @@
 package mistral
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -101,8 +103,17 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return openai.OaiResponsesHandler(c, info, resp)
 	}
 	if info.IsStream {
+		resp.Body = rewriteContentPartsStream(resp.Body)
 		usage, err = openai.OaiStreamHandler(c, info, resp)
 	} else {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
+		}
+		body = rewriteResponseBody(body)
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		usage, err = openai.OpenaiHandler(c, info, resp)
 	}
 	return
