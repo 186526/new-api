@@ -109,13 +109,12 @@ func redactRequestTarget(request *http.Request) string {
 
 // paymentSplitSegmentLimit caps how many "="-bearing segments the decoded-path
 // split tests before it falls back. The guard runs in the gin formatter for
-// every request, so its cost is chosen by an unauthenticated client; each
-// candidate hands the rest of the path to the predicates, and an unbounded
-// count would make that quadratic in the request line. A real callback URL has
-// a handful of segments, so the limit only binds on a crafted path. Reaching it
-// returns the first candidate instead of the path: that route half ends before
-// the first "="-bearing segment, so it holds no literal "=" and cannot print a
-// value that arrived after one.
+// every request, so its cost is chosen by an unauthenticated client, and a cap
+// keeps a crafted path from turning the walk into a long candidate list. A real
+// callback URL has a handful of segments, so the limit only binds on a crafted
+// path. Reaching it returns the first candidate instead of the path: that route
+// half ends before the first "="-bearing segment, so it holds no literal "=" and
+// cannot print a value that arrived after one.
 const paymentSplitSegmentLimit = 64
 
 // splitQueryDecodedIntoPath splits a path that carries a decoded query in one of
@@ -130,9 +129,11 @@ const paymentSplitSegmentLimit = 64
 // carry a decoded "=" of its own, and splitting there would leave a route half
 // without the callback segment while the query half starts with that earlier
 // name, so neither predicate would fire. The first split either predicate
-// accepts is the one returned. The segments are walked forward once, so a path
-// that is one long "="-bearing segment costs one pass rather than a backward
-// rescan per "=".
+// accepts is the one returned. The segments are walked forward once, and each
+// candidate hands the key-name predicate only its own segment, so the per
+// candidate cost is bounded by that segment's length: a long "=" segment costs
+// one pass, and an "&"-dense one costs its own part count rather than the
+// remainder's.
 //
 // At most paymentSplitSegmentLimit segments are tested; past that the first
 // candidate is returned (see that constant for why). A double-encoded "="
@@ -158,7 +159,12 @@ func splitQueryDecodedIntoPath(path string) (routePath, queryText string, found 
 				// says the request reached no route, which is what the log should show.
 				routePath = "/"
 			}
-			queryText = path[segmentStart:]
+			// The decoded query starts at this segment, and its key name is in the
+			// same segment because the key precedes the "=". Bounding the predicate
+			// input here keeps the per-candidate cost proportional to this segment
+			// instead of the whole remainder: "&" separates parts only inside a
+			// segment, so nothing the predicate needs lies past it.
+			queryText = path[segmentStart : segmentStart+segmentEnd]
 			if tested == 0 {
 				firstCandidateRoutePath = routePath
 			}

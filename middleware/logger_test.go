@@ -17,17 +17,24 @@ import (
 )
 
 // BenchmarkRedactRequestTarget pins the cost of the log-path redaction on a
-// request line an unauthenticated client chooses. The decoded-path guard walks
-// the segments of a path looking for "=", so a path that is one long
-// "="-bearing segment is the input that makes a per-candidate backward scan
-// quadratic; the second case is the same shape split into many segments, where
-// a whole-remainder predicate call per candidate is the cost. Both stay inside
-// a request line the edge allows (~8 KiB in the first case, ~8 KiB in the
-// second), so a regression shows up as microseconds here rather than seconds.
+// request line an unauthenticated client chooses. Each case is a cost regime
+// the decoded-path guard has had to be defended against, and each stayed inside
+// a request line the edge allows (~8 KiB), so a regression shows up as
+// microseconds here rather than seconds:
+//
+//   - one long "="-bearing segment, which made a per-candidate backward rescan
+//     quadratic;
+//   - many "="-bearing segments, which made a whole-remainder predicate call
+//     per candidate quadratic;
+//   - an "&"-dense remainder, where the key-name predicate splits on "&", so a
+//     per-candidate input that spans the remainder costs its part count. The
+//     second case has no "&" and returns in constant time there, which is why
+//     this third shape exists.
 func BenchmarkRedactRequestTarget(b *testing.B) {
 	for _, tc := range []struct{ name, path string }{
 		{"one equals segment 8000 bytes", "/" + strings.Repeat("=", 8000)},
 		{"many equals segments 2000 times", "/" + strings.Repeat("a=b/", 2000)},
+		{"ampersand dense remainder 8000 bytes", "/" + strings.Repeat("a=b/", 52) + "sign=&" + strings.Repeat("&a=b", 1600)},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			request := &http.Request{Method: http.MethodGet, URL: &url.URL{Path: tc.path}}
@@ -267,6 +274,52 @@ func TestAccessLogBoundsTheDecodedPathCandidateScan(t *testing.T) {
 	// "sign=" segment and log the whole path instead, so this pins the ceiling.
 	assert.Equal(t, "/files", loggedPath)
 	assert.NotContains(t, logged, "BOUNDEDSCANSIGNATUREVALUE", "the bounded scan must not log what it stopped before")
+}
+
+// TestAccessLogDropsASignatureInsideAnAmpersandDenseSegment pins the segment
+// bound on the predicate input. The decoded query handed to the key-name test is
+// cut at the segment holding the "=", so a signature must be found inside that
+// segment or in a later segment that becomes a candidate of its own. An
+// "&"-dense segment is where a bound that stopped too early would show: the key
+// sits after many parts, and the parts that follow it are in the same segment.
+//
+// The second case is the adversarial one for the bound: the signature is in a
+// later segment than an "&"-dense one, so the walk has to reach it rather than
+// stop at the first segment that failed the key-name test.
+func TestAccessLogDropsASignatureInsideAnAmpersandDenseSegment(t *testing.T) {
+	const canary = "AMPDENSESIGNATUREVALUE"
+	dense := strings.Repeat("c=d&", 400)
+	for _, tc := range []struct{ name, path, loggedPath string }{
+		{
+			"the signature follows many parts in one segment",
+			"/files/a=b&" + dense + "sign=" + canary,
+			"/files",
+		},
+		{
+			"the signature is in a segment after an ampersand-dense one",
+			"/files/a=b&" + dense + "/sign=" + canary,
+			"/files/a=b&" + dense,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			previousWriter := gin.DefaultWriter
+			var output bytes.Buffer
+			gin.DefaultWriter = &output
+			t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+			router := gin.New()
+			SetUpLogger(router)
+			router.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			logged := strings.TrimSuffix(output.String(), "\n")
+			_, loggedPath, found := strings.Cut(logged, "GET ")
+			require.True(t, found)
+			assert.Equal(t, tc.loggedPath, loggedPath)
+			assert.NotContains(t, logged, canary, "the signature may not reach the log")
+		})
+	}
 }
 
 func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
