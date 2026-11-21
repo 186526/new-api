@@ -13,6 +13,7 @@ This tree is a self-hosted fork of `QuantumNous/new-api` (remote `upstream`). It
 
 ### Remotes
 
+- The checkout on this workstation is often on a detached HEAD while the local `master` ref lies behind `origin/master`. `git push origin master` then fails with a non-fast-forward even though the new commits are ancestors of `origin/master` plus your own; push the commit you are on instead: `git push origin HEAD:master`. Check `git status -sb` for `HEAD（非分支）` before pushing.
 - `origin` is `git@github.com:186526/new-api.git`. The deployment repository `https://git.186526.xyz/186526/kubernetes.git` is the parent tree's remote and holds `deploys/` and `monitoring/`; it does not carry `source/`. Push the fork to `git.186526.xyz` over HTTPS when GitHub is unreachable.
 - The parent repository tracks `source/` as a gitlink: `git ls-files -s new-api/source` in `kubernetes/` shows mode 160000 and the commit `source/` is checked out at. Customize here and bump the gitlink to the new `master` commit of this fork whenever a parent change depends on the fork code. The recorded commit must be reachable from the fork remote (`origin`, `git.186526.xyz`), because a fresh clone fetches only what the remote has. Bumping the gitlink is a separate step: a parent commit that did not bump it still describes the previous fork commit, and the image tags in `deploys/` name the `sha-<commit>` CI built for that commit.
 
