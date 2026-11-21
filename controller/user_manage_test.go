@@ -59,8 +59,12 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 		// gets a fresh database, so a delta left queued for user 1 in one case
 		// would describe a row in the next case's database. Flushing while the
 		// database still points at the rows these deltas belong to keeps the two
-		// apart.
+		// apart. The clear afterwards is unconditional and comes after the flush
+		// because the flush requeues a delta it could not write: a case whose
+		// update was rolled back deliberately leaves one behind, and it must not
+		// reach the next case's database either.
 		model.FlushBatchUpdates()
+		model.ClearBatchUpdateAccumulators()
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled, common.SessionSecret = previousRedisEnabled, previousSecret
 		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)

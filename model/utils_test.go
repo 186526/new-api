@@ -108,6 +108,35 @@ func TestFlushBatchUpdatesCountsOnlyAcceptedRows(t *testing.T) {
 	}
 }
 
+// A delta whose row is gone must be dropped, not requeued. The flush folds a failed
+// write back into the accumulator for the next tick, so a branch that requeues
+// ErrRecordNotFound retries a write no row can ever accept: one deleted token or
+// channel would fail three UPDATEs and log six error lines every tick, forever, and
+// leave an entry that unflushedQuotaDelta reports as owed to a row that is gone.
+func TestAGoneRowIsNotRequeuedForAnotherAttempt(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+
+	const missingID = 987655
+	addNewRecord(BatchUpdateTypeTokenQuota, missingID, -50)
+	addNewRecord(BatchUpdateTypeUserQuota, missingID, -50)
+	addNewRecord(BatchUpdateTypeChannelUsedQuota, missingID, 50)
+
+	summaries := FlushBatchUpdates()
+	for _, i := range []int{BatchUpdateTypeTokenQuota, BatchUpdateTypeUserQuota, BatchUpdateTypeChannelUsedQuota} {
+		summary, ok := findFlushSummary(summaries, batchUpdateTypeNames[i])
+		require.True(t, ok, "accumulator %d must be reported even when its row is gone", i)
+		assert.Equal(t, 0, summary.Accepted, "no row existed, so the database accepted nothing")
+	}
+
+	assert.Empty(t, FlushBatchUpdates(), "a gone row must not be queued for another attempt")
+	for _, i := range []int{BatchUpdateTypeTokenQuota, BatchUpdateTypeUserQuota, BatchUpdateTypeChannelUsedQuota} {
+		assert.Empty(t, batchUpdateStores[i], "accumulator %d keeps no entry for a gone row", i)
+		assert.Zero(t, unflushedTestDelta(missingID, i), "accumulator %d owes nothing for a gone row", i)
+	}
+}
+
 func TestFlushBatchUpdatesIsEmptyWithoutAccumulatedDeltas(t *testing.T) {
 	resetBatchUpdateTestState(t)
 	common.BatchUpdateEnabled = true

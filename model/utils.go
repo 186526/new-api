@@ -239,7 +239,10 @@ func batchUpdate() []BatchUpdateFlushSummary {
 		unwritten = writeBatchUpdateStoresInto(unwritten, accepted)
 	}
 	// Whatever still failed goes back into the queue, so the next flush and the
-	// reservation check both still see it owed to its row.
+	// reservation check both still see it owed to its row. Both this and the clear
+	// below happen under the flush lock, so their order is not observable to a
+	// reader: reserveQuotaHoldingAccumulator holds the same lock across its read of
+	// stores plus in-flight.
 	requeueUnwrittenDeltas(unwritten)
 	clearBatchUpdateInFlight()
 	common.SysLog(common.LogText("batch update finished"))
@@ -336,11 +339,19 @@ func writeBatchUpdateStoresInto(stores []map[int]int, accepted []int) []map[int]
 				err := increaseTokenQuota(key, value)
 				if err != nil {
 					common.SysLog(common.LogText("failed to batch update token quota: %s", err.Error()))
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						// The token is gone. Requeueing would retry a write no row can accept.
+						continue
+					}
 					recordUnwrittenDelta(failed[i], key, value, err)
 					continue
 				}
 			case BatchUpdateTypeChannelUsedQuota:
 				if err := updateChannelUsedQuota(key, value); err != nil {
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						// The channel is gone. Requeueing would retry a write no row can accept.
+						continue
+					}
 					recordUnwrittenDelta(failed[i], key, value, err)
 					continue
 				}
@@ -406,6 +417,15 @@ func recordUnwrittenDelta(unwritten map[int]int, id int, value int, err error) {
 // either in the queue or in the in-flight record until a flush writes it; dropping
 // this requeue would erase it from both on a write error, and the reservation check
 // would then answer from a row that never received it.
+//
+// It assumes the accumulator belongs to the database that was installed when the
+// delta was queued, and requeues without re-checking that. The accumulators are
+// process-global and keyed by (kind, id), so a caller that swaps the database under
+// them inherits any delta this leaves behind, and the id may name an unrelated row
+// there. Nothing in the process does that - the database is installed once at start
+// up - so the ownership stays with whoever swaps it: that caller must flush before
+// it swaps and then clear the accumulators unconditionally, including when the flush
+// could not write.
 func requeueUnwrittenDeltas(unwritten []map[int]int) {
 	for i, store := range unwritten {
 		if len(store) == 0 {
@@ -426,6 +446,24 @@ func requeueUnwrittenDeltas(unwritten []map[int]int) {
 func clearBatchUpdateInFlight() {
 	for i := range BatchUpdateTypeCount {
 		batchUpdateLocks[i].Lock()
+		batchUpdateInFlight[i] = nil
+		batchUpdateLocks[i].Unlock()
+	}
+}
+
+// ClearBatchUpdateAccumulators drops every queued delta and the in-flight record.
+// It belongs to a caller that replaces the database under the accumulators: their
+// entries are keyed by (kind, id) and describe rows in the database that was
+// installed when they were queued, so a swap must flush first and then call this,
+// even when the flush could not write. Nothing in a running process does that - the
+// database is installed once at start up - so this exists for the tests that put a
+// fresh database under each case.
+func ClearBatchUpdateAccumulators() {
+	batchUpdateFlushLock.Lock()
+	defer batchUpdateFlushLock.Unlock()
+	for i := range BatchUpdateTypeCount {
+		batchUpdateLocks[i].Lock()
+		batchUpdateStores[i] = make(map[int]int)
 		batchUpdateInFlight[i] = nil
 		batchUpdateLocks[i].Unlock()
 	}
