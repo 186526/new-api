@@ -78,6 +78,9 @@ func configuredLabel(t *testing.T, metricName, channel, scope, window string) (s
 // labelNames returns the label names of the first sample of one metric, sorted.
 // The mission requires the existing label set to stay unchanged apart from the
 // new label, so the test names the whole set rather than only the new member.
+// A family with no samples fails here instead of returning nil, because a nil
+// slice compared against the expected set reads as a mismatch only by accident:
+// the metric may simply not have been published yet.
 func labelNames(t *testing.T, name string) []string {
 	t.Helper()
 	gathered, err := registry.Gather()
@@ -86,15 +89,17 @@ func labelNames(t *testing.T, name string) []string {
 		if family.GetName() != name {
 			continue
 		}
-		for _, sample := range family.GetMetric() {
-			names := make([]string, 0, len(sample.GetLabel()))
-			for _, label := range sample.GetLabel() {
-				names = append(names, label.GetName())
-			}
-			sort.Strings(names)
-			return names
+		require.NotEmpty(t, family.GetMetric(), "metric %s was not published, so its label set cannot be read", name)
+		sample := family.GetMetric()[0]
+		names := make([]string, 0, len(sample.GetLabel()))
+		for _, label := range sample.GetLabel() {
+			names = append(names, label.GetName())
 		}
+		require.NotEmpty(t, names, "metric %s was published without labels", name)
+		sort.Strings(names)
+		return names
 	}
+	require.FailNow(t, "metric family not found in the registry", "metric %s", name)
 	return nil
 }
 
@@ -207,16 +212,24 @@ func TestObserveUpstreamQuotaLabelsTheAllowanceOfAnAccountWithoutAChannel(t *tes
 // TestUpstreamQuotaKeepsItsLabelsAndAddsOnlyTheConfiguredOne pins the label set
 // of the three allowance metrics, so the numeric meaning of an existing series
 // is the one it had before the label: the same channel, scope and window values
-// key the same figure, and channel_configured is the only new member.
+// key the same figure, and channel_configured is the only new member. The
+// windows carry a reset time because the reset gauge is published only for a
+// window that has one, so the test must not depend on another test having
+// published that family first.
 func TestUpstreamQuotaKeepsItsLabelsAndAddsOnlyTheConfiguredOne(t *testing.T) {
+	reset := time.Unix(1_700_100_000, 0)
 	ObserveUpstreamQuota(UpstreamQuota{
-		Channel:     "label-set probe live",
-		Windows:     []QuotaWindow{{Scope: "api", Window: "monthly", RemainingRatio: 0.5}},
+		Channel: "label-set probe live",
+		Windows: []QuotaWindow{{
+			Scope: "api", Window: "monthly", RemainingRatio: 0.5, ResetAt: reset,
+		}},
 		RefreshedAt: time.Unix(1_700_000_000, 0),
 	})
 	ObserveUpstreamQuota(UpstreamQuota{
-		Channel:         "label-set probe orphan",
-		Windows:         []QuotaWindow{{Scope: "api", Window: "monthly", RemainingRatio: 0.5}},
+		Channel: "label-set probe orphan",
+		Windows: []QuotaWindow{{
+			Scope: "api", Window: "monthly", RemainingRatio: 0.5, ResetAt: reset,
+		}},
 		RefreshedAt:     time.Unix(1_700_000_000, 0),
 		ChannelOrphaned: true,
 	})
@@ -227,6 +240,78 @@ func TestUpstreamQuotaKeepsItsLabelsAndAddsOnlyTheConfiguredOne(t *testing.T) {
 		labelNames(t, "newapi_upstream_quota_reset_timestamp_seconds"))
 	assert.Equal(t, []string{"channel", "channel_configured"},
 		labelNames(t, "newapi_upstream_quota_refresh_timestamp_seconds"))
+}
+
+// TestObserveUpstreamQuotaDropsTheSeriesOfTheFlippedConfiguredLabel requires a
+// flip to leave only the new series behind. A GaugeVec never deletes a series,
+// so without the deletion a channel that comes back keeps its orphan series
+// forever, and a dashboard filtering on channel_configured would keep excluding
+// a channel that exists.
+func TestObserveUpstreamQuotaDropsTheSeriesOfTheFlippedConfiguredLabel(t *testing.T) {
+	channel := "Mistral Vibe (flipped label test)"
+	reset := time.Unix(1_700_200_000, 0)
+	refresh := time.Unix(1_700_000_000, 0)
+	window := func() []QuotaWindow {
+		return []QuotaWindow{{Scope: "monthly", Window: "monthly", RemainingRatio: 0.5, ResetAt: reset}}
+	}
+
+	// The account goes orphan, then its channel comes back.
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel: channel, Windows: window(), RefreshedAt: refresh, ChannelOrphaned: true,
+	})
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel: channel, Windows: window(), RefreshedAt: refresh,
+	})
+
+	counts := seriesCountByConfigured(t, "newapi_upstream_quota_remaining_ratio", channel)
+	require.Equal(t, 1, counts[channelConfiguredTrue], "the live series must be the one left")
+	assert.Equal(t, 0, counts[channelConfiguredFalse], "the orphan series of the earlier tick must be deleted")
+
+	counts = seriesCountByConfigured(t, "newapi_upstream_quota_reset_timestamp_seconds", channel)
+	assert.Equal(t, 1, counts[channelConfiguredTrue])
+	assert.Equal(t, 0, counts[channelConfiguredFalse])
+
+	counts = seriesCountByConfigured(t, "newapi_upstream_quota_refresh_timestamp_seconds", channel)
+	assert.Equal(t, 1, counts[channelConfiguredTrue])
+	assert.Equal(t, 0, counts[channelConfiguredFalse])
+
+	// The flip has to work the other way round too, or the orphan series would
+	// outlive a channel that is deleted again.
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel: channel, Windows: window(), RefreshedAt: refresh, ChannelOrphaned: true,
+	})
+	counts = seriesCountByConfigured(t, "newapi_upstream_quota_remaining_ratio", channel)
+	assert.Equal(t, 1, counts[channelConfiguredFalse])
+	assert.Equal(t, 0, counts[channelConfiguredTrue])
+}
+
+// seriesCountByConfigured counts the published series of one metric for a
+// channel, keyed by channel_configured value.
+func seriesCountByConfigured(t *testing.T, metricName, channel string) map[string]int {
+	t.Helper()
+	gathered, err := registry.Gather()
+	require.NoError(t, err)
+	counts := map[string]int{channelConfiguredTrue: 0, channelConfiguredFalse: 0}
+	for _, family := range gathered {
+		if family.GetName() != metricName {
+			continue
+		}
+		for _, sample := range family.GetMetric() {
+			name, configured := "", ""
+			for _, label := range sample.GetLabel() {
+				switch label.GetName() {
+				case labelChannel:
+					name = label.GetValue()
+				case labelChannelConfigured:
+					configured = label.GetValue()
+				}
+			}
+			if name == channel {
+				counts[configured]++
+			}
+		}
+	}
+	return counts
 }
 
 // TestObserveChannelBalanceKeepsItsLabelsAndAddsOnlyTheConfiguredOne pins the
