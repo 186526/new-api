@@ -1412,3 +1412,263 @@ func TestForgedVersion3HashIsNotMigrated(t *testing.T) {
 	assert.True(t, reserved, "a hash that fails its own signature is answered from the database")
 	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
 }
+
+// Under batch accumulation the row lags every spend until the next flush. When
+// the signed ledger is no longer usable the fallback must not answer from that
+// row: measured before the fix, wallet 100 with two accumulated spends of 30
+// accepted a reserve of 100 (the whole pre-debit balance) and took the row to 0.
+// The row cannot answer, so the reservation is refused and reported.
+func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	reserved, err := TryReserveUserQuota(user.Id, 30)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	reserved, err = TryReserveUserQuota(user.Id, 30)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	cached, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	require.Equal(t, 40, cached, "the ledger holds the live balance")
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the row has not been flushed yet")
+
+	// The signature lapses while the hash itself is still there.
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
+		"QuotaLedgerExp", int64(1)).Err())
+
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a row behind the accumulator cannot answer")
+	assert.False(t, reserved, "the pre-debit balance is not spendable")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no row spend either")
+
+	// After the flush the row holds the spends and the same reserve is refused
+	// for the right reason: the balance really is 40.
+	batchUpdate()
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 40, not 100")
+}
+
+// The token twin of the case above.
+func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingTokenRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 30, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	live, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	require.Equal(t, 70, live.RemainQuota)
+	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "the row has not been flushed")
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
+		"QuotaLedgerExp", int64(1)).Err())
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+}
+
+// A metadata write refreshes the hash but not the ledger, so the hash must not
+// be allowed to outlive the signature that makes its counters spendable. The
+// TTL is capped at the signed expiry, which keeps the hash alive only as long
+// as it can be trusted. Measured before the fix the hash was renewed to a full
+// TTL while the ledger had ~5s left.
+func TestUserHashNeverOutlivesItsSignedLedger(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	// A TTL longer than the remaining signed window, so a refresh that only
+	// touched the hash would outlive its ledger. useUserCacheMiniRedis pins
+	// SyncFrequency to 2s, which is shorter than this window and would hide it.
+	oldSync := common.SyncFrequency
+	common.SyncFrequency = 30
+	t.Cleanup(func() { common.SyncFrequency = oldSync })
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+
+	// Put the signed expiry 3 seconds out, then refresh the metadata.
+	expiresAt := time.Now().Add(3 * time.Second).UnixMilli()
+	mac, err := (UserBase{
+		Id: user.Id, AuthVersion: user.AuthVersion, CacheSchema: userCacheSchemaVersion,
+		QuotaCredited: 100, QuotaSpent: 0, QuotaLedgerExp: expiresAt,
+	}).quotaLedgerMAC()
+	require.NoError(t, err)
+	key := getUserCacheKey(user.Id)
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"QuotaLedgerExp", expiresAt, "QuotaLedgerMAC", mac).Err())
+
+	var fresh User
+	require.NoError(t, DB.First(&fresh, user.Id).Error)
+	require.NoError(t, updateUserCache(fresh))
+
+	ttl := common.RDB.PTTL(t.Context(), key).Val()
+	remaining := time.Until(time.UnixMilli(expiresAt))
+	assert.Positive(t, ttl, "the refresh kept the hash alive")
+	assert.LessOrEqual(t, ttl, remaining+time.Second,
+		"the hash TTL is capped at the signed expiry, so it cannot outlive its ledger")
+}
+
+// The two row-first callers write the row themselves and then hand the same
+// delta to the cache. Measured before the fix under batch accumulation, that
+// sequence left cache=60 against row=100 (the debit was applied twice): the
+// ledger was rebuilt from a row that already held it and then debited again.
+// syncRowCommittedUserQuota never rebuilds, so the cache and the row agree.
+func TestRowFirstDebitIsNotCountedTwiceUnderBatchAccumulation(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	// PurchaseSubscriptionWithBalance / AdjustUserQuota shape: their transaction
+	// writes the row with a direct UPDATE (they do not queue), and only then is
+	// the same delta handed to the cache.
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -40)).Error)
+	require.NoError(t, syncRowCommittedUserQuota(user.Id, -40))
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 60, balance, "the row already holds the debit, so the cache must not apply it twice")
+	assert.Equal(t, getUserQuotaFromDB(t, user.Id), balance)
+
+	// The wallet really holds 60 once the row is flushed, and 100 is refused.
+	batchUpdate()
+	assert.Equal(t, 60, getUserQuotaFromDB(t, user.Id))
+	reserved, err := TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 60, not 100")
+}
+
+// The same shape for a credit, which is the dangerous direction: counting a
+// credit twice would let the user spend quota nobody granted.
+func TestRowFirstCreditIsNotCountedTwiceUnderBatchAccumulation(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", 50)).Error)
+	require.NoError(t, syncRowCommittedUserQuota(user.Id, 50))
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 150, balance, "the credit is applied once, not twice")
+
+	batchUpdate()
+	assert.Equal(t, 150, getUserQuotaFromDB(t, user.Id))
+	reserved, err := TryReserveUserQuota(user.Id, 150)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the row's own balance is spendable")
+	reserved, err = TryReserveUserQuota(user.Id, 1)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the doubled credit is not spendable")
+}
+
+// A row-first caller whose hash is absent in non-batch mode: the row is the
+// authority, the cache carries nothing until the next read republishes it, and
+// that read equals the row. This is the shape r5 established, now reached
+// through the row-first entry rather than by flipping the batch flag.
+func TestRowFirstDeltaWithNoHashLeavesTheCacheEqualToTheRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = false
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -40)).Error)
+	require.NoError(t, syncRowCommittedUserQuota(user.Id, -40))
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 60, balance)
+	assert.Equal(t, 60, getUserQuotaFromDB(t, user.Id))
+
+	reserved, err := TryReserveUserQuota(user.Id, 60)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the row funds 60")
+}
+
+// A hash that exists but carries no ledger: the row-first caller must not be
+// told the delta landed when there was nothing to land it on, and the value the
+// reader sees must still equal the row.
+func TestRowFirstDeltaWithAPresentHashThatHasNoLedger(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = false
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.HDel(t.Context(), getUserCacheKey(user.Id),
+		"QuotaLedgerMAC", "QuotaLedgerExp").Err())
+
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -40)).Error)
+	// A present hash whose ledger does not verify is not a rebuild trigger for a
+	// row-first caller: the delta is reported rather than silently dropped.
+	err := syncRowCommittedUserQuota(user.Id, -40)
+	assert.Error(t, err, "a delta that cannot be recorded is not reported as success")
+
+	balance, readErr := GetUserQuota(user.Id, false)
+	require.NoError(t, readErr)
+	assert.Equal(t, getUserQuotaFromDB(t, user.Id), balance, "the cache equals the row")
+}
+
+// A stale hash — one whose signed ledger lags the row by an earlier row-first
+// delta — must still take the new delta, and the two converge on the row.
+func TestRowFirstDeltaOntoAStaleHashStillConverges(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = false
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+
+	// First row-first delta: the ledger is live and moves with the row.
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -20)).Error)
+	require.NoError(t, syncRowCommittedUserQuota(user.Id, -20))
+	// Second one before any read republished the hash.
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -30)).Error)
+	require.NoError(t, syncRowCommittedUserQuota(user.Id, -30))
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	row := getUserQuotaFromDB(t, user.Id)
+	assert.Equal(t, 50, row)
+	assert.Equal(t, row, balance, "both deltas landed once each")
+}

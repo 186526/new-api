@@ -88,7 +88,25 @@ redis.call('HSET', KEYS[1],
 if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
-redis.call('EXPIRE', KEYS[1], ARGV[12])
+-- The hash must never outlive the signature that makes its counters spendable.
+-- A metadata write that renewed only the hash would leave it alive past
+-- QuotaLedgerExp; the next read would then discard the ledger and rebuild the
+-- balance from a row the batch accumulator has not flushed, handing back quota
+-- that was already spent. Capping the TTL at the signed expiry means such a
+-- hash simply disappears, and the rebuild reads a flushed row.
+local ledgerExp = tonumber(redis.call('HGET', KEYS[1], 'QuotaLedgerExp') or '0')
+local ttl = tonumber(ARGV[12])
+local now = tonumber(redis.call('TIME')[1]) * 1000
+if ledgerExp > 0 then
+  local remaining = math.floor((ledgerExp - now) / 1000)
+  if remaining < 1 then
+    return 1
+  end
+  if remaining < ttl then
+    ttl = remaining
+  end
+end
+redis.call('EXPIRE', KEYS[1], ttl)
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
 		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},

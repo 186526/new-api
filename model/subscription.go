@@ -835,7 +835,9 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 	}
 
 	if chargedQuota > 0 {
-		if err := cacheDecrUserQuota(userId, int64(chargedQuota)); err != nil {
+		// The transaction already wrote the row, so this delta must move the
+		// ledger without being rebuilt from that row: the row holds it.
+		if err := syncRowCommittedUserQuota(userId, -int64(chargedQuota)); err != nil {
 			common.SysLog(common.LogText("failed to decrease user quota cache after subscription balance purchase: %s", err.Error()))
 		}
 	}

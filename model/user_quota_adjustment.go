@@ -78,7 +78,9 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 	// Both balances are bounded above, so their difference fits in int64.
 	delta := int64(adjustment.After) - int64(adjustment.Before)
 	if delta != 0 {
-		if err := cacheIncrUserQuota(userID, delta); err != nil {
+		// The transaction already wrote the row, so the ledger moves by the
+		// committed difference without ever being rebuilt from that row.
+		if err := syncRowCommittedUserQuota(userID, delta); err != nil {
 			common.SysError(common.LogText("failed to sync manual quota adjustment for user %d: %s", userID, err))
 		}
 	}
