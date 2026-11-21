@@ -95,8 +95,7 @@ func redactRequestTarget(request *http.Request) string {
 	// guard above sees it: there is no "?" to cut the target at, and the route
 	// segment is no longer the last one. Judge the decoded form instead, so the
 	// route still reads as the callback and the rest still reads as the query.
-	if routePath, pathQuery, found := splitQueryDecodedIntoPath(path); found &&
-		(relaycommon.IsPaymentCallbackPath(routePath) || relaycommon.IsPaymentCallbackQueryText(pathQuery)) {
+	if routePath, _, found := splitQueryDecodedIntoPath(path); found {
 		return routePath
 	}
 	if request.URL.RawQuery != "" {
@@ -114,21 +113,40 @@ func redactRequestTarget(request *http.Request) string {
 // starts at the beginning of the segment that holds it. Splitting there keeps
 // the key name in the query text, so the caller judges both halves with the same
 // payment predicates it applies to a real query instead of growing a second key
-// list. found is false when the path holds no "=", and both halves are then the
-// input unchanged.
+// list.
+//
+// Every "="-bearing segment is tried, not only the first: an earlier segment may
+// carry a decoded "=" of its own, and splitting there would leave a route half
+// without the callback segment while the query half starts with that earlier
+// name, so neither predicate would fire. The first split either predicate
+// accepts is the one returned.
+//
+// A double-encoded "=" ("%253D") stays a known limit: it decodes once to "%3D",
+// so the path holds no literal "=", found is false, and the value keeps its
+// percent-encoding. It is not plaintext in the log, but it is recoverable by
+// decoding the line. found is false when no segment is accepted, and path is
+// then returned unchanged with an empty query half.
 func splitQueryDecodedIntoPath(path string) (routePath, queryText string, found bool) {
-	equalsAt := strings.IndexByte(path, '=')
-	if equalsAt < 0 {
-		return path, "", false
+	searchFrom := 0
+	for {
+		equalsAt := strings.IndexByte(path[searchFrom:], '=')
+		if equalsAt < 0 {
+			return path, "", false
+		}
+		equalsAt += searchFrom
+		// The segment holding this "=" is where that decoded query starts. The
+		// key name sits in that segment, so the query text keeps it.
+		segmentStart := strings.LastIndexByte(path[:equalsAt], '/') + 1
+		routePath = strings.TrimSuffix(path[:segmentStart], "/")
+		if routePath == "" {
+			// The query took the whole first segment, so no route precedes it. "/"
+			// says the request reached no route, which is what the log should show.
+			routePath = "/"
+		}
+		queryText = path[segmentStart:]
+		if relaycommon.IsPaymentCallbackPath(routePath) || relaycommon.IsPaymentCallbackQueryText(queryText) {
+			return routePath, queryText, true
+		}
+		searchFrom = equalsAt + 1
 	}
-	// The segment holding the first "=" is where the decoded query starts. The
-	// key name sits in that segment, so the query text keeps it.
-	segmentStart := strings.LastIndexByte(path[:equalsAt], '/') + 1
-	routePath = strings.TrimSuffix(path[:segmentStart], "/")
-	if routePath == "" {
-		// The query took the whole first segment, so no route precedes it. "/"
-		// says the request reached no route, which is what the log should show.
-		routePath = "/"
-	}
-	return routePath, path[segmentStart:], true
 }

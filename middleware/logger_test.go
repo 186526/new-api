@@ -106,6 +106,58 @@ func TestAccessLogDropsASignatureDecodedIntoAPaymentCallbackPath(t *testing.T) {
 	}
 }
 
+// TestAccessLogDropsASignatureBehindADecodedEqualsInAnEarlierSegment pins the
+// case a single split at the first "=" misses: when an earlier segment already
+// carries a decoded "=", splitting there leaves a route half without the
+// callback segment and a query half whose first key is that earlier name, so
+// both payment predicates read the target as ordinary and the signature reaches
+// the log verbatim. The helper has to look at every "="-bearing segment, not
+// only the first one.
+func TestAccessLogDropsASignatureBehindADecodedEqualsInAnEarlierSegment(t *testing.T) {
+	const canary = "EARLIEREQUALSIGNATUREVALUE"
+	for _, tc := range []struct{ name, raw, loggedPath string }{
+		{
+			"an equals-bearing segment before the callback segment",
+			"/api/user/epay/x%3Dy/notify/sign%3D" + canary,
+			"/api/user/epay/x=y/notify",
+		},
+		{
+			"an equals-bearing segment before a signature key",
+			"/files/a%3Db/sign%3D" + canary,
+			"/files/a=b",
+		},
+		{
+			"an equals-bearing segment before a signature word",
+			"/dashboard/x%3Dy/signature%3D" + canary,
+			"/dashboard/x=y",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			previousWriter := gin.DefaultWriter
+			var output bytes.Buffer
+			gin.DefaultWriter = &output
+			t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+			router := gin.New()
+			SetUpLogger(router)
+			router.POST("/api/user/epay/notify", func(c *gin.Context) { c.Status(http.StatusOK) })
+			router.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+			request := httptest.NewRequest(http.MethodPost, tc.raw, nil)
+			require.NotContains(t, request.URL.Path, "%3D",
+				"the escaped \"=\" is decoded into the path, which is the case under test")
+			require.Empty(t, request.URL.RawQuery)
+			router.ServeHTTP(httptest.NewRecorder(), request)
+
+			logged := strings.TrimSuffix(output.String(), "\n")
+			_, loggedPath, found := strings.Cut(logged, "POST ")
+			require.True(t, found)
+			assert.Equal(t, tc.loggedPath, loggedPath, "the query is dropped and the readable path stays")
+			assert.NotContains(t, logged, canary, "the signature may not reach the log")
+		})
+	}
+}
+
 // TestAccessLogDropsASignatureDecodedIntoAPathOnlyForAPaymentCallback pins what
 // the decoded-path guard must not change. The normal query form still drops the
 // query whole, a non-payment page keeps its readable query and masks only the
