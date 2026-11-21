@@ -1,6 +1,8 @@
 package deepseek
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http/httptest"
 	"strings"
@@ -358,6 +360,8 @@ func TestReasoningHistoryReplay(t *testing.T) {
 
 // The caller identity scopes the key: two callers that send the same prompt
 // cache key never share one, and one caller keeps a stable key per cache key.
+// A request naming no conversation gets no key, because one token is often
+// shared by many end users of one client application.
 func TestConversationKeyBindsTheCaller(t *testing.T) {
 	newContext := func(tokenId int) *gin.Context {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -372,8 +376,37 @@ func TestConversationKeyBindsTheCaller(t *testing.T) {
 	assert.NotEqual(t, keyA, conversationKey(second, "deepseek-flash", "session-a"))
 	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-flash", "session-b"))
 	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-v4-pro", "session-a"))
-	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-flash", ""))
-	assert.Equal(t, conversationKey(first, "deepseek-flash", ""), conversationKey(first, "deepseek-flash", ""))
+}
+
+// Without a prompt cache key or a session id the request names no conversation,
+// so it must neither read nor write: merging every end user of one token would
+// interleave their reasoning.
+func TestConversationKeySkipsRequestsWithoutAConversation(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	common.SetContextKey(c, rootconstant.ContextKeyTokenId, 11)
+	assert.Empty(t, conversationKey(c, "deepseek-flash", ""))
+	assert.Empty(t, conversationKey(c, "deepseek-flash", "   "))
+
+	c.Request.Header.Set("X-Session-Id", "session-from-header")
+	assert.NotEmpty(t, conversationKey(c, "deepseek-flash", ""))
+	assert.NotEqual(t, conversationKey(c, "deepseek-flash", ""), conversationKey(c, "deepseek-flash", "session-a"))
+}
+
+// A caller could reach a victim's key under the previous derivation by sending
+// "token:<victim>\x00<discriminator>" as the unvalidated prompt cache key, and
+// entries written then would still carry the TTL. The prefix names the version
+// so those entries are never read.
+func TestReasoningHistoryKeepsOldDerivationsOut(t *testing.T) {
+	assert.Equal(t, "deepseek:reasoning:v2:", reasoningHistoryKeyPrefix)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	common.SetContextKey(c, rootconstant.ContextKeyTokenId, 11)
+	victim := conversationKey(c, "deepseek-flash", "session-a")
+	poisoned := []byte("deepseek-flash\x00token:11\x00session-a")
+	sum := sha256.Sum256(poisoned)
+	assert.Equal(t, victim, hex.EncodeToString(sum[:16]), "the crafted cache key reproduces the victim's hash; only the prefix separates them")
 }
 
 func TestConversationKeyFallsBackToTheUserAndFailsClosed(t *testing.T) {

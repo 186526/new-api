@@ -15,7 +15,11 @@ import (
 )
 
 const (
-	reasoningHistoryKeyPrefix = "deepseek:reasoning:"
+	// The version keeps entries written by the previous derivation out of
+	// reach. That derivation hashed the client's prompt cache key unvalidated,
+	// so a caller could craft "token:<id>\x00<disc>" and land on the key a
+	// later caller gets; old entries under this prefix would feed them.
+	reasoningHistoryKeyPrefix = "deepseek:reasoning:v2:"
 	reasoningHistoryTTL       = 24 * time.Hour
 	// reasoningHistoryMaxEntries caps one stored history so a long agent
 	// session cannot grow the cache without bound. Older turns fall back to the
@@ -35,9 +39,11 @@ type reasoningHistory struct {
 
 // conversationKey identifies one client conversation without storing its
 // content. The caller identity scopes every key, so two callers that send the
-// same prompt cache key never read each other's stored history; the prompt
-// cache key or X-Session-Id only tells one caller's conversations apart. A
-// request without an identity gets no key, so nothing is read or written.
+// same prompt cache key never read each other's stored history. The prompt
+// cache key or X-Session-Id only tells one caller's conversations apart, and a
+// request that names neither conversation nor identity gets no key, so nothing
+// is read or written: one token is often shared by many end users of one
+// client application, and their turns must not merge.
 func conversationKey(c *gin.Context, modelName string, promptCacheKey string) string {
 	if c == nil {
 		return ""
@@ -49,6 +55,9 @@ func conversationKey(c *gin.Context, modelName string, promptCacheKey string) st
 	discriminator := strings.TrimSpace(promptCacheKey)
 	if discriminator == "" {
 		discriminator = strings.TrimSpace(c.GetHeader("X-Session-Id"))
+	}
+	if discriminator == "" {
+		return ""
 	}
 	sum := sha256.Sum256([]byte(modelName + "\x00" + identity + "\x00" + discriminator))
 	return hex.EncodeToString(sum[:16])
