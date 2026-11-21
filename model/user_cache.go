@@ -278,7 +278,18 @@ func GetUserCache(userId int) (*UserBase, error) {
 			common.SysLog(common.LogText("failed to synchronously populate user cache: %s", err.Error()))
 		}
 	}
-	return user.ToBaseUser(), nil
+	// The row this snapshot came from lags the debit the accumulator still owes
+	// it, so the balance handed back must be the one the wallet holds. Every
+	// caller of this function uses the value as spendable quota.
+	base := user.ToBaseUser()
+	balance, balanceErr := quotaBalanceHeldByAccumulator(userId, BatchUpdateTypeUserQuota, func() (int, error) {
+		return base.Quota, nil
+	})
+	if balanceErr != nil {
+		return nil, balanceErr
+	}
+	base.Quota = balance
+	return base, nil
 }
 
 func cacheGetUserBase(userId int) (*UserBase, error) {
@@ -322,16 +333,25 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 		return nil, fmt.Errorf("user cache integrity check failed")
 	}
 	// Quota is outside the metadata MAC, so the stored value is only a mirror.
-	// A hash carrying a valid ledger reports the balance the ledger implies;
-	// one that carries none or contradicts its signature reports the balance the
-	// database holds, never the mirror.
+	// A hash carrying a valid ledger reports the balance the ledger implies. One
+	// whose ledger is missing, forged or past its signed window must not report
+	// the row either, because under batch accumulation the row lags the spend the
+	// accumulator still owes it: a ledger one second past its window would hand
+	// back the whole pre-debit balance. The balance reported instead is the row
+	// plus that owed delta, read as one instant, and the caller that finds the
+	// ledger unusable republishes it rather than trusting either half.
 	balance, ledgerErr := userCache.verifiedQuotaLedger()
 	if ledgerErr != nil {
-		user, err := GetUserById(userId, false)
+		balance, err = quotaBalanceHeldByAccumulator(userId, BatchUpdateTypeUserQuota, func() (int, error) {
+			user, readErr := GetUserById(userId, false)
+			if readErr != nil {
+				return 0, readErr
+			}
+			return user.Quota, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		balance = user.Quota
 	}
 	userCache.Quota = balance
 	floor, err := getUserAuthVersionFloor(userId)

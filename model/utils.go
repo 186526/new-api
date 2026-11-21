@@ -22,11 +22,14 @@ const (
 )
 
 var batchUpdateStores []map[int]int
+var batchUpdateInFlight []map[int]int
 var batchUpdateLocks []sync.Mutex
+var batchUpdateFlushLock sync.Mutex
 
 func init() {
 	for range BatchUpdateTypeCount {
 		batchUpdateStores = append(batchUpdateStores, make(map[int]int))
+		batchUpdateInFlight = append(batchUpdateInFlight, make(map[int]int))
 		batchUpdateLocks = append(batchUpdateLocks, sync.Mutex{})
 	}
 }
@@ -62,7 +65,26 @@ func addNewRecord(type_ int, id int, value int) {
 }
 
 func batchUpdate() {
-	// check if there's any data to update
+	// One flush at a time, so the in-flight record below describes exactly one
+	// swap-and-write and never overlaps another flush's rows.
+	batchUpdateFlushLock.Lock()
+	defer batchUpdateFlushLock.Unlock()
+
+	stores, ok := takeBatchUpdateStores()
+	if !ok {
+		return
+	}
+	common.SysLog(common.LogText("batch update started"))
+	writeBatchUpdateStores(stores)
+	clearBatchUpdateInFlight()
+	common.SysLog(common.LogText("batch update finished"))
+}
+
+// takeBatchUpdateStores swaps the accumulators out and reports whether there was
+// anything to flush. The swapped-out maps are recorded as in flight in the same
+// critical section that empties them, so no reader observes an empty accumulator
+// and an empty in-flight record while the rows are still owed.
+func takeBatchUpdateStores() ([]map[int]int, bool) {
 	hasData := false
 	for i := range BatchUpdateTypeCount {
 		batchUpdateLocks[i].Lock()
@@ -73,20 +95,22 @@ func batchUpdate() {
 		}
 		batchUpdateLocks[i].Unlock()
 	}
-
 	if !hasData {
-		return
+		return nil, false
 	}
-
-	common.SysLog(common.LogText("batch update started"))
 	stores := make([]map[int]int, BatchUpdateTypeCount)
 	for i := range BatchUpdateTypeCount {
 		batchUpdateLocks[i].Lock()
 		stores[i] = batchUpdateStores[i]
+		batchUpdateInFlight[i] = stores[i]
 		batchUpdateStores[i] = make(map[int]int)
 		batchUpdateLocks[i].Unlock()
 	}
+	return stores, true
+}
 
+// writeBatchUpdateStores writes the swapped-out maps to their rows.
+func writeBatchUpdateStores(stores []map[int]int) {
 	for i, store := range stores {
 		if i == BatchUpdateTypeUserQuota || i == BatchUpdateTypeUsedQuota || i == BatchUpdateTypeRequestCount {
 			continue
@@ -121,7 +145,26 @@ func batchUpdate() {
 	for key := range userIDs {
 		updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
 	}
-	common.SysLog(common.LogText("batch update finished"))
+}
+
+// FlushBatchUpdates writes every accumulated delta to its row now. The periodic
+// updater calls this on its own schedule; an explicit call is for a caller that
+// needs the rows current before the next tick, and for shutting down without
+// leaving a delta unwritten.
+func FlushBatchUpdates() {
+	batchUpdate()
+}
+
+// clearBatchUpdateInFlight forgets the rows the flush just wrote. Until this
+// runs, the swapped-out maps are the only record that those rows still lag, so
+// a reservation in that window is refused rather than answered from a balance
+// the flush has not published yet.
+func clearBatchUpdateInFlight() {
+	for i := range BatchUpdateTypeCount {
+		batchUpdateLocks[i].Lock()
+		batchUpdateInFlight[i] = nil
+		batchUpdateLocks[i].Unlock()
+	}
 }
 
 func RecordExist(err error) (bool, error) {

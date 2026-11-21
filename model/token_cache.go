@@ -117,6 +117,21 @@ func cacheInitToken(token Token) (int, error) {
 			seedUsed = value
 		}
 	}
+	// Under batch accumulation the row the snapshot came from lags the spend the
+	// accumulator still owes it. Signing that row as the remainder would publish
+	// a ledger authorizing quota already spent, so the owed delta raises the
+	// signed used counter instead: granted never moves, the remainder the seed
+	// signs is the one the wallet holds.
+	snapshotRemain := int(granted - seedUsed)
+	liveRemain, balanceErr := quotaBalanceHeldByAccumulator(token.Id, BatchUpdateTypeTokenQuota, func() (int, error) {
+		return snapshotRemain, nil
+	})
+	if balanceErr != nil {
+		return 0, balanceErr
+	}
+	if liveRemain < snapshotRemain {
+		seedUsed += int64(snapshotRemain - liveRemain)
+	}
 	ledgerMAC, ledgerExp, ledgerErr := tokenQuotaLedgerSeedArgs(token.Key, token.Id,
 		granted, seedUsed, tokenCacheTTLSeconds())
 	if ledgerErr != nil {
@@ -227,6 +242,22 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if ledger, result, ledgerErr := verifiedTokenQuotaLedger(token.Id, key); result == cacheQuotaOK && ledgerErr == nil {
 		token.RemainQuota = int(ledger.granted - ledger.used)
 		token.UsedQuota = int(ledger.used)
+		return &token, nil
+	}
+	// The ledger is missing, forged or past its signed window. The mirror is the
+	// row as it was published, and under batch accumulation the row lags the
+	// spend the accumulator still owes it, so the mirror alone hands back quota
+	// already spent. The reported remainder is the mirror plus that owed delta,
+	// read as one instant.
+	balance, balanceErr := quotaBalanceHeldByAccumulator(token.Id, BatchUpdateTypeTokenQuota, func() (int, error) {
+		return token.RemainQuota, nil
+	})
+	if balanceErr != nil {
+		return nil, balanceErr
+	}
+	if token.RemainQuota != balance {
+		token.UsedQuota += token.RemainQuota - balance
+		token.RemainQuota = balance
 	}
 	return &token, nil
 }

@@ -1672,3 +1672,285 @@ func TestRowFirstDeltaOntoAStaleHashStillConverges(t *testing.T) {
 	assert.Equal(t, 50, row)
 	assert.Equal(t, row, balance, "both deltas landed once each")
 }
+
+// The r7 acceptance shape: the guard has to hold for the whole window, not for
+// one request. A retry, a second relay replica or a client that resends the same
+// call all arrive as a second request, and the first one discarded the hash on
+// its way out. Measured before the fix: step 1 refused and step 2 accepted the
+// whole pre-debit balance, leaving the row at -60 against a wallet holding 40.
+func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameReserve(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	for range 2 {
+		reserved, err := TryReserveUserQuota(user.Id, 30)
+		require.NoError(t, err)
+		require.True(t, reserved)
+	}
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the accumulator holds both spends")
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
+		"QuotaLedgerExp", int64(1)).Err())
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		reserved, err := TryReserveUserQuota(user.Id, 100)
+		assert.ErrorIs(t, err, errQuotaRowLagsDebit, "attempt %d must refuse", attempt)
+		assert.False(t, reserved, "attempt %d must not spend the pre-debit balance", attempt)
+		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "attempt %d must not move the row", attempt)
+	}
+
+	batchUpdate()
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+	reserved, err := TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 40, not 100")
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+}
+
+// The token twin: the mutation fence only hides this for ten seconds, and a
+// token whose hash was dropped any other way is not covered at all.
+func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameTokenReserve(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 30, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
+		"QuotaLedgerExp", int64(1)).Err())
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
+		assert.ErrorIs(t, err, errQuotaRowLagsDebit, "attempt %d must refuse", attempt)
+		assert.False(t, reserved, "attempt %d must not spend the pre-debit balance", attempt)
+		assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "attempt %d must not move the row", attempt)
+	}
+
+	batchUpdate()
+	assert.Equal(t, 70, getTokenFromDB(t, token.Id).RemainQuota)
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 70, not 100")
+}
+
+// A hash that is gone rather than expired is a different branch: no signature
+// fails, so no discard runs, and the miss used to hydrate straight from the row.
+// The PEXPIREAT cap now produces this by design at ledger expiry, and a Redis
+// restart produces it unconditionally.
+func TestBatchVanishedHashDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	reserved, err := TryReserveUserQuota(user.Id, 60)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a vanished hash cannot make the row the authority")
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no row spend either")
+
+	// The refusal is not one-shot: the miss repeats on every attempt.
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	batchUpdate()
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 40")
+}
+
+// The token twin of the vanished hash.
+func TestBatchVanishedTokenHashDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 30, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheKey(token.Key)).Err())
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+
+	batchUpdate()
+	assert.Equal(t, 70, getTokenFromDB(t, token.Id).RemainQuota)
+}
+
+// The flush window: batchUpdate swaps the accumulator out before it writes the
+// rows, so for the length of one flush the map is empty while the row still lags.
+// A guard that only reads the accumulator reads "nothing pending" and authorizes
+// the pre-debit balance. The window is driven through the two phases directly
+// because the real flush is not interruptible from a test.
+func TestBatchFlushWindowDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	reserved, err := TryReserveUserQuota(user.Id, 60)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	batchUpdateFlushLock.Lock()
+	stores, ok := takeBatchUpdateStores()
+	require.True(t, ok)
+	batchUpdateFlushLock.Unlock()
+
+	// The accumulator is now empty and the row has not been written.
+	require.Empty(t, batchUpdateStores[BatchUpdateTypeUserQuota])
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a mid-flush row cannot answer")
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	writeBatchUpdateStores(stores)
+	clearBatchUpdateInFlight()
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 40")
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the wallet is funded, not blocked")
+}
+
+// A signed ledger whose window has closed still describes the layout, so no
+// signature check fails: only the expiry does. Replacing its balance with the
+// row's is what hands back the pre-debit balance. Produced without an attacker:
+// a metadata write near expiry refreshes only CacheExpiresAt.
+func TestExpiredButGenuinelySignedLedgerDoesNotAnswerFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	reserved, err := TryReserveUserQuota(user.Id, 10)
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	// Move the signed window into the past and re-sign, so the signature matches.
+	expiresAt := time.Now().Add(-time.Second).UnixMilli()
+	mac, err := (UserBase{
+		Id: user.Id, AuthVersion: user.AuthVersion, CacheSchema: userCacheSchemaVersion,
+		QuotaCredited: 100, QuotaSpent: 10, QuotaLedgerExp: expiresAt,
+	}).quotaLedgerMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
+		"QuotaCredited", 100, "QuotaSpent", 10, "QuotaLedgerExp", expiresAt, "QuotaLedgerMAC", mac).Err())
+
+	reserved, err = TryReserveUserQuota(user.Id, 95)
+	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a closed window cannot fall back to the pre-debit row")
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	// The read path must not report 100 either: that value feeds the trust bypass.
+	balance, readErr := GetUserQuota(user.Id, false)
+	require.NoError(t, readErr)
+	assert.Equal(t, 90, balance, "the reader reports the live balance, not the row or the stale ledger")
+
+	batchUpdate()
+	assert.Equal(t, 90, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 95)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row funds 90")
+}
+
+// A row-first caller hands the committed delta to the ledger. A Redis that
+// refuses the script reports a miss with an error attached; treating that as
+// success tells the caller the delta landed while nothing moved, and the row
+// then lags its own commit. Measured before the fix: a wallet at 100 with the
+// row debited to 60 and a Redis error left the caller reading success, after
+// which a reserve of 100 was accepted and took the row to -40.
+func TestRowFirstDeltaReportsARedisErrorInsteadOfSwallowingIt(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+		Update("quota", gorm.Expr("quota + ?", -40)).Error)
+	server.SetError("LOADING Redis is loading the dataset in memory")
+
+	err := syncRowCommittedUserQuota(user.Id, -40)
+	assert.Error(t, err, "a delta that could not be applied is not reported as success")
+}
+
+// The read path under batch accumulation: a ledger that is present but past its
+// window must not be replaced by the row. Measured before the fix, wallet 100
+// with two accumulated spends of 30 read 100 back instead of 40, and that value
+// feeds the trust bypass.
+func TestReadAfterLedgerExpiryHoldsTheLiveBalance(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	for range 2 {
+		reserved, err := TryReserveUserQuota(user.Id, 30)
+		require.NoError(t, err)
+		require.True(t, reserved)
+	}
+
+	live, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	require.Equal(t, 40, live, "the ledger holds the live balance")
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
+		"QuotaLedgerExp", int64(1)).Err())
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 40, balance, "the closed window reports the live balance, not the pre-debit row")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the row has not been flushed")
+
+	batchUpdate()
+	balance, err = GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 40, balance, "and the flushed row agrees")
+}

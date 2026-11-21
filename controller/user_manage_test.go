@@ -55,6 +55,12 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	common.SetDatabaseTypes(databaseTypes[dialect], databaseTypes[dialect])
 
 	t.Cleanup(func() {
+		// A batch accumulator entry is keyed by subject id, and each case here
+		// gets a fresh database, so a delta left queued for user 1 in one case
+		// would describe a row in the next case's database. Flushing while the
+		// database still points at the rows these deltas belong to keeps the two
+		// apart.
+		model.FlushBatchUpdates()
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled, common.SessionSecret = previousRedisEnabled, previousSecret
 		common.SetDatabaseTypes(previousMainDatabaseType, previousLogDatabaseType)
@@ -624,8 +630,10 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			// reservation: money already taken out of the cached balance that the
 			// database has not seen yet. The signed ledger is the only thing that
 			// records it, so the reservation is made through the real path rather
-			// than by rewriting the mirror, which the ledger ignores.
-			if tc.cached != tc.before {
+			// than by rewriting the mirror, which the ledger ignores. A case that
+			// names no cached balance is not modelling a reservation at all, so
+			// none is made; a zero here would otherwise be read as a full one.
+			if tc.cached > 0 && tc.cached != tc.before {
 				reserved, err := model.TryReserveUserQuota(user.Id, tc.before-tc.cached)
 				require.NoError(t, err)
 				require.True(t, reserved)
