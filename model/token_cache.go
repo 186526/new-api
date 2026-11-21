@@ -69,6 +69,18 @@ func invalidateTokenCacheForMutation(key string) error {
 // verification. Existing quota counters survive repairs because pre-consume
 // can update Redis before the database catches up; counters that are no
 // longer integers are replaced from the snapshot.
+//
+// The quota ledger is seeded from the snapshot, never from the counters already
+// in the hash: the metadata MAC covers neither RemainQuota nor UsedQuota, so a
+// writer with Redis access can raise them without breaking it, and seeding from
+// them would sign the forgery. A hash that predates the ledger therefore gets
+// its counters reset to the snapshot once. A hash whose live counter is already
+// above the snapshot keeps it and is signed at that counter, so an unflushed
+// batch spend is neither lost nor signed under a baseline it does not match.
+//
+// The counters are compared as decimal strings and the remainder is derived
+// with HINCRBY, because a sum near the wallet ceiling loses its last digit when
+// Lua holds it as a double.
 // Returns 0 when fenced, 1 after initialization, or 2 for an existing hash.
 func cacheInitToken(token Token) (int, error) {
 	if !common.RedisEnabled {
@@ -93,12 +105,44 @@ func cacheInitToken(token Token) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	const script = `
+	granted := int64(token.RemainQuota) + int64(token.UsedQuota)
+	ledgerMAC, ledgerExp, ledgerErr := tokenQuotaLedgerSeedArgs(token.Key, token.Id,
+		granted, int64(token.UsedQuota), tokenCacheTTLSeconds())
+	if ledgerErr != nil {
+		ledgerMAC = ""
+	}
+	const script = quotaLedgerLuaHelpers + `
+local args = cjson.decode(ARGV[23])
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return 0
 end
+local seedLedger = function()
+  if args.seed.mac == '' or redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
+    return
+  end
+  local used = args.seed.usedBase
+  local liveUsed = redis.call('HGET', KEYS[1], 'UsedQuota')
+  local liveSign, liveDigits = magnitude(liveUsed)
+  local baseSign, baseDigits = magnitude(used)
+  local grantedSign, grantedDigits = magnitude(args.seed.granted)
+  if liveSign ~= nil and liveSign ~= '-' and baseSign ~= nil and grantedSign ~= nil
+    and compareMagnitude(liveDigits, baseDigits) > 0
+    and compareMagnitude(liveDigits, grantedDigits) <= 0 then
+    used = liveUsed
+  end
+  -- QuotaUsedBase keeps the baseline the signature covers; only the unsigned
+  -- counters move to the live value, so an unflushed batch spend is neither
+  -- lost nor signed under a baseline that does not match. The remainder is
+  -- derived with HINCRBY because Lua would round a sum near 2^53.
+  redis.call('HSET', KEYS[1],
+    'QuotaGranted', args.seed.granted, 'QuotaUsedBase', args.seed.usedBase, 'UsedQuota', used,
+    'RemainQuota', args.seed.granted,
+    'QuotaLedgerMAC', args.seed.mac, 'QuotaLedgerExp', args.seed.expiresAt)
+  redis.call('HINCRBY', KEYS[1], 'RemainQuota', '-' .. used)
+end
 local exists = redis.call('EXISTS', KEYS[1])
 if exists == 1 and (ARGV[21] ~= 'true' or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[22]) then
+  seedLedger()
   redis.call('EXPIRE', KEYS[1], ARGV[18])
   return 2
 end
@@ -115,12 +159,29 @@ for _, counter in ipairs({{'AccessedTime', ARGV[6]}, {'RemainQuota', ARGV[15]}, 
     redis.call('HSET', KEYS[1], counter[1], counter[2])
   end
 end
+seedLedger()
 redis.call('EXPIRE', KEYS[1], ARGV[18])
 if exists == 1 then
   return 2
 end
 return 1`
 
+	ledgerArgs, err := common.Marshal(struct {
+		Seed struct {
+			Granted   string `json:"granted"`
+			UsedBase  string `json:"usedBase"`
+			ExpiresAt string `json:"expiresAt"`
+			MAC       string `json:"mac"`
+		} `json:"seed"`
+	}{struct {
+		Granted   string `json:"granted"`
+		UsedBase  string `json:"usedBase"`
+		ExpiresAt string `json:"expiresAt"`
+		MAC       string `json:"mac"`
+	}{ledgerDecimal(granted), ledgerDecimal(int64(token.UsedQuota)), ledgerDecimal(ledgerExp), ledgerMAC}})
+	if err != nil {
+		return 0, err
+	}
 	return common.RDB.Eval(context.Background(), script, []string{
 		cacheKey, getTokenCacheFenceKey(token.Key),
 	},
@@ -132,6 +193,7 @@ return 1`
 		strconv.FormatBool(token.AllowUserQuotaQuery),
 		tokenCacheTTLSeconds(),
 		token.CacheExpiresAt, mac, strconv.FormatBool(repair), existing.CacheMAC,
+		string(ledgerArgs),
 	).Int()
 }
 

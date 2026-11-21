@@ -594,7 +594,16 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			oldRDB := common.RDB
 			common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
 			common.RedisEnabled = true
-			t.Cleanup(func() { _ = common.RDB.Close(); common.RDB = oldRDB })
+			previousBatch := common.BatchUpdateEnabled
+			// Batch updates keep an outstanding reservation in the cache alone,
+			// which is the state these cases model: the database still shows the
+			// pre-reservation balance.
+			common.BatchUpdateEnabled = true
+			t.Cleanup(func() {
+				common.BatchUpdateEnabled = previousBatch
+				_ = common.RDB.Close()
+				common.RDB = oldRDB
+			})
 			user := model.User{Username: "cached-quota", Quota: tc.before, AuthVersion: 1}
 			require.NoError(t, db.Create(&user).Error)
 			cache, err := model.GetUserCache(user.Id)
@@ -611,7 +620,21 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 				}
 			}
 			require.NotEmpty(t, quotaKey)
-			server.HSet(quotaKey, "Quota", strconv.Itoa(tc.cached))
+			// The scenarios where the cache lags the database model an outstanding
+			// reservation: money already taken out of the cached balance that the
+			// database has not seen yet. The signed ledger is the only thing that
+			// records it, so the reservation is made through the real path rather
+			// than by rewriting the mirror, which the ledger ignores.
+			if tc.cached != tc.before {
+				reserved, err := model.TryReserveUserQuota(user.Id, tc.before-tc.cached)
+				require.NoError(t, err)
+				require.True(t, reserved)
+				assert.Equal(t, tc.cached, func() int {
+					cachedUser, err := model.GetUserCache(user.Id)
+					require.NoError(t, err)
+					return cachedUser.Quota
+				}())
+			}
 			if tc.missingCache {
 				server.Del(quotaKey)
 			}
@@ -637,7 +660,11 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 					assert.Equal(t, strconv.Itoa(tc.after), server.HGet(quotaKey, "Quota"))
 				}
 			} else if !tc.failCache {
-				assert.Equal(t, strconv.Itoa(tc.wantCached), server.HGet(quotaKey, "Quota"))
+				// The mirror is no longer authoritative on its own; it is checked
+				// against the signed ledger, which must report the expected balance.
+				cachedUser, err := model.GetUserCache(user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, tc.wantCached, cachedUser.Quota)
 			}
 		})
 	}

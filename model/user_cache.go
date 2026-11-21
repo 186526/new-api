@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -12,13 +13,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const userCacheSchemaVersion = 2
+// userCacheSchemaVersion 3 adds the signed quota ledger described on UserBase;
+// a hash written under version 2 carries none and is reloaded from the database.
+const userCacheSchemaVersion = 3
 
+// UserBase is the cached user snapshot. Quota is a mirror of the signed quota
+// ledger, never an authority: a writer holding only Redis access can set the
+// mirror to anything. The ledger is
+//
+//	QuotaCredited  every quota credited into the hash since it was published
+//	QuotaSpent     every quota reserved out of it; moves on each reservation
+//	QuotaSpentBase QuotaSpent when the ledger was last signed
+//
+// and Quota = QuotaCredited - QuotaSpent. The ledger MAC covers the identity,
+// the authentication version and the two fields that only a credit or an
+// exhausted reservation changes, so a reservation can move QuotaSpent without
+// re-signing. The script refuses a counter below QuotaSpentBase or above
+// QuotaCredited, which are both signed.
 type UserBase struct {
 	Id             int    `json:"id"`
 	Group          string `json:"group"`
 	Email          string `json:"email"`
 	Quota          int    `json:"quota"`
+	QuotaCredited  int64  `json:"-"`
+	QuotaSpent     int64  `json:"-"`
+	QuotaSpentBase int64  `json:"-"`
+	QuotaLedgerMAC string `json:"-"`
+	QuotaLedgerExp int64  `json:"-"`
 	Status         int    `json:"status"`
 	Role           int    `json:"role"`
 	Username       string `json:"username"`
@@ -29,8 +50,59 @@ type UserBase struct {
 	CacheMAC       string `json:"-"`
 }
 
+// quotaLedgerMAC signs the fields a reservation must trust. It binds the user,
+// the authentication version and the two fields a reservation may not move,
+// together with the expiry, which every write advances so a copy taken earlier
+// always presents an expiry the live hash has already passed.
+func (user UserBase) quotaLedgerMAC() (string, error) {
+	return authCacheMAC(getUserCacheKey(user.Id), struct {
+		Id             int
+		AuthVersion    int64
+		CacheSchema    int
+		QuotaCredited  int64
+		QuotaSpentBase int64
+		ExpiresAt      int64
+	}{user.Id, user.AuthVersion, user.CacheSchema, user.QuotaCredited, user.QuotaSpentBase, user.QuotaLedgerExp})
+}
+
+// verifiedQuotaLedger checks the ledger this hash carries and returns the
+// balance it implies. A hash whose ledger is missing, expired, forged or
+// self-contradictory is not usable for a spend.
+func (user UserBase) verifiedQuotaLedger() (int, error) {
+	if user.QuotaLedgerMAC == "" {
+		return 0, fmt.Errorf("%w: the hash carries no quota ledger", ErrQuotaLedgerUnverified)
+	}
+	if user.QuotaLedgerExp <= time.Now().UnixMilli() {
+		return 0, fmt.Errorf("%w: the quota ledger signature has expired", ErrQuotaLedgerUnverified)
+	}
+	mac, err := user.quotaLedgerMAC()
+	if err != nil {
+		return 0, err
+	}
+	if !validAuthCacheMAC(mac, user.QuotaLedgerMAC, user.QuotaLedgerExp) {
+		return 0, fmt.Errorf("%w: the quota ledger signature does not match", ErrQuotaLedgerUnverified)
+	}
+	if user.QuotaSpentBase < 0 || user.QuotaSpent < user.QuotaSpentBase {
+		return 0, fmt.Errorf("%w: the quota ledger counters contradict each other", ErrQuotaLedgerUnverified)
+	}
+	// QuotaCredited may be negative and QuotaSpent may exceed it: both describe a
+	// wallet in debt, which is a balance it can hold but not spend from. The
+	// difference is the balance either way.
+	return int(user.QuotaCredited - user.QuotaSpent), nil
+}
+
+// cacheMAC signs everything a reader trusts except Quota and the ledger: both
+// move between signatures (Quota mirrors the ledger, QuotaSpent advances on
+// every reservation), so signing them would invalidate the hash on the first
+// spend, and the following miss would reload a balance the batch accumulator
+// has not flushed yet.
 func (user UserBase) cacheMAC() (string, error) {
 	user.Quota = 0
+	user.QuotaCredited = 0
+	user.QuotaSpent = 0
+	user.QuotaSpentBase = 0
+	user.QuotaLedgerMAC = ""
+	user.QuotaLedgerExp = 0
 	return authCacheMAC(getUserCacheKey(user.Id), struct {
 		User           UserBase
 		AuthVersion    int64
@@ -80,11 +152,18 @@ func invalidateUserCache(userId int) error {
 	return common.RedisDelKey(getUserCacheKey(userId))
 }
 
+// populateUserCache publishes the database snapshot with its quota balance and,
+// because the database is authoritative at that moment, the ledger that makes
+// the balance spendable. A hash that already carries a ledger keeps it: only a
+// publish with no ledger before it derives one from the balance.
 func populateUserCache(user User) error {
 	if !common.RedisEnabled {
 		return nil
 	}
-	return writeUserCache(user.ToBaseUser(), true)
+	if err := writeUserCache(user.ToBaseUser(), true); err != nil {
+		return err
+	}
+	return seedUserQuotaLedger(user.Id, user.Quota, user.AuthVersion)
 }
 
 // updateUserCache refreshes non-quota user cache fields.
@@ -144,6 +223,19 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if err != nil || !validAuthCacheMAC(mac, userCache.CacheMAC, userCache.CacheExpiresAt) {
 		return nil, fmt.Errorf("user cache integrity check failed")
 	}
+	// Quota is outside the metadata MAC, so the stored value is only a mirror.
+	// A hash carrying a valid ledger reports the balance the ledger implies;
+	// one that carries none or contradicts its signature reports the balance the
+	// database holds, never the mirror.
+	balance, ledgerErr := userCache.verifiedQuotaLedger()
+	if ledgerErr != nil {
+		user, err := GetUserById(userId, false)
+		if err != nil {
+			return nil, err
+		}
+		balance = user.Quota
+	}
+	userCache.Quota = balance
 	floor, err := getUserAuthVersionFloor(userId)
 	if err != nil {
 		return nil, err
@@ -190,6 +282,8 @@ func getUserGroupCache(userId int) (string, error) {
 	return cache.Group, nil
 }
 
+// getUserQuotaCache answers the wallet balance from the cache, which reports the
+// signed ledger's balance rather than the Quota mirror (see cacheGetUserBase).
 func getUserQuotaCache(userId int) (int, error) {
 	if RegionEnabled() {
 		return regionLeaseAvailable(RegionSubjectUser, strconv.Itoa(userId))

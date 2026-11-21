@@ -292,7 +292,12 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 				require.NoError(t, err)
 				cachedUser, err := cacheGetUserBase(user.Id)
 				require.NoError(t, err)
-				assert.Equal(t, user.Quota, cachedUser.Quota)
+				// The unreadable mirror is repaired from the snapshot, but it is a
+				// mirror: the reported balance is the one the signed ledger implies,
+				// which still holds the 70 already spent and the snapshot does not.
+				assert.Equal(t, "100", cacheQuotaField(t, getUserCacheKey(user.Id), "Quota"),
+					"the non-integer mirror is replaced from the snapshot")
+				assert.Equal(t, 30, cachedUser.Quota, "the signed ledger stays the authority on the balance")
 				cachedToken, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
 				assert.Equal(t, token.RemainQuota, cachedToken.RemainQuota)
