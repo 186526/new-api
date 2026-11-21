@@ -39,9 +39,10 @@ func setupMistralBalanceTest(t *testing.T) {
 // newMistralConsoleServer answers both allowance sources with one merged
 // allowance used at percentage percent of limit dollars: the public billing
 // endpoint for the channel key, which the balance path reads first, and the
-// console trpc endpoint for a cookie, which is the fallback of an account that
-// names no key. The key endpoint is answered with its own two-sided shape, so a
-// test drives the source the balance path actually reads.
+// console trpc endpoint for a cookie, which is the fallback for an entry that
+// carries one and also what a key the billing endpoint refuses falls through to.
+// The key endpoint is answered with its own two-sided shape, so a test drives the
+// source the balance path actually reads.
 func newMistralConsoleServer(t *testing.T, percentage float64, limit float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

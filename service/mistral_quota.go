@@ -18,7 +18,8 @@ const (
 	// The console bills Vibe and Studio from one monthly allowance and answers it
 	// as structured JSON over trpc, so a session cookie reads the percentage and
 	// the plan amount from one request without parsing a page. It is the fallback
-	// of an account that names no key.
+	// for an entry that carries a cookie, which is also where a key the billing
+	// endpoint refuses falls through.
 	defaultMistralAdminBaseURL = "https://admin.mistral.ai"
 	mistralConsoleBudgetPath   = "/api/trpc/billing.budget"
 	mistralConsoleReferer      = "/subscription"
@@ -58,8 +59,9 @@ const (
 // MistralQuotaAccount is one Mistral subscription. The public billing endpoint
 // reports the merged monthly allowance to an API key, and Mistral no longer
 // renders that allowance to a console session, so a key is the credential that
-// reads it and the browser session cookie is only a fallback for an account that
-// names no key. The two configured keys belong to the account entry, while
+// reads it and the browser session cookie is the fallback for an entry that
+// carries one, which is also where a key the billing endpoint refuses falls
+// through. The two configured keys belong to the account entry, while
 // ChannelKey is filled in when the channel is known, so a rotated channel key
 // decides the allowance of the channel that carries it.
 type MistralQuotaAccount struct {
@@ -188,7 +190,8 @@ func LoadMistralQuotaAccounts() ([]MistralQuotaAccount, error) {
 
 // MistralQuotaClient reads the monthly allowance of an account: from the public
 // billing endpoint with an API key, and from the console trpc endpoint or the
-// Vibe app with a session cookie for an account that names no key.
+// Vibe app with a session cookie for an entry that carries one, which is also
+// where a key the billing endpoint refuses falls through.
 type MistralQuotaClient struct {
 	AdminBaseURL string
 	VibeBaseURL  string
@@ -264,7 +267,8 @@ func (c *MistralQuotaClient) Fetch(ctx context.Context, account MistralQuotaAcco
 // answered with 200 and the login page, so the cookie cannot be trusted to
 // report it. The console trpc endpoint, which carries the plan amount, and the
 // Vibe app, which carries the percentage alone, stay as the fallbacks for an
-// account that names no key. A source that answers 401 or 403 for the key, or a
+// entry that carries a cookie, which is also where a key the billing endpoint
+// refuses falls through. A source that answers 401 or 403 for the key, or a
 // login redirect for the cookie, falls through to the next source instead of
 // being reported as the allowance.
 func (c *MistralQuotaClient) allowanceSources(account MistralQuotaAccount) []func(context.Context, MistralQuotaAccount) (*MistralBudget, bool, error) {
