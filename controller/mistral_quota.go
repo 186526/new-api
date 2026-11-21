@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -37,6 +40,7 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 
 	client := service.NewMistralQuotaClient()
 	result := mistralQuotaRefreshResult{}
+	missing := newMistralMissingChannels(accounts)
 	for _, account := range accounts {
 		quota, err := client.Fetch(context.Background(), account)
 		if err != nil {
@@ -56,12 +60,86 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 		// The channel balance shows the allowance the channel key consumes, and
 		// the balance sweep skips a disabled channel, so it is refreshed here for
 		// every configured channel instead.
-		if err := refreshMistralChannelBalance(account, quota); err != nil {
-			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, err))
+		stored, channels, balanceErr := refreshMistralChannelBalance(account, quota)
+		missing.recordBalance(account.Channel, stored, channels, balanceErr)
+		if balanceErr != nil {
+			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, balanceErr))
 		}
 		time.Sleep(common.RequestInterval)
 	}
+	missing.logOnce()
 	return result
+}
+
+// mistralMissingChannels collects the configured accounts whose allowance could
+// not be stored because no channel carries their name. The accounts are known
+// before the channels are read, so a failure to read the channels does not turn
+// every account into a missing channel.
+type mistralMissingChannels struct {
+	names           map[string]struct{}
+	absent          []string
+	mistralChannels []string
+	loadError       string
+}
+
+func newMistralMissingChannels(accounts []service.MistralQuotaAccount) *mistralMissingChannels {
+	missing := &mistralMissingChannels{names: make(map[string]struct{}, len(accounts))}
+	for _, account := range accounts {
+		missing.names[account.Channel] = struct{}{}
+	}
+	return missing
+}
+
+// recordBalance notes how storing the balance of an account went: the Mistral
+// channels that were read, the account among them that has no channel, and the
+// error that kept the balance from being stored. A name that is not a configured
+// account is ignored, so only the quota configuration can add an account to the
+// list.
+func (m *mistralMissingChannels) recordBalance(account string, stored bool, channels []string, loadErr error) {
+	if loadErr != nil {
+		m.loadError = loadErr.Error()
+	}
+	if len(channels) > 0 {
+		m.mistralChannels = channels
+	}
+	if stored {
+		return
+	}
+	if _, ok := m.names[account]; ok {
+		m.absent = append(m.absent, account)
+	}
+}
+
+// logOnce writes one line for the accounts that have no channel. The line is
+// written when a refresh first finds them and again only when the report
+// changes: a channel deleted by mistake is reported again after the channel list
+// is edited or read again, and a missing account does not hide the lines of the
+// other accounts, because their balance line keeps its place in the log.
+func (m *mistralMissingChannels) logOnce() {
+	if len(m.absent) == 0 {
+		return
+	}
+	slices.Sort(m.absent)
+	slices.Sort(m.mistralChannels)
+	absent := slices.Compact(slices.Clone(m.absent))
+	report := strings.Join(absent, ", ") + "|" +
+		strings.Join(slices.Compact(m.mistralChannels), ", ") + "|" + m.loadError
+	mistralMissingChannelLog.mu.Lock()
+	defer mistralMissingChannelLog.mu.Unlock()
+	if mistralMissingChannelLog.reported == report {
+		return
+	}
+	mistralMissingChannelLog.reported = report
+	common.SysLog(common.LogText(
+		"no Mistral channel carries the name of the configured quota accounts %s, so their allowance is published without a channel balance",
+		strings.Join(absent, ", ")))
+}
+
+// mistralMissingChannelLog holds the report of the last logged line, so the next
+// refresh only logs a report that changed.
+var mistralMissingChannelLog struct {
+	mu       sync.Mutex
+	reported string
 }
 
 // mistralQuotaWindows lists every allowance the console reported, so the

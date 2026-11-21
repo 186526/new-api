@@ -30,20 +30,29 @@ func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 
 // refreshMistralChannelBalance stores the allowance of a channel whose quota was
 // already fetched by the quota refresh, so the balance does not depend on the
-// channel balance sweep, which only visits enabled channels.
-func refreshMistralChannelBalance(account service.MistralQuotaAccount, quota *service.MistralQuota) error {
+// channel balance sweep, which only visits enabled channels. It reports whether a
+// channel carries the account name, and the names of the Mistral channels it
+// read: the quota refresh records an account without a channel, and writes its
+// log line once per configuration rather than per tick.
+func refreshMistralChannelBalance(account service.MistralQuotaAccount, quota *service.MistralQuota) (stored bool, mistralChannels []string, err error) {
 	channels, err := model.GetAllChannels(0, 0, true, true)
 	if err != nil {
-		return err
+		return false, nil, err
 	}
 	for _, channel := range channels {
-		if channel.Type != constant.ChannelTypeMistral || channel.Name != account.Channel {
+		if channel.Type != constant.ChannelTypeMistral {
 			continue
 		}
-		_, err = applyMistralChannelBalance(channel, account, quota)
-		return err
+		mistralChannels = append(mistralChannels, channel.Name)
+		if channel.Name != account.Channel {
+			continue
+		}
+		if _, err := applyMistralChannelBalance(channel, account, quota); err != nil {
+			return false, mistralChannels, err
+		}
+		return true, mistralChannels, nil
 	}
-	return common.NewMessage(fmt.Sprintf("no Mistral channel is named %q", account.Channel))
+	return false, mistralChannels, nil
 }
 
 // applyMistralChannelBalance picks the allowance the channel key consumes and
