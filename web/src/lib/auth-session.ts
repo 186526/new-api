@@ -147,6 +147,28 @@ function isAuthTokenRotation(value: unknown): value is AuthTokenRotation {
   )
 }
 
+const sessionChangeListeners = new Set<(sid: string | null) => void>()
+
+/**
+ * Run `listener` after a session change has fully landed in the store.
+ *
+ * The store subscription fires *inside* `setBundle`, so a listener registered
+ * there sees the new state but cannot tell whether a request it starts will be
+ * served from the entry it is about to invalidate. This hook runs after
+ * `applyAuthBundle` returns, which is after the token is readable.
+ *
+ * `synchronizeTabs = false` marks a credential rotation for the same session;
+ * it is not a session change, so listeners do not run.
+ */
+export function subscribeAuthSessionChange(
+  listener: (sid: string | null) => void
+): () => void {
+  sessionChangeListeners.add(listener)
+  return () => {
+    sessionChangeListeners.delete(listener)
+  }
+}
+
 export function applyAuthBundle(
   bundle: AuthBundle,
   synchronizeTabs = true
@@ -154,8 +176,20 @@ export function applyAuthBundle(
   const previousSID = useAuthStore.getState().auth.session?.sid
   authEpoch += 1
   useAuthStore.getState().auth.setBundle(bundle)
-  if (synchronizeTabs && previousSID !== bundle.session.sid) {
+  if (previousSID === bundle.session.sid) return
+
+  if (synchronizeTabs) {
     publishAuthSessionEvent('authenticated', bundle.session.sid)
+  }
+  for (const listener of sessionChangeListeners) {
+    listener(bundle.session.sid)
+  }
+}
+
+/** Tell the listeners that `sid`'s session ended, after the store was reset. */
+function publishSessionEnded(): void {
+  for (const listener of sessionChangeListeners) {
+    listener(null)
   }
 }
 
@@ -194,6 +228,7 @@ export function clearAuthentication(
   if (synchronizeTabs && sid) {
     publishAuthSessionEvent('signed_out', sid)
   }
+  if (sid) publishSessionEnded()
 }
 
 export function clearAuthenticatedClientState(
@@ -204,50 +239,73 @@ export function clearAuthenticatedClientState(
   clearAuthentication(synchronizeTabs)
 }
 
-let registeredSessionSID: string | null = null
+let seenSessionSID: string | null = null
 let sessionCacheSubscription: (() => void) | null = null
 
 /**
- * Clear the query cache whenever the dashboard session id changes.
+ * Keep the query cache and the persisted status snapshot in step with the
+ * dashboard session.
  *
  * This lives at module scope, not in a React effect, because the first
  * `/api/status` read happens before any component mounts: `main.tsx` primes
  * `['status']` at module evaluation, and the root route resolves the refresh
- * cookie in `beforeLoad`. A reloading signed-in visitor therefore stores the
- * anonymous variant of `/api/status` — no `SidebarModulesAdmin` — into a cache
- * entry that stays fresh for five minutes. A subscriber installed by a mounted
- * component is registered after that resolution and never observes the change,
- * so the admin sidebar gates stay fail-open for the whole session.
+ * cookie in `beforeLoad`. A reloading signed-in visitor therefore caches the
+ * anonymous variant of `/api/status`, which carries no `SidebarModulesAdmin`;
+ * the nav gates read "unset" and fail open for as long as that variant lives.
  *
- * Registered from `main.tsx` right after `createRouter`, which runs before the
- * router resolves the first route. Replacing the RootComponent effect with a
- * module subscription also makes the reset independent of which route renders:
- * any route mounting a status consumer would otherwise decide whether stale
- * credentials survive.
+ * Two orderings have to be covered, and a store subscription alone covers only
+ * the second:
+ * - The anonymous read is still in flight when the session lands. Clearing
+ *   destroys the query, which cancels that request without writing anything, so
+ *   the entry would stay empty. The session-change hook therefore reads status
+ *   again once the token is readable, and that read carries `Authorization`.
+ * - The anonymous variant already sits in the cache. The same re-read starts
+ *   from an emptied cache and refills it.
+ *
+ * `reloadStatus` is passed in rather than imported: `lib/status-query` reaches
+ * this module through `lib/api`, so importing it back would close the cycle. It
+ * must be the status-query reader, not a bare request, because the sidebar
+ * gates read the snapshot that reader persists.
+ *
+ * Signed out, only the clear runs. Nothing re-reads status for a session that
+ * has just ended.
+ *
+ * Registered from `main.tsx` right after `createRouter`, before the router
+ * resolves the first route, so the reset does not depend on which route mounts.
  *
  * Returns an unsubscribe function; calling it also drops the remembered session
  * so a later re-registration re-baselines instead of clearing once.
  */
 export function subscribeSignedInCacheReset(
-  queryClient: QueryClient
+  queryClient: QueryClient,
+  reloadStatus: (queryClient: QueryClient) => Promise<unknown>
 ): () => void {
   sessionCacheSubscription?.()
-  registeredSessionSID = useAuthStore.getState().auth.session?.sid ?? null
+  seenSessionSID = useAuthStore.getState().auth.session?.sid ?? null
 
-  const unsubscribe = useAuthStore.subscribe((state) => {
+  const unsubscribeStore = useAuthStore.subscribe((state) => {
     const sid = state.auth.session?.sid ?? null
-    if (sid === registeredSessionSID) return
-    registeredSessionSID = sid
-    // An empty cache only describes the credentials it was filled with, so
-    // the session change invalidates all of it. The next status read then
-    // reaches the network with whatever credential the new session sent.
+    if (sid === seenSessionSID) return
+    seenSessionSID = sid
+    // A cache filled under one credential says nothing about another, so the
+    // whole of it goes. This also cancels reads still in flight under the old
+    // credential; the change hook below replaces the one that matters.
     queryClient.clear()
   })
 
+  const unsubscribeChange = subscribeAuthSessionChange((sid) => {
+    seenSessionSID = sid
+    if (!sid) return
+    // Errors stay unobserved on purpose: a failed status read must not disturb
+    // the session that just landed.
+    void reloadStatus(queryClient).catch(() => undefined)
+  })
+
   sessionCacheSubscription = () => {
-    unsubscribe()
+    unsubscribeStore()
+    unsubscribeChange()
     sessionCacheSubscription = null
-    registeredSessionSID = null
+    seenSessionSID = null
   }
   return sessionCacheSubscription
 }

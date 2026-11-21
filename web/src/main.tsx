@@ -27,7 +27,11 @@ import '@/lib/dayjs'
 import { subscribeSignedInCacheReset } from '@/lib/auth-session'
 import { initializeFrontendCache } from '@/lib/frontend-cache'
 import { createAppQueryClient } from '@/lib/query-client'
-import { readCachedStatus, statusQueryOptions } from '@/lib/status-query'
+import {
+  readCachedStatus,
+  reloadStatusAfterSessionChange,
+  statusQueryOptions,
+} from '@/lib/status-query'
 
 import { DirectionProvider } from './context/direction-provider'
 import { FontProvider } from './context/font-provider'
@@ -58,8 +62,9 @@ const router = createRouter({
 
 // Watch for session changes before the router resolves its first route, so a
 // reload whose refresh cookie yields a session drops the anonymous `/api/status`
-// entry this module just primed. See `subscribeSignedInCacheReset`.
-subscribeSignedInCacheReset(queryClient)
+// entry this module just primed and reads it again under the new credential.
+// See `subscribeSignedInCacheReset`.
+subscribeSignedInCacheReset(queryClient, reloadStatusAfterSessionChange)
 
 // Register the router instance for type safety
 declare module '@tanstack/react-router' {

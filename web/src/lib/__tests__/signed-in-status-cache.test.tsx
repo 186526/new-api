@@ -20,15 +20,15 @@ import { QueryClient } from '@tanstack/react-query'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 /**
- * Guard the boot order of a reload by a signed-in visitor.
+ * Guard the boot of a reload by a signed-in visitor who keeps the anonymous
+ * `/api/status` read in flight until after the Refresh Cookie is exchanged.
  *
  * `main.tsx` primes `['status']` at module evaluation, when memory holds no
- * credential, and the request interceptor therefore sends the anonymous
- * variant. The root route resolves the Refresh Cookie afterwards, in
- * `beforeLoad`. `/api/status` returns the admin sidebar config only to a
- * signed-in caller, so unless the session change drops that anonymous entry it
- * stays fresh for five minutes and the admin's sidebar switches read as
- * unset — every gate then fails open.
+ * credential, so that read goes out anonymous. The root route then resolves the
+ * Refresh Cookie in `beforeLoad`, while the anonymous read is still pending.
+ * `/api/status` returns `SidebarModulesAdmin` only to a signed-in caller, and
+ * the sidebar gates read the snapshot it persists — so the dropped anonymous
+ * read must neither fill the cache nor overwrite that snapshot.
  */
 
 type AxiosRequest = import('axios').InternalAxiosRequestConfig
@@ -37,7 +37,7 @@ type Backend = (config: AxiosRequest) => Promise<unknown>
 // The adapter seam. `@/lib/http-client` creates its own axios instance from
 // its own copy of the axios module, so the mock intercepts `create` and gives
 // every instance an adapter that delegates to `backend`. Both clients the boot
-// path uses — the refresh exchange and `api` — answer from `serve`.
+// path uses — the refresh exchange and `api` — answer from it.
 let backend: Backend = async () => {
   throw new Error('no backend stub installed')
 }
@@ -87,10 +87,14 @@ const bundle = {
 type AuthModules = {
   useAuthStore: typeof import('@/stores/auth-store').useAuthStore
   resolveAuthentication: typeof import('@/lib/auth-session').resolveAuthentication
+  clearAuthenticatedClientState: typeof import('@/lib/auth-session').clearAuthenticatedClientState
   isSidebarModuleEnabled: typeof import('@/lib/nav-modules').isSidebarModuleEnabled
 }
 
 let auth: AuthModules
+
+/** Records every `/api/status` request, in the order the server received it. */
+let statusRequests: { url: string; signedIn: boolean }[] = []
 
 /** An axios-shaped rejection, which is what the refresh runner inspects. */
 function axiosError(config: AxiosRequest, status: number): Error {
@@ -105,16 +109,34 @@ function axiosError(config: AxiosRequest, status: number): Error {
  * `/api/user/auth/refresh` stands in for the Refresh Cookie exchange the root
  * route performs; `/api/status` answers with the variant the request's
  * Authorization header earned.
+ *
+ * `holdAnonymousStatus` keeps the first anonymous `/api/status` pending until
+ * the returned release function runs, which is the ordering a hard reload
+ * produces when the refresh exchange wins.
  */
-function stubBackend(refresh: { status: number }): void {
+function stubBackend(options: {
+  refresh: { status: number }
+  holdAnonymousStatus?: boolean
+}): () => void {
+  let releaseAnonymous = () => {}
+  const anonymousGate = new Promise<void>((resolve) => {
+    releaseAnonymous = resolve
+  })
+
   backend = async (config) => {
     const response = { status: 200, statusText: 'OK', headers: {}, config }
     if (config.url === '/api/user/auth/refresh') {
-      if (refresh.status >= 400) throw axiosError(config, refresh.status)
+      if (options.refresh.status >= 400) {
+        throw axiosError(config, options.refresh.status)
+      }
       return { ...response, data: { success: true, data: bundle } }
     }
     if (config.url === '/api/status') {
       const signedIn = Boolean(config.headers.get('Authorization'))
+      statusRequests.push({ url: config.url, signedIn })
+      if (!signedIn && options.holdAnonymousStatus) {
+        await anonymousGate
+      }
       return {
         ...response,
         data: {
@@ -128,6 +150,8 @@ function stubBackend(refresh: { status: number }): void {
     }
     throw new Error(`Unexpected request: ${config.url}`)
   }
+
+  return releaseAnonymous
 }
 
 function createQueryClient(): QueryClient {
@@ -136,17 +160,29 @@ function createQueryClient(): QueryClient {
 
 /**
  * The boot sequence `main.tsx` performs: create the app-wide client, install
- * the session reset, then let the deferred anonymous status read land.
+ * the session reset, then start the status read.
+ *
+ * The read is deliberately not awaited. `main.tsx` fires it without awaiting,
+ * and the point of these tests is what happens while it is still in flight.
  */
-async function bootApp(): Promise<QueryClient> {
+async function bootApp(): Promise<{
+  queryClient: QueryClient
+  primed: Promise<unknown>
+}> {
   const { subscribeSignedInCacheReset } = await import('@/lib/auth-session')
   const { statusQueryOptions } = await import('@/lib/status-query')
+  const { reloadStatusAfterSessionChange } = await import('@/lib/status-query')
   const queryClient = createQueryClient()
-  subscribeSignedInCacheReset(queryClient)
-  // `main.tsx` fires this without awaiting it; the assertions below read the
-  // same cache entry afterwards, so awaiting it keeps the order above.
-  await queryClient.ensureQueryData(statusQueryOptions)
-  return queryClient
+  subscribeSignedInCacheReset(queryClient, reloadStatusAfterSessionChange)
+  const primed = queryClient.ensureQueryData(statusQueryOptions).catch(() => {})
+  return { queryClient, primed }
+}
+
+/** Let the pending `/api/status` reach the stub and block there. */
+function waitForAnonymousRequest(): Promise<void> {
+  return vi.waitFor(() => {
+    expect(statusRequests.some((request) => !request.signedIn)).toBe(true)
+  })
 }
 
 /**
@@ -159,7 +195,7 @@ test('main installs the session cache reset before the router resolves', async (
   const { default: source } = await import('../../main.tsx?raw')
 
   const routerCreated = source.indexOf('const router = createRouter(')
-  const subscribed = source.indexOf('subscribeSignedInCacheReset(queryClient)')
+  const subscribed = source.indexOf('subscribeSignedInCacheReset(queryClient')
   const rendered = source.indexOf('root.render(')
 
   expect(routerCreated).toBeGreaterThan(-1)
@@ -171,6 +207,7 @@ test('main installs the session cache reset before the router resolves', async (
 beforeEach(async () => {
   window.localStorage.clear()
   document.cookie = ''
+  statusRequests = []
   backend = async () => {
     throw new Error('no backend stub installed')
   }
@@ -178,10 +215,17 @@ beforeEach(async () => {
   // the status query all hold module state that a reload would have recreated.
   vi.resetModules()
   const { useAuthStore } = await import('@/stores/auth-store')
-  const { resolveAuthentication } = await import('@/lib/auth-session')
+  const { resolveAuthentication, clearAuthenticatedClientState } = await import(
+    '@/lib/auth-session'
+  )
   const { isSidebarModuleEnabled } = await import('@/lib/nav-modules')
   useAuthStore.getState().auth.reset('idle')
-  auth = { useAuthStore, resolveAuthentication, isSidebarModuleEnabled }
+  auth = {
+    useAuthStore,
+    resolveAuthentication,
+    clearAuthenticatedClientState,
+    isSidebarModuleEnabled,
+  }
 })
 
 afterEach(() => {
@@ -189,31 +233,72 @@ afterEach(() => {
   vi.resetModules()
 })
 
-test('a reload with a session in the refresh cookie keeps the admin sidebar config', async () => {
-  stubBackend({ status: 200 })
+test('an anonymous status read still in flight at sign-in refills the cache with the signed-in variant', async () => {
+  const releaseAnonymous = stubBackend({
+    refresh: { status: 200 },
+    holdAnonymousStatus: true,
+  })
 
-  // 1. Module evaluation: the anonymous status read primes the cache.
-  const queryClient = await bootApp()
-  const { STATUS_QUERY_KEY, ensureStatus } = await import('@/lib/status-query')
-  expect(
-    queryClient.getQueryData<Record<string, unknown>>(STATUS_QUERY_KEY)
-      ?.SidebarModulesAdmin
-  ).toBeUndefined()
+  // 1. Module evaluation: the anonymous read goes out and stays pending.
+  const { queryClient, primed } = await bootApp()
+  await waitForAnonymousRequest()
 
-  // 2. The root route's beforeLoad exchanges the Refresh Cookie for a session.
+  // 2. The root route's beforeLoad exchanges the Refresh Cookie for a session
+  //    while that read is still in flight.
   expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
 
-  // 3. The first status reader after authentication must see the session's
-  //    variant, not the primed anonymous entry.
-  const status = await ensureStatus(queryClient)
+  // 3. The anonymous response arrives before the signed-in refill can land, the
+  //    ordering a slow anonymous request produces. It is the read the reset
+  //    dropped, so it must leave no trace — not in the cache, not in the
+  //    snapshot the gates read.
+  releaseAnonymous()
+  await primed
 
-  expect(status?.SidebarModulesAdmin).toBe(adminSidebarConfig)
+  // 4. The session reset refills the cache with the signed-in variant, and that
+  //    refill rewrites the snapshot. Reading it here, without a consumer asking
+  //    for status, separates a refill from a later consumer fetching from an
+  //    empty cache and masking a missing one.
+  const { STATUS_QUERY_KEY, STATUS_STORAGE_KEY } = await import(
+    '@/lib/status-query'
+  )
+  await vi.waitFor(() => {
+    const cached = queryClient.getQueryData<Record<string, unknown>>(
+      STATUS_QUERY_KEY
+    )
+    expect(cached?.SidebarModulesAdmin).toBe(adminSidebarConfig)
+    // The gates read this snapshot, not the cache entry, so both have to be in
+    // place before the assertions below mean anything.
+    const persisted = window.localStorage.getItem(STATUS_STORAGE_KEY)
+    expect(persisted).toContain('SidebarModulesAdmin')
+  })
+
   expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(false)
+})
+
+test('the signed-in refill carries the session credential, not the anonymous one', async () => {
+  const releaseAnonymous = stubBackend({
+    refresh: { status: 200 },
+    holdAnonymousStatus: true,
+  })
+  const { primed } = await bootApp()
+  await waitForAnonymousRequest()
+
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+  releaseAnonymous()
+  await primed
+  await vi.waitFor(() => {
+    expect(statusRequests.some((request) => request.signedIn)).toBe(true)
+  })
+
+  expect(statusRequests).toEqual([
+    { url: '/api/status', signedIn: false },
+    { url: '/api/status', signedIn: true },
+  ])
 })
 
 test('without the reset subscription the primed anonymous entry survives', async () => {
   // The negative control: this is the regression the subscription prevents.
-  stubBackend({ status: 200 })
+  stubBackend({ refresh: { status: 200 } })
   const { statusQueryOptions, ensureStatus } = await import(
     '@/lib/status-query'
   )
@@ -227,10 +312,27 @@ test('without the reset subscription the primed anonymous entry survives', async
   expect(auth.isSidebarModuleEnabled('chat', 'playground')).toBe(true)
 })
 
+test('signing out clears the cache without reading status for the closed session', async () => {
+  stubBackend({ refresh: { status: 200 } })
+  const { queryClient } = await bootApp()
+  expect((await auth.resolveAuthentication()).kind).toBe('authenticated')
+  await vi.waitFor(() => {
+    expect(statusRequests.some((request) => request.signedIn)).toBe(true)
+  })
+  const requestsBeforeSignOut = statusRequests.length
+
+  auth.clearAuthenticatedClientState(queryClient, false)
+
+  const { STATUS_QUERY_KEY } = await import('@/lib/status-query')
+  expect(queryClient.getQueryData(STATUS_QUERY_KEY)).toBeUndefined()
+  expect(statusRequests.length).toBe(requestsBeforeSignOut)
+})
+
 test('an anonymous boot keeps the anonymous variant', async () => {
-  stubBackend({ status: 401 })
-  const queryClient = await bootApp()
+  stubBackend({ refresh: { status: 401 } })
+  const { queryClient, primed } = await bootApp()
   const { ensureStatus } = await import('@/lib/status-query')
+  await primed
 
   expect((await auth.resolveAuthentication()).kind).toBe('anonymous')
   const status = await ensureStatus(queryClient)

@@ -31,16 +31,20 @@ import {
 /**
  * Single source of truth for `/api/status`.
  *
- * `/api/status` is entirely global on the backend: every field is read from
- * in-memory option maps under a read lock, with no user context and no auth
- * middleware on the route. That makes it safe to share one cache entry across
- * every consumer — branding, nav module gates, and the setup guard.
+ * `/api/status` varies on `Authorization`: the backend returns
+ * `SidebarModulesAdmin` only to a signed-in caller and marks that variant
+ * `no-store, private`. One cache entry therefore describes the credentials it
+ * was fetched with, not the site in general, which is why the entry is dropped
+ * whenever the dashboard session changes — see `subscribeSignedInCacheReset` in
+ * `lib/auth-session`.
  *
  * Anything that needs status must go through `statusQueryOptions` so React
  * Query can dedupe. Calling `getStatus()` directly re-introduces the duplicate
  * requests this module exists to collapse.
  */
 export const STATUS_QUERY_KEY = ['status'] as const
+
+export const STATUS_STALE_TIME = 5 * 60 * 1000
 
 export const STATUS_STORAGE_KEY = 'status'
 
@@ -130,11 +134,22 @@ function writeCachedStatus(status: StatusData | null): void {
  *
  * Owns both side effects of a successful read — syncing the system-config store
  * and writing the localStorage snapshot — so consumers never repeat either one.
+ *
+ * A read a session change cancelled skips both. `getStatus` sends none of React
+ * Query's signal, so the request runs to completion anyway and resolves with the
+ * variant of the credential it went out under — for a reload, the anonymous one.
+ * That response can arrive after the signed-in refill has written its snapshot,
+ * and writing it would hand the sidebar gates an anonymous snapshot that fails
+ * open for the rest of the session.
  */
-async function fetchStatus(): Promise<StatusData | null> {
+async function fetchStatus({
+  signal,
+}: {
+  signal: AbortSignal
+}): Promise<StatusData | null> {
   const status = (await getStatus()) as StatusData | null
 
-  if (status) {
+  if (status && !signal.aborted) {
     try {
       useSystemConfigStore.getState().setConfig(mapStatusDataToConfig(status))
     } catch (err) {
@@ -153,10 +168,25 @@ export const statusQueryOptions = queryOptions({
   queryKey: STATUS_QUERY_KEY,
   queryFn: fetchStatus,
   // Data becomes stale after 5 minutes
-  staleTime: 5 * 60 * 1000,
+  staleTime: STATUS_STALE_TIME,
   // Cache expires after 30 minutes
   gcTime: 30 * 60 * 1000,
 })
+
+/**
+ * Re-read `/api/status` for the credential a session change just installed.
+ *
+ * Passed to `subscribeSignedInCacheReset` from `main.tsx`. It goes through the
+ * full `statusQueryOptions` rather than a bare request because the sidebar gates
+ * read the snapshot `fetchStatus` persists, and the system-config store needs
+ * the mapped values: a re-read that only filled the React Query entry would
+ * leave both behind.
+ */
+export async function reloadStatusAfterSessionChange(
+  queryClient: QueryClient
+): Promise<StatusData | null> {
+  return queryClient.fetchQuery(statusQueryOptions)
+}
 
 /**
  * Await status from the shared cache.
