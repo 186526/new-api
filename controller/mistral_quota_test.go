@@ -163,7 +163,7 @@ func TestMistralQuotaRefreshReadsTheChannelKeyOverTheFileKey(t *testing.T) {
 	require.False(t, refreshMistralQuotas().failed)
 
 	assert.Equal(t, 1, keyEndpoints, "the refresh reads the key endpoint of the channel key")
-	assert.Equal(t, 0, consoleEndpoints, "the console is only the fallback of an account without a key")
+	assert.Equal(t, 0, consoleEndpoints, "the key endpoint answered, so a keyed entry never reached its console fallback")
 	stored, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	assert.InDelta(t, 148.14, stored.Balance, 0.01)
