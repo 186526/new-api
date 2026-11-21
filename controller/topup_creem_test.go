@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -122,4 +123,111 @@ func TestCreemCheckoutSummaryIsTheSharedPaymentSummary(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("body_bytes=%d unparsed=true", len(unparsed)), paymentLogSummary([]byte(unparsed)))
 	assert.NotContains(t, paymentLogSummary([]byte(`{"secret":"x","signature":"y"}`)), "secret")
 	assert.Equal(t, "status=paid", paymentLogSummary([]byte(`{"secret":"x","status":"paid"}`)))
+}
+
+// enableCreemWebhookForTest turns the Creem webhook on for the duration of a
+// test, so the handler reaches the lines after the availability check.
+func enableCreemWebhookForTest(t *testing.T) {
+	t.Helper()
+	confirmPaymentComplianceForTest(t)
+	previousAPIKey, previousProducts, previousWebhookSecret := setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret
+	t.Cleanup(func() {
+		setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret = previousAPIKey, previousProducts, previousWebhookSecret
+	})
+	setting.CreemApiKey = "creem-test-key"
+	setting.CreemProducts = `[{"productId":"prod_canary"}]`
+	setting.CreemWebhookSecret = "creem-test-secret"
+}
+
+// creemWebhookRequest drives CreemWebhook for one request and returns what the
+// handler wrote and what it logged.
+func creemWebhookRequest(t *testing.T, method, target, body string) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	captured := capturePaymentServerLog(t)
+	gin.SetMode(gin.TestMode)
+	previousMode := gin.Mode()
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+
+	router := gin.New()
+	router.POST("/api/creem/webhook", CreemWebhook)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(method, target, strings.NewReader(body)))
+	return recorder, captured.String()
+}
+
+// TestCreemWebhookLogsNoCallbackQueryWhenDisabled covers the unauthenticated
+// rejection: with the webhook turned off, any caller reaches this line.
+func TestCreemWebhookLogsNoCallbackQueryWhenDisabled(t *testing.T) {
+	confirmPaymentComplianceForTest(t)
+	previousAPIKey, previousProducts, previousWebhookSecret := setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret
+	t.Cleanup(func() {
+		setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret = previousAPIKey, previousProducts, previousWebhookSecret
+	})
+	setting.CreemWebhookSecret = "" // webhook disabled: the first branch
+
+	recorder, logged := creemWebhookRequest(t, http.MethodPost,
+		"/api/creem/webhook?sign=SUPERSECRETSIGNATUREVALUE&pid=canary-pid", `{}`)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	assert.Contains(t, logged, `path="/api/creem/webhook"`, "the line still names the endpoint")
+	assert.NotContains(t, logged, "SUPERSECRETSIGNATUREVALUE")
+	assert.NotContains(t, logged, "canary-pid")
+	assert.NotContains(t, logged, "sign=")
+}
+
+// TestCreemWebhookLogsNoCallbackQueryWhenTheBodyCannotBeRead covers the second
+// line: a body the handler cannot read still names the endpoint, not the query.
+func TestCreemWebhookLogsNoCallbackQueryWhenTheBodyCannotBeRead(t *testing.T) {
+	enableCreemWebhookForTest(t)
+	captured := capturePaymentServerLog(t)
+	gin.SetMode(gin.TestMode)
+	previousMode := gin.Mode()
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/creem/webhook?sign=SUPERSECRETSIGNATUREVALUE&pid=canary-pid", nil)
+	request.Body = io.NopCloser(failingReader{})
+	router := gin.New()
+	router.POST("/api/creem/webhook", CreemWebhook)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	logged := captured.String()
+	assert.Contains(t, logged, "failed to read request body")
+	assert.Contains(t, logged, `path="/api/creem/webhook"`)
+	assert.NotContains(t, logged, "SUPERSECRETSIGNATUREVALUE")
+	assert.NotContains(t, logged, "canary-pid")
+}
+
+// failingReader is a request body that cannot be read, so CreemWebhook reaches
+// its read-error line.
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// TestCreemWebhookLogsNoCallbackQueryWhenTheSignatureVerifies covers the third
+// line: a signed callback that passes verification still logs the endpoint
+// alone.
+func TestCreemWebhookLogsNoCallbackQueryWhenTheSignatureVerifies(t *testing.T) {
+	enableCreemWebhookForTest(t)
+	captured := capturePaymentServerLog(t)
+	gin.SetMode(gin.TestMode)
+	previousMode := gin.Mode()
+	t.Cleanup(func() { gin.SetMode(previousMode) })
+
+	body := `{"id":"evt_canary","eventType":"checkout.completed"}`
+	signature := generateCreemSignature(body, setting.CreemWebhookSecret)
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/creem/webhook?sign=SUPERSECRETSIGNATUREVALUE&pid=canary-pid", strings.NewReader(body))
+	request.Header.Set(CreemSignatureHeader, signature)
+	router := gin.New()
+	router.POST("/api/creem/webhook", CreemWebhook)
+	router.ServeHTTP(httptest.NewRecorder(), request)
+
+	logged := captured.String()
+	assert.Contains(t, logged, "Creem webhook signature verified")
+	assert.NotContains(t, logged, "SUPERSECRETSIGNATUREVALUE")
+	assert.NotContains(t, logged, "canary-pid")
+	assert.NotContains(t, logged, "sign=")
 }
