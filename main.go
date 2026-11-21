@@ -274,6 +274,15 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
 	}
+	// Once the listener is closed no new request queues a delta, and a clean
+	// Shutdown means every in-flight request has returned too, so the accumulator
+	// then holds all of this process's unflushed deltas. Write them before the
+	// process exits: a scale-down or a restart must not drop them. When Shutdown
+	// timed out, a handler still running can queue another delta after this flush;
+	// that one is lost, which is the same loss the unflushed accumulator had before.
+	if common.BatchUpdateEnabled {
+		model.FlushBatchUpdates()
+	}
 	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer metricsCancel()
 	appmetrics.Shutdown(metricsCtx, metricsServer)
