@@ -129,35 +129,75 @@ func TestMistralQuotaRefreshPublishesTheAllowanceOfAnAccountWithoutAChannel(t *t
 	assert.InDelta(t, 0.75, windows[0].RemainingRatio, 1e-9)
 }
 
-// TestMistralQuotaRefreshTakesTheConsoleAllowanceOverTheKeyBudget requires the
-// refresh to publish what the console reports for a merged plan, not the figure
-// the public billing endpoint reports to the key. The endpoint answered 10 USD
-// at 100% on this plan, so a refresh that read it last would publish nothing left
-// while the console still had 112.50 USD of 150.
-func TestMistralQuotaRefreshTakesTheConsoleAllowanceOverTheKeyBudget(t *testing.T) {
+// TestMistralQuotaRefreshReadsTheChannelKeyOverTheFileKey requires the refresh to
+// publish the allowance of the key the channel carries and to store it as the
+// balance, because the balance sweep and the refresh must agree about a channel
+// that a stale file key reported as exhausted. The file names a key of the free
+// plan (100% of 10 USD); the channel's own key reports 1.238795712% of 150 USD,
+// about 148.14 USD left, and the console still has 112.50 USD of 150.
+func TestMistralQuotaRefreshReadsTheChannelKeyOverTheFileKey(t *testing.T) {
 	setupMistralBalanceTest(t)
 	captureMistralServerLog(t)
-	var keyBudgetHits int
+	var keyEndpoints, consoleEndpoints int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/trpc/billing.budget":
+			consoleEndpoints++
 			_, _ = w.Write([]byte(`{"result":{"data":{"json":{"usage_percentage":25,"initial_budget":150,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`))
 		case "/v1/billing/budget":
-			keyBudgetHits++
-			_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":100,"initial_budget":10},"api_budget":{"usage_percentage":100,"initial_budget":10}}`))
+			keyEndpoints++
+			if r.Header.Get("Authorization") == "Bearer mstrl_free" {
+				_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":100,"initial_budget":10},"api_budget":{"usage_percentage":100,"initial_budget":10}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":1.238795712,"initial_budget":150},"api_budget":{"usage_percentage":0.00018766,"initial_budget":15}}`))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(server.Close)
-	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio","monthlyLimitUsd":150}]`)
-	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_studio", Name: "Mistral (pro)"}
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_free","studioKey":"mstrl_free","monthlyLimitUsd":150}]`)
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_channel", Name: "Mistral (pro)"}
 	require.NoError(t, model.DB.Create(channel).Error)
 
 	require.False(t, refreshMistralQuotas().failed)
 
-	assert.Equal(t, 0, keyBudgetHits, "an account with a console session must never read the key budget endpoint")
+	assert.Equal(t, 1, keyEndpoints, "the refresh reads the key endpoint of the channel key")
+	assert.Equal(t, 0, consoleEndpoints, "the console is only the fallback of an account without a key")
+	stored, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.InDelta(t, 148.14, stored.Balance, 0.01)
+}
+
+// TestMistralQuotaRefreshFallsBackToTheConsoleWhenTheChannelKeyIsRejected
+// requires a key the endpoint refuses to fall through to the console and to
+// publish that allowance, instead of storing a balance of zero and leaving a
+// channel disabled for a credential that only needs replacing.
+func TestMistralQuotaRefreshFallsBackToTheConsoleWhenTheChannelKeyIsRejected(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captureMistralServerLog(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/billing/budget":
+			http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
+		case "/api/trpc/billing.budget":
+			_, _ = w.Write([]byte(`{"result":{"data":{"json":{"usage_percentage":25,"initial_budget":150,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1"}]`)
+	channel := &model.Channel{
+		Type: constant.ChannelTypeMistral, Key: "mstrl_rotated", Name: "Mistral (pro)",
+		Status: common.ChannelStatusAutoDisabled, OtherInfo: `{"status_reason":"Insufficient balance"}`,
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	require.False(t, refreshMistralQuotas().failed, "a refused key falls through to the console instead of failing the tick")
+
 	stored, err := model.GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	assert.InDelta(t, 112.5, stored.Balance, 1e-9)
+	assert.NotZero(t, stored.Balance, "a refused key must never be stored as an exhausted allowance")
 }

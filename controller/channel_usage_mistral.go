@@ -31,7 +31,7 @@ type mistralUsageBudget struct {
 }
 
 // mistralUsage is the usage dialog payload. Amounts are derived from the plan
-// amount the console reports, and stay zero when the console omitted it.
+// amount the allowance source reports, and stay zero when it omitted one.
 type mistralUsage struct {
 	ChannelName string               `json:"channel_name"`
 	Budgets     []mistralUsageBudget `json:"budgets"`
@@ -82,14 +82,16 @@ func unixSeconds(at time.Time) int64 {
 	return at.Unix()
 }
 
-// GetMistralChannelUsage 返回账号的月度额度；数据来自控制台页面，不落库。
+// GetMistralChannelUsage 返回账号的月度额度；数据来自按渠道 key 读取的 billing 端点，不落库。
 func GetMistralChannelUsage(c *gin.Context) {
 	channelId, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		common.ApiError(c, fmt.Errorf("invalid channel id: %w", err))
 		return
 	}
-	ch, err := model.GetChannelById(channelId, false)
+	// The channel key decides which plan the allowance is read for, so the row is
+	// loaded with its key instead of without one.
+	ch, err := model.GetChannelById(channelId, true)
 	if err != nil {
 		common.SysError(common.LogText("failed to load channel %d for mistral usage: %s", channelId, err.Error()))
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel not found"})
@@ -110,6 +112,7 @@ func GetMistralChannelUsage(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": fmt.Sprintf("no Mistral quota account is configured for channel %q", ch.Name)})
 		return
 	}
+	account.ChannelKey = mistralChannelKey(ch)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), channelUsageFetchTimeout)
 	defer cancel()
@@ -119,7 +122,7 @@ func GetMistralChannelUsage(c *gin.Context) {
 		common.SysError(common.LogText("failed to fetch mistral usage: channel_id=%d, error=%s", ch.Id, err.Error()))
 		var authErr *service.MistralQuotaAuthError
 		if errors.As(err, &authErr) {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": "Mistral console session was rejected; update the cookie in the quota account configuration"})
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "Mistral rejected the credential of this channel; update the key or the cookie in the quota account configuration"})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "Failed to fetch usage. Please try again later"})

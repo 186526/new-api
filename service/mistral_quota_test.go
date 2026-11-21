@@ -20,14 +20,15 @@ const consoleBudgetAnswer = `{"result":{"data":{"json":{"usage_percentage":65.79
 // plan amount.
 const vibeUsageAnswer = `[{"result":{"data":{"json":{"usagePercentage":65.79,"paygEnabled":false,"resetAt":"2026-12-01T00:00:00Z"}}}}]`
 
-// keyBudgetAnswer is what the public billing endpoint answers to any key of an
-// Education plan account: the free plan's 10 USD, fully used, split into the two
-// sides the endpoint still reports. It is wrong for the plan and must never
-// replace the console answer.
-const keyBudgetAnswer = `{"vibe_budget":{"usage_percentage":100.0,"initial_budget":10.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},"api_budget":{"usage_percentage":100.0,"initial_budget":10.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`
+// paidKeyBudgetAnswer is the answer the channel's own key gave on 2026-11-21:
+// 1.238795712% of the merged 150 USD allowance used, which leaves about 148.14
+// USD, next to an API side of 0.00018766% of 15 USD.
+const paidKeyBudgetAnswer = `{"vibe_budget":{"usage_percentage":1.238795712,"initial_budget":150.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},"api_budget":{"usage_percentage":0.00018766,"initial_budget":15.0,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`
 
 // newMistralSourceServer serves one answer per path, and records the order the
-// paths were asked for so a test can require the chain.
+// paths were asked for so a test can require the chain. A path mapped to an empty
+// answer is refused with 401, which is what a key the account no longer carries
+// answers.
 func newMistralSourceServer(t *testing.T, answers map[string]string) (*httptest.Server, *[]string) {
 	t.Helper()
 	var asked []string
@@ -36,6 +37,10 @@ func newMistralSourceServer(t *testing.T, answers map[string]string) (*httptest.
 		answer, ok := answers[r.URL.Path]
 		if !ok {
 			http.Error(w, "unexpected path", http.StatusInternalServerError)
+			return
+		}
+		if answer == "" {
+			http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		_, _ = w.Write([]byte(answer))
@@ -53,15 +58,16 @@ func newMistralTestClient(serverURL string) *MistralQuotaClient {
 	}
 }
 
-// TestFetchMistralQuotaPrefersTheConsoleBudget requires the merged allowance to
-// come from the console trpc endpoint when the account has a session, and the
-// public billing endpoint never to be asked: that endpoint reported 10 USD on
-// this plan, so reading it would replace the real plan amount.
-func TestFetchMistralQuotaPrefersTheConsoleBudget(t *testing.T) {
+// TestFetchMistralQuotaReadsTheKeyBudgetFirst requires the merged allowance to
+// come from the public billing endpoint when the account has a key, even with a
+// console session present: the console answers a dead session with 200 and the
+// login page, so it cannot be trusted to report the allowance, and the key
+// endpoint is the only source that does.
+func TestFetchMistralQuotaReadsTheKeyBudgetFirst(t *testing.T) {
 	server, asked := newMistralSourceServer(t, map[string]string{
 		mistralConsoleBudgetPath: consoleBudgetAnswer,
 		mistralVibeUsagePath:     vibeUsageAnswer,
-		mistralBillingBudgetPath: keyBudgetAnswer,
+		mistralBillingBudgetPath: paidKeyBudgetAnswer,
 	})
 
 	quota, err := newMistralTestClient(server.URL).Fetch(context.Background(), MistralQuotaAccount{
@@ -72,20 +78,77 @@ func TestFetchMistralQuotaPrefersTheConsoleBudget(t *testing.T) {
 		t.Fatalf("Fetch() error: %v", err)
 	}
 	if quota.Allowance == nil {
-		t.Fatalf("Allowance = nil, want the console answer")
+		t.Fatalf("Allowance = nil, want the key budget answer")
 	}
-	if quota.Allowance.UsagePercentage != 65.79 {
-		t.Errorf("usage percentage = %v, want 65.79", quota.Allowance.UsagePercentage)
+	if quota.Allowance.UsagePercentage != 1.238795712 {
+		t.Errorf("usage percentage = %v, want the key endpoint's 1.238795712", quota.Allowance.UsagePercentage)
 	}
 	if quota.Allowance.LimitUSD != 150 {
-		t.Errorf("plan amount = %v, want the console's 150", quota.Allowance.LimitUSD)
+		t.Errorf("plan amount = %v, want the 150 the key endpoint reports", quota.Allowance.LimitUSD)
 	}
 	wantReset := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
 	if !quota.Allowance.ResetAt.Equal(wantReset) {
 		t.Errorf("ResetAt = %v, want %v", quota.Allowance.ResetAt, wantReset)
 	}
-	if want := []string{mistralConsoleBudgetPath}; !equalPaths(*asked, want) {
+	if want := []string{mistralBillingBudgetPath}; !equalPaths(*asked, want) {
 		t.Errorf("paths asked = %v, want %v", *asked, want)
+	}
+}
+
+// TestFetchMistralQuotaReadsTheChannelKeyOverTheFileKey requires the key the
+// channel calls the upstream with to decide the allowance of that channel. On
+// 2026-11-21 the accounts file named a key that answered the free plan's 100% of
+// 10 USD, while the key of channel 16 answered 1.238795712% of 150 USD, about
+// 148.14 USD left; reading the file key reported nothing left and the balance
+// sweep disabled the channel.
+func TestFetchMistralQuotaReadsTheChannelKeyOverTheFileKey(t *testing.T) {
+	server, asked := newMistralSourceServer(t, map[string]string{
+		mistralConsoleBudgetPath: consoleBudgetAnswer,
+		mistralVibeUsagePath:     vibeUsageAnswer,
+		mistralBillingBudgetPath: paidKeyBudgetAnswer,
+	})
+
+	quota, err := newMistralTestClient(server.URL).Fetch(context.Background(), MistralQuotaAccount{
+		Channel: "Mistral Vibe (xu.bo)", Cookie: "ory_session_test=stale",
+		VibeKey: "mstrl_old", StudioKey: "", ChannelKey: "mstrl_channel", MonthlyLimitUSD: 150,
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if quota.Allowance == nil {
+		t.Fatalf("Allowance = nil, want the channel key's answer")
+	}
+	remaining := quota.Allowance.LimitUSD * (1 - quota.Allowance.UsagePercentage/100)
+	if want := 148.14; remaining < want-0.01 || remaining > want+0.01 {
+		t.Errorf("remaining = %v USD, want about %v USD", remaining, want)
+	}
+	if want := []string{mistralBillingBudgetPath}; !equalPaths(*asked, want) {
+		t.Errorf("paths asked = %v, want %v", *asked, want)
+	}
+}
+
+// TestFetchMistralQuotaFallsThroughARejectedKey requires a key the endpoint
+// refuses to fall through to the console sources instead of being reported as an
+// allowance of zero: the key of a channel may have been rotated, and the cookie
+// still reads the plan.
+func TestFetchMistralQuotaFallsThroughARejectedKey(t *testing.T) {
+	server, asked := newMistralSourceServer(t, map[string]string{
+		mistralConsoleBudgetPath: consoleBudgetAnswer,
+		mistralVibeUsagePath:     vibeUsageAnswer,
+		mistralBillingBudgetPath: "",
+	})
+
+	quota, err := newMistralTestClient(server.URL).Fetch(context.Background(), MistralQuotaAccount{
+		Channel: "Mistral (pro)", Cookie: "ory_session_test=abc", ChannelKey: "mstrl_rotated",
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if quota.Allowance == nil || quota.Allowance.UsagePercentage != 65.79 {
+		t.Fatalf("Allowance = %#v, want the console's 65.79%%", quota.Allowance)
+	}
+	if want := []string{mistralBillingBudgetPath, mistralConsoleBudgetPath}; !equalPaths(*asked, want) {
+		t.Errorf("paths asked = %v, want the key endpoint then the console", *asked)
 	}
 }
 
@@ -103,7 +166,7 @@ func TestFetchMistralQuotaFallsThroughARejectedConsoleSession(t *testing.T) {
 		case mistralVibeUsagePath:
 			_, _ = w.Write([]byte(vibeUsageAnswer))
 		default:
-			http.Error(w, "the key budget endpoint must not answer an account with a session", http.StatusInternalServerError)
+			http.Error(w, "an account without a key must not reach the key budget endpoint", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
@@ -141,20 +204,41 @@ func TestFetchMistralQuotaReportsARejectedSessionWhenNoSourceAnswers(t *testing.
 	if !errors.As(err, &authErr) || authErr.Status != http.StatusFound {
 		t.Fatalf("Fetch() error = %v, want MistralQuotaAuthError with status 302", err)
 	}
+	if authErr.Credential != mistralCredentialSession {
+		t.Errorf("credential = %q, want the console session to be named", authErr.Credential)
+	}
 }
 
-// TestFetchMistralQuotaReadsTheKeyBudgetOnlyWithoutACookie requires the public
-// billing endpoint to stay reachable for an account that has no console session
-// at all, and to be reported without asking either console source.
-func TestFetchMistralQuotaReadsTheKeyBudgetOnlyWithoutACookie(t *testing.T) {
+// TestFetchMistralQuotaReportsARejectedKeyWhenNoSourceAnswers requires a refused
+// key with no console session to surface the auth error, so the refresh backs off
+// instead of publishing a zero balance for a channel whose key was rotated.
+func TestFetchMistralQuotaReportsARejectedKeyWhenNoSourceAnswers(t *testing.T) {
+	server, _ := newMistralSourceServer(t, map[string]string{mistralBillingBudgetPath: ""})
+
+	_, err := newMistralTestClient(server.URL).Fetch(context.Background(), MistralQuotaAccount{
+		Channel: "Mistral (key only)", ChannelKey: "mstrl_rotated", MonthlyLimitUSD: 150,
+	})
+	var authErr *MistralQuotaAuthError
+	if !errors.As(err, &authErr) || authErr.Status != http.StatusUnauthorized {
+		t.Fatalf("Fetch() error = %v, want MistralQuotaAuthError with status 401", err)
+	}
+	if authErr.Credential != mistralCredentialKey {
+		t.Errorf("credential = %q, want the API key to be named", authErr.Credential)
+	}
+}
+
+// TestFetchMistralQuotaReadsTheKeyBudgetWithoutACookie requires the public
+// billing endpoint to answer an account that has a key and no console session,
+// without asking either console source.
+func TestFetchMistralQuotaReadsTheKeyBudgetWithoutACookie(t *testing.T) {
 	server, asked := newMistralSourceServer(t, map[string]string{
 		mistralConsoleBudgetPath: consoleBudgetAnswer,
 		mistralVibeUsagePath:     vibeUsageAnswer,
-		mistralBillingBudgetPath: keyBudgetAnswer,
+		mistralBillingBudgetPath: paidKeyBudgetAnswer,
 	})
 
 	quota, err := newMistralTestClient(server.URL).Fetch(context.Background(), MistralQuotaAccount{
-		Channel: "Mistral (key only)", StudioKey: "mstrl_studio", MonthlyLimitUSD: 150,
+		Channel: "Mistral (key only)", StudioKey: "mstrl_studio",
 	})
 	if err != nil {
 		t.Fatalf("Fetch() error: %v", err)
@@ -163,7 +247,7 @@ func TestFetchMistralQuotaReadsTheKeyBudgetOnlyWithoutACookie(t *testing.T) {
 		t.Fatal("Allowance = nil, want the key budget answer")
 	}
 	if quota.Allowance.LimitUSD != 150 {
-		t.Errorf("plan amount = %v, want the configured 150 to win over the endpoint's 10", quota.Allowance.LimitUSD)
+		t.Errorf("plan amount = %v, want the 150 the key endpoint reports", quota.Allowance.LimitUSD)
 	}
 	if want := []string{mistralBillingBudgetPath}; !equalPaths(*asked, want) {
 		t.Errorf("paths asked = %v, want %v", *asked, want)
@@ -278,21 +362,22 @@ func TestParseMistralAllowanceRejectsMissingPercentage(t *testing.T) {
 }
 
 // TestParseMistralBillingBudgetPrefersTheVibeSide requires the merged allowance
-// of the public endpoint to be the side the console renders, and the API side to
-// be read only when the answer carries nothing else.
+// of the public endpoint to be the Vibe side the console renders, and the API
+// side to be read only when the answer carries no Vibe side. The top-level
+// object holds no percentage, so its numbers can never become the allowance.
 func TestParseMistralBillingBudgetPrefersTheVibeSide(t *testing.T) {
-	allowance, payg, err := parseMistralBillingBudget([]byte(keyBudgetAnswer))
+	allowance, payg, err := parseMistralBillingBudget([]byte(paidKeyBudgetAnswer))
 	if err != nil {
 		t.Fatalf("parseMistralBillingBudget() error: %v", err)
 	}
-	if allowance.UsagePercentage != 100 || allowance.LimitUSD != 10 {
-		t.Errorf("allowance = %#v, want the Vibe side's 100%% of 10", allowance)
+	if allowance.UsagePercentage != 1.238795712 || allowance.LimitUSD != 150 {
+		t.Errorf("allowance = %#v, want the Vibe side's 1.238795712%% of 150", allowance)
 	}
 	if payg {
 		t.Error("PaygEnabled = true, want false")
 	}
 
-	allowance, _, err = parseMistralBillingBudget([]byte(`{"api_budget":{"usage_percentage":40,"initial_budget":15}}`))
+	allowance, _, err = parseMistralBillingBudget([]byte(`{"vibe_budget":{},"api_budget":{"usage_percentage":40,"initial_budget":15}}`))
 	if err != nil {
 		t.Fatalf("parseMistralBillingBudget() error: %v", err)
 	}
@@ -300,16 +385,22 @@ func TestParseMistralBillingBudgetPrefersTheVibeSide(t *testing.T) {
 		t.Errorf("allowance = %#v, want the API side as the only one reported", allowance)
 	}
 
+	if _, _, err := parseMistralBillingBudget([]byte(`{"usage_percentage":0,"initial_budget":0}`)); err == nil {
+		t.Fatal("parseMistralBillingBudget() error = nil, want an error when neither side is reported")
+	}
 	if _, _, err := parseMistralBillingBudget([]byte(`{}`)); err == nil {
 		t.Fatal("parseMistralBillingBudget() error = nil, want an error when no side is reported")
 	}
 }
 
+// TestLoadMistralQuotaAccountsFromFile reads a file that mixes a session entry
+// with a key-only entry: the key endpoint reads the allowance with a key, so an
+// account that names one needs no cookie.
 func TestLoadMistralQuotaAccountsFromFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 	if err := os.WriteFile(path, []byte(`[
 		{"channel":"vibe-pro","cookie":"ory_session_a=1; csrftoken=a","vibeKey":"mstrl_v","studioKey":"mstrl_s","monthlyLimitUsd":150},
-		{"channel":"vibe-team","cookie":"ory_session_b=2; csrftoken=b"}
+		{"channel":"vibe-team","vibeKey":"mstrl_team"}
 	]`), 0o600); err != nil {
 		t.Fatalf("write accounts file: %v", err)
 	}
@@ -333,15 +424,17 @@ func TestLoadMistralQuotaAccountsFromFile(t *testing.T) {
 	if accounts[0].MonthlyLimitUSD != 150 {
 		t.Errorf("monthly limit = %v, want 150", accounts[0].MonthlyLimitUSD)
 	}
+	if accounts[1].Cookie != "" || accounts[1].VibeKey != "mstrl_team" {
+		t.Errorf("key-only entry = %#v, want the key and no cookie", accounts[1])
+	}
 }
 
-// TestLoadMistralQuotaAccountsRequiresASession requires the configuration to keep
-// naming a session cookie. An account that could be configured with a key alone
-// would read the public billing endpoint, which reported the free plan's 10 USD
-// on every plan measured, and would report nothing left without any error.
-func TestLoadMistralQuotaAccountsRequiresASession(t *testing.T) {
+// TestLoadMistralQuotaAccountsRequiresACredential requires an entry that names
+// neither a cookie nor a key to be rejected: such an account has no credential
+// that reads the allowance, so loading it would publish nothing in silence.
+func TestLoadMistralQuotaAccountsRequiresACredential(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
-	if err := os.WriteFile(path, []byte(`[{"channel":"key-only","vibeKey":"mstrl_v"}]`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`[{"channel":"no-credential","monthlyLimitUsd":150}]`), 0o600); err != nil {
 		t.Fatalf("write accounts file: %v", err)
 	}
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", "")
@@ -349,7 +442,31 @@ func TestLoadMistralQuotaAccountsRequiresASession(t *testing.T) {
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", path)
 
 	if _, err := LoadMistralQuotaAccounts(); err == nil {
-		t.Fatal("LoadMistralQuotaAccounts() error = nil, want an account without a cookie to be rejected")
+		t.Fatal("LoadMistralQuotaAccounts() error = nil, want an entry without a credential to be rejected")
+	} else if !strings.Contains(err.Error(), "neither a console session nor an API key") {
+		t.Errorf("error = %v, want a message naming the missing credential", err)
+	}
+}
+
+// TestLoadMistralQuotaAccountsFromEnvWithoutACookie requires the single-account
+// environment source to accept a key alone, the same way the file does.
+func TestLoadMistralQuotaAccountsFromEnvWithoutACookie(t *testing.T) {
+	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", "")
+	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", "")
+	t.Setenv("MISTRAL_VIBE_QUOTA_COOKIE", "")
+	t.Setenv("MISTRAL_VIBE_QUOTA_CHANNEL", "Mistral Vibe (xu.bo)")
+	t.Setenv("MISTRAL_VIBE_QUOTA_VIBE_KEY", "mstrl_v")
+	t.Setenv("MISTRAL_VIBE_QUOTA_STUDIO_KEY", "")
+
+	accounts, err := LoadMistralQuotaAccounts()
+	if err != nil {
+		t.Fatalf("LoadMistralQuotaAccounts() error: %v", err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("len(accounts) = %d, want 1", len(accounts))
+	}
+	if accounts[0].Channel != "Mistral Vibe (xu.bo)" || accounts[0].VibeKey != "mstrl_v" {
+		t.Errorf("account = %#v, want the configured channel and key", accounts[0])
 	}
 }
 

@@ -36,21 +36,29 @@ func setupMistralBalanceTest(t *testing.T) {
 	})
 }
 
-// newMistralConsoleServer answers the console trpc budget endpoint with one
-// merged allowance used at percentage percent of limit dollars. It refuses the
-// public billing endpoint, which a console session must never reach.
+// newMistralConsoleServer answers both allowance sources with one merged
+// allowance used at percentage percent of limit dollars: the public billing
+// endpoint for the channel key, which the balance path reads first, and the
+// console trpc endpoint for a cookie, which is the fallback of an account that
+// names no key. The key endpoint is answered with its own two-sided shape, so a
+// test drives the source the balance path actually reads.
 func newMistralConsoleServer(t *testing.T, percentage float64, limit float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/billing/budget" {
-			http.Error(w, "the public billing endpoint must not answer an account with a session", http.StatusInternalServerError)
-			return
+		switch r.URL.Path {
+		case "/v1/billing/budget":
+			assert.Contains(t, r.Header.Get("Authorization"), "Bearer mstrl_")
+			assert.NotEmpty(t, r.Header.Get("Authorization"), "the key endpoint is read with a key, not a cookie")
+			_, _ = fmt.Fprintf(w,
+				`{"vibe_budget":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false},"api_budget":{"usage_percentage":%v,"initial_budget":15,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`,
+				percentage, limit, percentage)
+		default:
+			assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
+			assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla/5.0")
+			_, _ = fmt.Fprintf(w,
+				`{"result":{"data":{"json":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`,
+				percentage, limit)
 		}
-		assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
-		assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla/5.0")
-		_, _ = fmt.Fprintf(w,
-			`{"result":{"data":{"json":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`,
-			percentage, limit)
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -63,6 +71,66 @@ func setMistralQuotaEnv(t *testing.T, serverURL string, accounts string) {
 	t.Setenv("MISTRAL_QUOTA_ADMIN_BASE_URL", serverURL)
 	t.Setenv("MISTRAL_VIBE_QUOTA_BASE_URL", serverURL)
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", accounts)
+}
+
+// TestMistralBalanceReadsTheChannelKeyEvenWhenTheFileKeyIsFree requires the
+// balance path to read the allowance with the key the channel calls the upstream
+// with and not with the key recorded in the accounts file. On 2026-11-21 the file
+// named a key that answered the free plan's 100% of 10 USD while the key of
+// channel 16 answered 1.238795712% of 150 USD, so the file key reported nothing
+// left and the sweep disabled the channel; the channel key reports about 148.14
+// USD, whatever key the file names.
+func TestMistralBalanceReadsTheChannelKeyEvenWhenTheFileKeyIsFree(t *testing.T) {
+	setupMistralBalanceTest(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/billing/budget" {
+			t.Errorf("path = %q, want the key billing endpoint", r.URL.Path)
+			http.Error(w, "the balance path reads only the key endpoint", http.StatusInternalServerError)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer mstrl_old" {
+			_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":100,"initial_budget":10},"api_budget":{"usage_percentage":100,"initial_budget":10}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":1.238795712,"initial_budget":150},"api_budget":{"usage_percentage":0.00018766,"initial_budget":15}}`))
+	}))
+	t.Cleanup(server.Close)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral Vibe (xu.bo)","cookie":"ory_session_x=stale","vibeKey":"mstrl_old","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_channel", Name: "Mistral Vibe (xu.bo)"}
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	result, err := updateChannelBalance(channel)
+
+	require.NoError(t, err)
+	assert.InDelta(t, 148.14, result.Balance, 0.01, "the channel key reports the plan's own allowance")
+	assert.InDelta(t, 148.14, channel.Balance, 0.01)
+}
+
+// TestMistralBalanceFallsBackToTheSessionWhenTheChannelKeyIsRejected requires a
+// channel key the endpoint refuses to fall through to the cookie instead of
+// writing a balance of zero, which would disable the channel for a credential
+// that only needs replacing.
+func TestMistralBalanceFallsBackToTheSessionWhenTheChannelKeyIsRejected(t *testing.T) {
+	setupMistralBalanceTest(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/billing/budget" {
+			http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
+		_, _ = w.Write([]byte(`{"result":{"data":{"json":{"usage_percentage":65.79,"initial_budget":150,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`))
+	}))
+	t.Cleanup(server.Close)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_rotated", Name: "Mistral (pro)"}
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	result, err := updateChannelBalance(channel)
+
+	require.NoError(t, err)
+	assert.InDelta(t, 51.315, result.Balance, 1e-9, "the console still reads the plan")
 }
 
 // TestMistralBalanceIsTheSameForEveryKeyOfTheAccount requires the channel
@@ -107,9 +175,10 @@ func TestMistralBalanceRejectsUnknownChannel(t *testing.T) {
 	require.ErrorContains(t, err, `no Mistral quota account is configured for channel "Mistral (other)"`)
 }
 
-// newMistralAutoDisableServer serves the console allowance of one account and
-// flips it between an exhausted and a refilled plan, so a test can take a channel
-// through the disable and the recovery of the same allowance.
+// newMistralAutoDisableServer serves the allowance of one account and flips it
+// between an exhausted and a refilled plan, so a test can take a channel through
+// the disable and the recovery of the same allowance. Both sources report the
+// same figure, because the balance path reads the key endpoint first.
 type mistralAutoDisableServer struct {
 	*httptest.Server
 	exhausted bool
@@ -122,6 +191,12 @@ func newMistralAutoDisableState(t *testing.T) *mistralAutoDisableServer {
 		percentage, limit := 100.0, 150.0
 		if !state.exhausted {
 			percentage, limit = 65.79, 150.0
+		}
+		if r.URL.Path == "/v1/billing/budget" {
+			_, _ = fmt.Fprintf(w,
+				`{"vibe_budget":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}`,
+				percentage, limit)
+			return
 		}
 		_, _ = fmt.Fprintf(w,
 			`{"result":{"data":{"json":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`,

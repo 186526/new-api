@@ -15,15 +15,14 @@ import (
 )
 
 // MistralQuotaRefreshInterval is how often the configured Mistral accounts
-// publish their monthly allowance to the metrics endpoint. The console is the
-// primary source for every account that has a session, so this interval is what
-// the console is polled at: each tick reads every account once, which the
-// deployed one-minute value turns into five requests a minute for the five
-// configured accounts (about 300 an hour), with no pause between them because
-// POLLING_INTERVAL is unset. A failed refresh stretches the wait between ticks:
-// a rejected session backs off to six intervals, any other failed source to
-// two, and a tick in which every account answers re-jitters the interval. Each
-// tick still adds jitter so the accounts do not poll on an exact schedule.
+// publish their monthly allowance to the metrics endpoint. Each tick reads every
+// account once, with the key its channel carries, which the deployed one-minute
+// value turns into one request per account a minute, with no pause between them
+// because POLLING_INTERVAL is unset. A failed refresh stretches the wait between
+// ticks: a rejected credential backs off to six intervals, any other failed
+// source to two, and a tick in which every account answers re-jitters the
+// interval. Each tick still adds jitter so the accounts do not poll on an exact
+// schedule.
 const MistralQuotaRefreshInterval = time.Minute
 
 const mistralQuotaMaxBackoff = time.Hour
@@ -52,6 +51,13 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 	missing := newMistralMissingChannels(accounts)
 	missing.recordChannels(channels)
 	for _, account := range accounts {
+		// The channel is resolved before the allowance is read, so the allowance
+		// is read with the key the channel actually calls the upstream with
+		// instead of the key recorded in the accounts file, and so the series of an
+		// account whose channel is gone is labelled channel_configured="false"
+		// instead of reading as a live channel.
+		channel, orphaned := channels.resolve(account.Channel)
+		account.ChannelKey = mistralChannelKey(channel)
 		quota, err := client.Fetch(context.Background(), account)
 		if err != nil {
 			result.failed = true
@@ -62,10 +68,6 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 			common.SysLog(common.LogText("failed to refresh Mistral quota: channel=%s, error=%v", account.Channel, err))
 			continue
 		}
-		// The channel is resolved before the allowance is published, so the
-		// series of an account whose channel is gone is labelled
-		// channel_configured="false" instead of reading as a live channel.
-		channel, orphaned := channels.resolve(account.Channel)
 		appmetrics.ObserveUpstreamQuota(appmetrics.UpstreamQuota{
 			Channel:         quota.Channel,
 			Windows:         mistralQuotaWindows(quota),
@@ -161,7 +163,7 @@ var mistralMissingChannelLog struct {
 	reported string
 }
 
-// mistralQuotaWindows lists the merged monthly allowance the console reported.
+// mistralQuotaWindows lists the merged monthly allowance the source reported.
 // Vibe and Studio draw on one allowance, so the account publishes one window:
 // a second scope would show a plan amount every plan has stopped carrying.
 func mistralQuotaWindows(quota *service.MistralQuota) []appmetrics.QuotaWindow {

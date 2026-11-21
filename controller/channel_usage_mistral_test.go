@@ -161,6 +161,41 @@ func TestGetMistralChannelUsageWithoutAccount(t *testing.T) {
 	assert.Equal(t, `no Mistral quota account is configured for channel "Mistral (pro)"`, body["message"])
 }
 
+// TestGetMistralChannelUsageReadsTheChannelKey requires the usage dialog of a
+// channel to read the allowance with the key the channel carries. The accounts
+// file names a key of the free plan (100% of 10 USD), which is what the dialog
+// reported while the channel's own key still had about 148.14 USD of 150.
+func TestGetMistralChannelUsageReadsTheChannelKey(t *testing.T) {
+	setupMistralBalanceTest(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/billing/budget" {
+			if r.Header.Get("Authorization") == "Bearer mstrl_free" {
+				_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":100,"initial_budget":10}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"vibe_budget":{"usage_percentage":1.238795712,"initial_budget":150,"reset_at":"2026-12-01T00:00:00Z"}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral Vibe (xu.bo)","cookie":"ory_session_x=stale","vibeKey":"mstrl_free","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_channel", Name: "Mistral Vibe (xu.bo)"}
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	_, body := getMistralUsage(t, newMistralUsageRouter(), channel.Id)
+
+	require.Equal(t, true, body["success"])
+	data := body["data"].(map[string]any)
+	budgets := data["budgets"].([]any)
+	require.Len(t, budgets, 1)
+	merged := budgets[0].(map[string]any)
+	assert.InDelta(t, 1.238795712, merged["usage_percentage"], 1e-9)
+	assert.InDelta(t, 150.0, merged["limit_usd"], 1e-9)
+	assert.InDelta(t, 148.14, merged["remaining_usd"], 0.01)
+}
+
 func TestGetMistralChannelUsageReportsRejectedSession(t *testing.T) {
 	setupMistralBalanceTest(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +209,7 @@ func TestGetMistralChannelUsageReportsRejectedSession(t *testing.T) {
 	_, body := getMistralUsage(t, newMistralUsageRouter(), channel.Id)
 
 	assert.Equal(t, false, body["success"])
-	assert.Contains(t, body["message"], "session was rejected")
+	assert.Contains(t, body["message"], "rejected the credential")
 }
 
 func TestGetMistralChannelUsageForMissingChannel(t *testing.T) {

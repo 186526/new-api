@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -59,18 +60,34 @@ func (i mistralChannelIndex) resolve(name string) (*model.Channel, bool) {
 // updateChannelMistralBalance reports what is left of the account's merged
 // monthly allowance as the channel balance. Mistral bills Vibe and Studio from
 // one allowance, so every channel of the account draws on the same figure and
-// the key the channel carries no longer selects a side. The allowance lives in
-// the console, so the account is matched by channel name.
+// the key the channel carries no longer selects a side. The allowance is read
+// with the channel's own key, so a key left behind in the accounts file cannot
+// decide the balance of a channel that was rotated since.
 func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 	account, err := findMistralQuotaAccount(channel.Name)
 	if err != nil {
 		return 0, err
 	}
+	account.ChannelKey = mistralChannelKey(channel)
 	quota, err := service.FetchMistralQuota(context.Background(), account)
 	if err != nil {
 		return 0, err
 	}
 	return applyMistralChannelBalance(channel, quota)
+}
+
+// mistralChannelKey returns the key a channel calls the upstream with, or an
+// empty string for a channel that carries none. A Mistral channel holds one key,
+// so the first key of a multi-line value is the one it uses.
+func mistralChannelKey(channel *model.Channel) string {
+	if channel == nil {
+		return ""
+	}
+	keys := channel.GetKeys()
+	if len(keys) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(keys[0])
 }
 
 // storeMistralChannelBalance stores the allowance of a channel whose quota was
