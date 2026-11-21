@@ -70,11 +70,11 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 		if orphaned {
 			missing.recordAbsent(account.Channel)
 		}
-		// The channel balance shows the allowance the channel key consumes, and
-		// the balance sweep skips a disabled channel, so it is refreshed here for
-		// every configured channel instead. An account without a channel has no
-		// balance to store.
-		if err := storeMistralChannelBalance(channel, account, quota); err != nil {
+		// The channel balance shows the account's merged allowance, and the
+		// balance sweep visits a disabled channel only when it disabled it
+		// itself, so it is refreshed here for every configured channel instead.
+		// An account without a channel has no balance to store.
+		if err := storeMistralChannelBalance(channel, quota); err != nil {
 			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, err))
 		}
 		time.Sleep(common.RequestInterval)

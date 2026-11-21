@@ -191,8 +191,8 @@ func (c *MistralQuotaClient) Fetch(ctx context.Context, account MistralQuotaAcco
 
 	quota := &MistralQuota{Channel: channel, FetchedAt: time.Now()}
 	var firstErr error
-	for _, source := range c.allowanceSources(account) {
-		allowance, payg, err := source.fetch(ctx, account)
+	for _, fetch := range c.allowanceSources(account) {
+		allowance, payg, err := fetch(ctx, account)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -212,11 +212,6 @@ func (c *MistralQuotaClient) Fetch(ctx context.Context, account MistralQuotaAcco
 	return nil, errMistralAccountWithoutCredential
 }
 
-// mistralAllowanceSource is one endpoint that reports the merged allowance.
-type mistralAllowanceSource struct {
-	fetch func(context.Context, MistralQuotaAccount) (*MistralBudget, bool, error)
-}
-
 // allowanceSources lists the endpoints the allowance is read from, in order. The
 // console answers with the plan amount; the Vibe app answers the same percentage
 // without it. The public billing endpoint is not a fallback for either: it
@@ -225,13 +220,13 @@ type mistralAllowanceSource struct {
 // figure. It is read only for an account that has no session at all, and a
 // console answer that redirects to the login page or answers 401 falls through
 // to the next source instead of being reported as the allowance.
-func (c *MistralQuotaClient) allowanceSources(account MistralQuotaAccount) []mistralAllowanceSource {
+func (c *MistralQuotaClient) allowanceSources(account MistralQuotaAccount) []func(context.Context, MistralQuotaAccount) (*MistralBudget, bool, error) {
 	if account.Cookie == "" {
-		return []mistralAllowanceSource{{fetch: c.fetchKeyBudget}}
+		return []func(context.Context, MistralQuotaAccount) (*MistralBudget, bool, error){c.fetchKeyBudget}
 	}
-	return []mistralAllowanceSource{
-		{fetch: c.fetchConsoleBudget},
-		{fetch: c.fetchVibeUsage},
+	return []func(context.Context, MistralQuotaAccount) (*MistralBudget, bool, error){
+		c.fetchConsoleBudget,
+		c.fetchVibeUsage,
 	}
 }
 

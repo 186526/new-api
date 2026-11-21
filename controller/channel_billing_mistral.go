@@ -74,11 +74,12 @@ func updateChannelMistralBalance(channel *model.Channel) (float64, error) {
 }
 
 // storeMistralChannelBalance stores the allowance of a channel whose quota was
-// already fetched by the quota refresh, so the balance does not depend on the
-// channel balance sweep, which only visits enabled channels. A nil channel is an
-// account without a channel: its allowance is still published as the upstream
-// quota, but there is no channel balance to store.
-func storeMistralChannelBalance(channel *model.Channel, account service.MistralQuotaAccount, quota *service.MistralQuota) error {
+// already fetched by the quota refresh, so the balance does not wait for the
+// channel balance sweep, which reads a disabled channel only when it disabled it
+// for its balance. A nil channel is an account without a channel: its allowance
+// is still published as the upstream quota, but there is no channel balance to
+// store.
+func storeMistralChannelBalance(channel *model.Channel, quota *service.MistralQuota) error {
 	if channel == nil {
 		return nil
 	}
