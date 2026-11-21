@@ -86,6 +86,12 @@ func isSensitiveURLQueryKey(key string) bool {
 		"secret",
 		"password",
 		"passwd",
+		// Payment callbacks: Epay signs with sign and sends its merchant id
+		// beside it. Both stay masked on an upstream debug URL too; a channel
+		// that names its own auth query sign or pid then loses a readable
+		// value, which fails closed.
+		"sign",
+		"pid",
 		"signature",
 		"sig",
 		"awsaccesskeyid",
@@ -97,6 +103,126 @@ func isSensitiveURLQueryKey(key string) bool {
 	return strings.Contains(normalized, "token") ||
 		strings.Contains(normalized, "secret") ||
 		strings.Contains(normalized, "signature")
+}
+
+// paymentCallbackQueryKeyNames names the signature keys the payment gateways
+// known to this tree use. A key the list does not hold can still be a
+// signature, which is why the access log also recognises a callback by its
+// path; this list only widens the net for a callback logged under another
+// path, such as the signed redirect to a frontend return page.
+var paymentCallbackQueryKeyNames = map[string]bool{
+	"pid":        true,
+	"sig":        true,
+	"hash":       true,
+	"hmac":       true,
+	"digest":     true,
+	"epay_sign":  true,
+	"caller_key": true,
+}
+
+// paymentSignatureNameSegments are the words a separated key segment can be
+// without being a payment signature. Read alongside paymentCallbackQueryKeyNames,
+// they let a name be judged word by word instead of by substring, so `design`
+// and `signal` keep their value in the log.
+var paymentSignatureNameSegments = map[string]bool{
+	"sign":   true,
+	"sig":    true,
+	"hmac":   true,
+	"hash":   true,
+	"digest": true,
+}
+
+// IsPaymentCallbackPath reports whether a path is one this tree serves a
+// payment callback on. The decision reads only the path: the route names come
+// from new-api's own router, so the gateway cannot move a callback out of this
+// rule by naming its signature parameter something else. A custom notify_url
+// changes the scheme, host and any path prefix before the route, so the rule
+// reads every path segment instead of matching the registered path whole.
+//
+// A false positive only drops one log line's query; the handler still reads
+// the query it was sent.
+func IsPaymentCallbackPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	segments := strings.Split(strings.TrimSuffix(path, "/"), "/")
+	for _, segment := range segments {
+		if segment == "webhook" {
+			return true
+		}
+	}
+	switch segments[len(segments)-1] {
+	case "notify", "return":
+		// The Epay callback and its signed redirect are the routes that end
+		// this way; both carry the signature in the query.
+		return true
+	}
+	return false
+}
+
+// IsPaymentCallbackQueryName reports whether one query key names a payment
+// signature. The name is read in segments, so `provider_sign` and
+// `merchantSign` count while `design` and `signal` do not: a page keeps its
+// readable query unless a segment really is a signature word.
+func IsPaymentCallbackQueryName(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	if normalized == "" {
+		return false
+	}
+	if paymentCallbackQueryKeyNames[normalized] {
+		return true
+	}
+	for _, segment := range strings.FieldsFunc(normalized, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.'
+	}) {
+		if paymentSignatureNameSegments[segment] {
+			return true
+		}
+	}
+	// A camelCase name has no separator, so read the suffixes too, but only at a
+	// word boundary: `merchantSign` counts and `design` does not.
+	for _, suffix := range []string{"signature", "hmac", "sign", "sig"} {
+		if !strings.HasSuffix(normalized, suffix) {
+			continue
+		}
+		start := len(normalized) - len(suffix)
+		if start == 0 {
+			return true
+		}
+		rawSuffix := key[len(key)-len(suffix):]
+		if rawSuffix[0] >= 'A' && rawSuffix[0] <= 'Z' {
+			return true
+		}
+		if !isASCIILetter(normalized[start-1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isASCIILetter(character byte) bool {
+	return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')
+}
+
+// IsPaymentCallbackQueryText reports whether raw query text carries a payment
+// signature key. It is the same net as IsPaymentCallbackQuery for a query that
+// arrived as text, as one does when a path parameter swallowed the "?" and the
+// router resolved the query into the path.
+func IsPaymentCallbackQueryText(rawQuery string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(rawQuery, "&") {
+		rawKey, _, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		if IsPaymentCallbackQueryName(key) {
+			return true
+		}
+	}
+	return false
 }
 
 func GetAPIVersion(c *gin.Context) string {

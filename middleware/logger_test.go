@@ -95,7 +95,11 @@ func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
 	content, err = os.ReadFile(logger.GetCurrentLogPath())
 	require.NoError(t, err)
 	assert.Contains(t, string(content), "/ok/after-rotation")
-	assert.Contains(t, string(content), "[Recovery]")
-	assert.Contains(t, string(content), "rotation-panic-marker\n")
+	// PanicRecover writes the panic, its target and its stack through
+	// common.SysLog rather than letting gin dump the request, so the log has the
+	// [SYS] line and a source frame and none of gin's [Recovery] output.
+	assert.Contains(t, string(content), "panic detected: rotation-panic-marker")
+	assert.Contains(t, string(content), "stacktrace from panic:")
 	assert.Contains(t, string(content), "middleware/logger_test.go")
+	assert.NotContains(t, string(content), "[Recovery]")
 }

@@ -444,10 +444,11 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 		return "", fmt.Errorf("failed to read response: %v", err)
 	}
 
-	logger.LogInfo(ctx, common.LogText("Creem API response received trade_no=%s status_code=%d body=%q", referenceId, resp.StatusCode, string(body)))
+	logger.LogInfo(ctx, common.LogText("Creem API response received trade_no=%s status_code=%d body=%q", referenceId, resp.StatusCode, paymentLogSummary(body)))
 
 	// 检查响应状态
 	if resp.StatusCode/100 != 2 {
+		logger.LogWarn(ctx, common.LogText("Creem API rejected checkout trade_no=%s status_code=%d", referenceId, resp.StatusCode))
 		return "", fmt.Errorf("Creem API http status %d ", resp.StatusCode)
 	}
 	// 解析响应
