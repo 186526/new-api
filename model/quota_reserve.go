@@ -1194,22 +1194,70 @@ func persistTokenQuotaDelta(id int, delta int) error {
 	return nil
 }
 
-func reserveUserQuotaDB(id int, quota int) (bool, error) {
+// reserveUserQuotaDB writes a wallet reservation against the row, treating the
+// delta the accumulator still owes that row as part of the balance the WHERE
+// clause sees. A queued debit lowers what the row may fund and a queued credit
+// raises it, so the comparison answers the balance the wallet holds rather than
+// the balance the row happens to hold, and a credit is never a reason to refuse.
+func reserveUserQuotaDB(id int, quota int, owed int) (bool, error) {
 	result := DB.Model(&User{}).
-		Where("id = ? AND quota >= ?", id, quota).
+		Where("id = ? AND quota + ? >= ?", id, owed, quota).
 		Update("quota", gorm.Expr("quota - ?", quota))
 	return result.RowsAffected == 1, result.Error
 }
 
-func reserveTokenQuotaDB(id int, quota int) (bool, error) {
+func reserveTokenQuotaDB(id int, quota int, owed int) (bool, error) {
 	result := DB.Model(&Token{}).
-		Where("id = ? AND remain_quota >= ?", id, quota).
+		Where("id = ? AND remain_quota + ? >= ?", id, owed, quota).
 		Updates(map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"accessed_time": common.GetTimestamp(),
 		})
 	return result.RowsAffected == 1, result.Error
+}
+
+// reserveQuotaHoldingAccumulator runs a row reservation with the accumulator for
+// this kind held still, so a spend queued between the balance the WHERE clause
+// sees and the write cannot slip through: the read of the owed delta and the
+// update it authorizes are one critical section. The reserve callback is handed
+// that owed delta, which it folds into the comparison.
+//
+// Both locks are part of that section. Queuing a delta takes only the kind lock,
+// so the kind lock has to span the update; releasing it before the write is the
+// check-then-act window the guard exists to close. The flush lock covers the
+// other half: a flush swaps the accumulator out, then writes rows, then clears
+// its in-flight record, and between the swap and the write the row is stale
+// while the accumulator looks empty, so the in-flight record alone would not
+// answer.
+//
+// The cost is one row update per reservation: the kind lock stalls that kind's
+// queuing and the flush for one database round trip. It is only paid on a path
+// that has already lost its signed ledger, and the read path already holds the
+// flush lock across one row read. The lock order is flush then kind, matching
+// takeBatchUpdateStores, so nothing here can close a cycle with a flush.
+func reserveQuotaHoldingAccumulator(kind int, subject int, reserve func(owed int) (bool, error)) (bool, error) {
+	if !common.BatchUpdateEnabled {
+		return reserve(0)
+	}
+	batchUpdateFlushLock.Lock()
+	defer batchUpdateFlushLock.Unlock()
+	batchUpdateLocks[kind].Lock()
+	defer batchUpdateLocks[kind].Unlock()
+	owed := batchUpdateStores[kind][subject] + batchUpdateInFlight[kind][subject]
+	return reserve(owed)
+}
+
+// reserveUserQuotaFromRow and reserveTokenQuotaFromRow are the shorthand the
+// reserve paths use: the row answers, with the accumulator held still.
+func reserveUserQuotaFromRow(id int, quota int) (bool, error) {
+	return reserveQuotaHoldingAccumulator(BatchUpdateTypeUserQuota, id,
+		func(owed int) (bool, error) { return reserveUserQuotaDB(id, quota, owed) })
+}
+
+func reserveTokenQuotaFromRow(id int, quota int) (bool, error) {
+	return reserveQuotaHoldingAccumulator(BatchUpdateTypeTokenQuota, id,
+		func(owed int) (bool, error) { return reserveTokenQuotaDB(id, quota, owed) })
 }
 
 // quotaBalanceHeldByAccumulator answers the balance a subject holds right now,
@@ -1246,20 +1294,6 @@ func unflushedQuotaDelta(subject int, kind int) int {
 	defer batchUpdateLocks[kind].Unlock()
 	return batchUpdateStores[kind][subject] + batchUpdateInFlight[kind][subject]
 }
-
-// hasUnflushedQuotaDebit reports whether the row for this subject lags the
-// accumulator by any amount. It is deliberately conservative in the direction
-// that costs availability rather than quota: a false positive refuses a
-// reservation or a database answer, which the caller reads as "not now", never
-// as quota it may spend.
-func hasUnflushedQuotaDebit(subject int, kind int) bool {
-	return unflushedQuotaDelta(subject, kind) != 0
-}
-
-// errQuotaRowLagsDebit reports that the only balance available predates a debit
-// the accumulator has not flushed. It is never answered as an empty wallet: the
-// wallet is busy, not empty.
-var errQuotaRowLagsDebit = errors.New("database balance predates an unflushed quota debit")
 
 // discardUnverifiedUserQuotaCache drops a hash whose counters contradict their
 // signature. The next read republishes the balance from the database, the only
@@ -1299,14 +1333,7 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 		switch {
 		case errors.Is(reserveErr, ErrQuotaLedgerUnverified) || result == cacheQuotaUnverified:
 			discardUnverifiedUserQuotaCache(id, ledgerRefusalReason(reserveErr))
-			if hasUnflushedQuotaDebit(id, BatchUpdateTypeUserQuota) {
-				// The row predates a spend the accumulator has not flushed, so it
-				// cannot answer, and republishing from it would sign a balance the
-				// wallet does not hold. The refusal is the only answer that cannot
-				// authorize the spend again; it ends when the flush writes the row.
-				return false, false, errQuotaRowLagsDebit
-			}
-			reserved, err = reserveUserQuotaDB(id, quota)
+			reserved, err = reserveUserQuotaFromRow(id, quota)
 			return reserved, true, err
 		case errors.Is(reserveErr, errQuotaLedgerContended):
 			// A transient: the wallet was never consulted, so answering it as
@@ -1320,13 +1347,10 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 		case result == cacheQuotaInsufficient:
 			return false, false, nil
 		}
-		// The hash is absent or unusable, so answering from the row would authorize
-		// exactly what the ledger exists to stop, and republishing from that row
-		// would sign it. Refuse while the accumulator still owes the row a debit;
-		// the refusal ends when the flush writes it.
-		if hasUnflushedQuotaDebit(id, BatchUpdateTypeUserQuota) {
-			return false, false, errQuotaRowLagsDebit
-		}
+		// The hash is absent or unusable, so the row has to answer. Republishing
+		// from a row the accumulator has not written would sign a balance the wallet
+		// does not hold, so try one hydrate while the hash can still be rebuilt; a
+		// reservation that falls through to the row has the owed delta folded in.
 		if hydrated {
 			break
 		}
@@ -1339,12 +1363,9 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 		return false, false, errQuotaLedgerContended
 	}
 	// The hash could not be published: a fence blocks it, or the balance never
-	// arrived. The database answers the reservation only when it is not behind an
-	// unflushed debit.
-	if hasUnflushedQuotaDebit(id, BatchUpdateTypeUserQuota) {
-		return false, false, errQuotaRowLagsDebit
-	}
-	reserved, err = reserveUserQuotaDB(id, quota)
+	// arrived. The row answers, with the accumulator's owed delta folded in, so a
+	// spend the flush has not written yet still counts against this reservation.
+	reserved, err = reserveUserQuotaFromRow(id, quota)
 	return reserved, true, err
 }
 
@@ -1359,13 +1380,7 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 		switch {
 		case errors.Is(reserveErr, ErrQuotaLedgerUnverified) || result == cacheQuotaUnverified:
 			discardUnverifiedTokenQuotaCache(id, key, ledgerRefusalReason(reserveErr))
-			if hasUnflushedQuotaDebit(id, BatchUpdateTypeTokenQuota) {
-				// See the user twin: the row cannot answer while the accumulator
-				// still owes it a spend, and republishing from it would sign a
-				// balance the token does not hold.
-				return false, false, errQuotaRowLagsDebit
-			}
-			reserved, err = reserveTokenQuotaDB(id, quota)
+			reserved, err = reserveTokenQuotaFromRow(id, quota)
 			return reserved, true, err
 		case errors.Is(reserveErr, errQuotaLedgerContended):
 			contended++
@@ -1377,11 +1392,8 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 		case result == cacheQuotaInsufficient:
 			return false, false, nil
 		}
-		// See the user twin: refusing here is what makes the refusal hold for every
-		// repeat of the request, not only the first one.
-		if hasUnflushedQuotaDebit(id, BatchUpdateTypeTokenQuota) {
-			return false, false, errQuotaRowLagsDebit
-		}
+		// See the user twin: the ledger could not be published, so the row
+		// answers, with the accumulator's owed delta folded in.
 		if hydrated {
 			break
 		}
@@ -1393,10 +1405,7 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 	if contended > 0 {
 		return false, false, errQuotaLedgerContended
 	}
-	if hasUnflushedQuotaDebit(id, BatchUpdateTypeTokenQuota) {
-		return false, false, errQuotaRowLagsDebit
-	}
-	reserved, err = reserveTokenQuotaDB(id, quota)
+	reserved, err = reserveTokenQuotaFromRow(id, quota)
 	return reserved, true, err
 }
 
@@ -1414,22 +1423,24 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 		return reserveRegionQuota(RegionSubjectUser, strconv.Itoa(id), quota)
 	}
 	if !common.RedisEnabled {
-		return reserveUserQuotaDB(id, quota)
+		return reserveUserQuotaFromRow(id, quota)
 	}
 
 	reserved, fromDB, err := reserveUserQuotaCached(id, quota)
 	if fromDB {
 		return reserved, err
 	}
-	if errors.Is(err, errQuotaLedgerContended) || errors.Is(err, errQuotaRowLagsDebit) {
-		// Falling back here is the over-spend the ledger exists to stop: under
-		// batch accumulation the database row predates the debit. The wheel is
-		// busy, not empty, so the caller is told to try again.
+	if errors.Is(err, errQuotaLedgerContended) {
+		// Falling back here is the over-spend the ledger exists to stop: the
+		// wallet was never consulted, so the caller is told to try again.
 		return false, err
 	}
 	if err != nil {
-		common.SysLog(common.LogText("user quota cache reserve unavailable, falling back to database: %s", err.Error()))
-		return reserveUserQuotaDB(id, quota)
+		// A Redis that answers LOADING or times out is the one moment the
+		// accumulator is the only record of a committed spend, so this exit needs
+		// the accumulator held still more than the others, not less.
+		common.SysLog(common.LogText("user quota cache reserve unavailable, answering from the database: %s", err.Error()))
+		return reserveUserQuotaFromRow(id, quota)
 	}
 	if !reserved {
 		return false, nil
@@ -1457,19 +1468,21 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
 	if !common.RedisEnabled {
-		return reserveTokenQuotaDB(id, quota)
+		return reserveTokenQuotaFromRow(id, quota)
 	}
 
 	reserved, fromDB, err := reserveTokenQuotaCached(id, key, quota)
 	if fromDB {
 		return reserved, err
 	}
-	if errors.Is(err, errQuotaLedgerContended) || errors.Is(err, errQuotaRowLagsDebit) {
+	if errors.Is(err, errQuotaLedgerContended) {
 		return false, err
 	}
 	if err != nil {
-		common.SysLog(common.LogText("token quota cache reserve unavailable, falling back to database: %s", err.Error()))
-		return reserveTokenQuotaDB(id, quota)
+		// See the user twin: a Redis that is down is the moment the accumulator is
+		// the only record of a committed spend.
+		common.SysLog(common.LogText("token quota cache reserve unavailable, answering from the database: %s", err.Error()))
+		return reserveTokenQuotaFromRow(id, quota)
 	}
 	if !reserved {
 		return false, nil

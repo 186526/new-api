@@ -1414,10 +1414,10 @@ func TestForgedVersion3HashIsNotMigrated(t *testing.T) {
 }
 
 // Under batch accumulation the row lags every spend until the next flush. When
-// the signed ledger is no longer usable the fallback must not answer from that
-// row: measured before the fix, wallet 100 with two accumulated spends of 30
-// accepted a reserve of 100 (the whole pre-debit balance) and took the row to 0.
-// The row cannot answer, so the reservation is refused and reported.
+// the signed ledger is no longer usable, the row may still answer, but only with
+// the accumulator's owed debit folded in: measured before the fix, wallet 100
+// with two accumulated spends of 30 accepted a reserve of 100 (the whole
+// pre-debit balance) and took the row to 0. The folded comparison answers 40.
 func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -1443,17 +1443,24 @@ func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 		"QuotaLedgerExp", int64(1)).Err())
 
 	reserved, err = TryReserveUserQuota(user.Id, 100)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a row behind the accumulator cannot answer")
+	require.NoError(t, err, "the row answers, with the owed debit folded in")
 	assert.False(t, reserved, "the pre-debit balance is not spendable")
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no row spend either")
 
-	// After the flush the row holds the spends and the same reserve is refused
-	// for the right reason: the balance really is 40.
-	batchUpdate()
-	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
-	reserved, err = TryReserveUserQuota(user.Id, 100)
+	// The balance the accumulator implies is 40, so 40 is spendable and 41 is not.
+	reserved, err = TryReserveUserQuota(user.Id, 41)
 	require.NoError(t, err)
-	assert.False(t, reserved, "the flushed row funds 40, not 100")
+	assert.False(t, reserved, "41 is past the implied balance")
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "40 is exactly what the wallet holds")
+
+	// After the flush the row holds every spend and the numbers still agree.
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 1)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row is drained")
 }
 
 // The token twin of the case above.
@@ -1480,9 +1487,22 @@ func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingTokenRow(t *testing.T) 
 		"QuotaLedgerExp", int64(1)).Err())
 
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
-	assert.False(t, reserved)
+	require.NoError(t, err, "the row answers, with the owed debit folded in")
+	assert.False(t, reserved, "the pre-debit balance is not spendable")
 	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 71, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "71 is past the implied balance")
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 70, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "70 is exactly what the token holds")
+
+	batchUpdate()
+	assert.Equal(t, 0, getTokenFromDB(t, token.Id).RemainQuota)
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 1, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the flushed row is drained")
 }
 
 // A metadata write refreshes the hash but not the ledger, so the hash must not
@@ -1673,11 +1693,12 @@ func TestRowFirstDeltaOntoAStaleHashStillConverges(t *testing.T) {
 	assert.Equal(t, row, balance, "both deltas landed once each")
 }
 
-// The r7 acceptance shape: the guard has to hold for the whole window, not for
-// one request. A retry, a second relay replica or a client that resends the same
-// call all arrive as a second request, and the first one discarded the hash on
-// its way out. Measured before the fix: step 1 refused and step 2 accepted the
-// whole pre-debit balance, leaving the row at -60 against a wallet holding 40.
+// The r7 acceptance shape, kept: the folded balance has to hold for every repeat
+// of the request, not for one. A retry, a second relay replica or a client that
+// resends the same call all arrive as another request, and the first one
+// discarded the hash on its way out. Measured before the fix: a retry accepted
+// the whole pre-debit balance beyond what the wallet held, leaving the row below
+// the spends it already owed.
 func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameReserve(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -1698,17 +1719,29 @@ func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameReserve(t *testing.T) {
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		reserved, err := TryReserveUserQuota(user.Id, 100)
-		assert.ErrorIs(t, err, errQuotaRowLagsDebit, "attempt %d must refuse", attempt)
-		assert.False(t, reserved, "attempt %d must not spend the pre-debit balance", attempt)
+		require.NoError(t, err, "attempt %d must answer, not fail", attempt)
+		assert.False(t, reserved, "attempt %d must not spend past the implied balance", attempt)
 		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "attempt %d must not move the row", attempt)
+	}
+	// The implied balance is 40, so exactly 40 is spendable on every repeat.
+	for attempt := 1; attempt <= 3; attempt++ {
+		reserved, err := TryReserveUserQuota(user.Id, 41)
+		require.NoError(t, err)
+		assert.False(t, reserved, "attempt %d cannot spend 41 past the implied 40", attempt)
 	}
 
 	batchUpdate()
 	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
-	reserved, err := TryReserveUserQuota(user.Id, 100)
+	reserved, err := TryReserveUserQuota(user.Id, 41)
 	require.NoError(t, err)
-	assert.False(t, reserved, "the flushed row funds 40, not 100")
+	assert.False(t, reserved, "the flushed row funds 40, not 41")
 	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the wallet holds 40 and pays 40")
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id), "a ledger reservation is queued, not written")
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the queued spend lands on the flush")
 }
 
 // The token twin: the mutation fence only hides this for ten seconds, and a
@@ -1730,17 +1763,22 @@ func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameTokenReserve(t *testing.T)
 		"QuotaLedgerExp", int64(1)).Err())
 
 	for attempt := 1; attempt <= 3; attempt++ {
-		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
-		assert.ErrorIs(t, err, errQuotaRowLagsDebit, "attempt %d must refuse", attempt)
-		assert.False(t, reserved, "attempt %d must not spend the pre-debit balance", attempt)
+		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 71, false)
+		require.NoError(t, err, "attempt %d must answer, not fail", attempt)
+		assert.False(t, reserved, "attempt %d must not spend past the implied 70", attempt)
 		assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "attempt %d must not move the row", attempt)
 	}
 
 	batchUpdate()
 	assert.Equal(t, 70, getTokenFromDB(t, token.Id).RemainQuota)
-	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 71, false)
 	require.NoError(t, err)
-	assert.False(t, reserved, "the flushed row funds 70, not 100")
+	assert.False(t, reserved, "the flushed row funds 70, not 71")
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 70, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the token holds 70 and pays 70")
+	batchUpdate()
+	assert.Equal(t, 0, getTokenFromDB(t, token.Id).RemainQuota, "the spend lands on the flush")
 }
 
 // A hash that is gone rather than expired is a different branch: no signature
@@ -1763,21 +1801,27 @@ func TestBatchVanishedHashDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
 
 	reserved, err = TryReserveUserQuota(user.Id, 100)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a vanished hash cannot make the row the authority")
-	assert.False(t, reserved)
+	require.NoError(t, err, "the row answers, with the owed debit folded in")
+	assert.False(t, reserved, "a vanished hash cannot make the row the authority")
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no row spend either")
 
-	// The refusal is not one-shot: the miss repeats on every attempt.
-	reserved, err = TryReserveUserQuota(user.Id, 100)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
-	assert.False(t, reserved)
+	// The answer is not one-shot: the same miss repeats on every attempt.
+	reserved, err = TryReserveUserQuota(user.Id, 41)
+	require.NoError(t, err)
+	assert.False(t, reserved, "41 is past the implied 40")
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
 
 	batchUpdate()
 	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
-	reserved, err = TryReserveUserQuota(user.Id, 100)
+	reserved, err = TryReserveUserQuota(user.Id, 41)
 	require.NoError(t, err)
 	assert.False(t, reserved, "the flushed row funds 40")
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the wallet holds 40 and pays 40")
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id), "a ledger reservation is queued, not written")
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the queued spend lands on the flush")
 }
 
 // The token twin of the vanished hash.
@@ -1797,13 +1841,13 @@ func TestBatchVanishedTokenHashDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheKey(token.Key)).Err())
 
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
-	assert.False(t, reserved)
+	require.NoError(t, err, "the row answers, with the owed debit folded in")
+	assert.False(t, reserved, "a vanished hash cannot make the row the authority")
 	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 
-	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit)
-	assert.False(t, reserved)
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 71, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "71 is past the implied 70")
 	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 
 	batchUpdate()
@@ -1838,19 +1882,23 @@ func TestBatchFlushWindowDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 
 	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
 	reserved, err = TryReserveUserQuota(user.Id, 100)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a mid-flush row cannot answer")
-	assert.False(t, reserved)
+	require.NoError(t, err, "a mid-flush row answers with the in-flight debit folded in")
+	assert.False(t, reserved, "the in-flight spend still counts")
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+	reserved, err = TryReserveUserQuota(user.Id, 41)
+	require.NoError(t, err)
+	assert.False(t, reserved, "41 is past the 40 the in-flight debit leaves")
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "40 is exactly what the wallet holds mid-flush")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the reserve was queued, not written")
 
 	writeBatchUpdateStores(stores)
 	clearBatchUpdateInFlight()
-	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
-	reserved, err = TryReserveUserQuota(user.Id, 100)
-	require.NoError(t, err)
-	assert.False(t, reserved, "the flushed row funds 40")
-	reserved, err = TryReserveUserQuota(user.Id, 40)
-	require.NoError(t, err)
-	assert.True(t, reserved, "the wallet is funded, not blocked")
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id), "the in-flight spend landed")
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "and the reserve that followed it")
 }
 
 // A signed ledger whose window has closed still describes the layout, so no
@@ -1880,8 +1928,8 @@ func TestExpiredButGenuinelySignedLedgerDoesNotAnswerFromTheLaggingRow(t *testin
 		"QuotaCredited", 100, "QuotaSpent", 10, "QuotaLedgerExp", expiresAt, "QuotaLedgerMAC", mac).Err())
 
 	reserved, err = TryReserveUserQuota(user.Id, 95)
-	assert.ErrorIs(t, err, errQuotaRowLagsDebit, "a closed window cannot fall back to the pre-debit row")
-	assert.False(t, reserved)
+	require.NoError(t, err, "the row answers with the owed debit folded in")
+	assert.False(t, reserved, "a closed window cannot spend from the pre-debit row")
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
 
 	// The read path must not report 100 either: that value feeds the trust bypass.
@@ -1894,6 +1942,12 @@ func TestExpiredButGenuinelySignedLedgerDoesNotAnswerFromTheLaggingRow(t *testin
 	reserved, err = TryReserveUserQuota(user.Id, 95)
 	require.NoError(t, err)
 	assert.False(t, reserved, "the flushed row funds 90")
+	reserved, err = TryReserveUserQuota(user.Id, 90)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the wallet holds 90 and pays 90")
+	assert.Equal(t, 90, getUserQuotaFromDB(t, user.Id), "a ledger reservation is queued, not written")
+	batchUpdate()
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the queued spend lands on the flush")
 }
 
 // A row-first caller hands the committed delta to the ledger. A Redis that
@@ -1953,4 +2007,239 @@ func TestReadAfterLedgerExpiryHoldsTheLiveBalance(t *testing.T) {
 	balance, err = GetUserQuota(user.Id, false)
 	require.NoError(t, err)
 	assert.Equal(t, 40, balance, "and the flushed row agrees")
+}
+
+// pauseNextQuotaUpdate registers a gorm hook that holds the first UPDATE after
+// it is called until the returned release function runs, so a test can observe
+// what is allowed to happen between a decision and the write it authorizes.
+func pauseNextQuotaUpdate(t *testing.T, name string) (entered <-chan struct{}, release func()) {
+	t.Helper()
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
+		enteredOnce.Do(func() { close(enteredCh) })
+		<-releaseCh
+	}))
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseCh) })
+		DB.Callback().Update().Remove(name)
+	})
+	return enteredCh, func() { releaseOnce.Do(func() { close(releaseCh) }) }
+}
+
+func unflushedTestDelta(subject int, kind int) int {
+	return batchUpdateStores[kind][subject] + batchUpdateInFlight[kind][subject]
+}
+
+// The conditional update and the delta it must respect have to be one critical
+// section. Queuing a spend takes batchUpdateLocks[kind]; a reservation that lets
+// that lock go before it writes can have a committed spend land between the
+// balance it decided on and the balance it wrote, and then the wallet pays both.
+// Measured before the fix: reserve accepted, spend queued during the paused
+// UPDATE, wallet 100 paid 30+100.
+func TestBatchReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	// The hash cannot be verified, so the reserve has to answer from the row.
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
+
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve")
+	defer release()
+
+	answer := make(chan error, 1)
+	reservedAnswer := make(chan bool, 1)
+	go func() {
+		reserved, err := TryReserveUserQuota(user.Id, 100)
+		reservedAnswer <- reserved
+		answer <- err
+	}()
+	<-entered
+
+	queued := make(chan error, 1)
+	go func() { queued <- DecreaseUserQuota(user.Id, 30, false) }()
+	select {
+	case err := <-queued:
+		require.NoError(t, err)
+		release()
+		<-answer
+		t.Fatal("a committed spend was queued between the balance the reserve decided on and the row it wrote")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	release()
+	require.NoError(t, <-answer)
+	assert.True(t, <-reservedAnswer, "the wallet held 100 when the reserve wrote")
+	require.NoError(t, <-queued)
+
+	batchUpdate()
+	assert.Equal(t, -30, getUserQuotaFromDB(t, user.Id), "the spend is ordered after the reserve, not inside it")
+}
+
+// The token twin.
+func TestBatchTokenReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
+
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve")
+	defer release()
+
+	answer := make(chan error, 1)
+	reservedAnswer := make(chan bool, 1)
+	go func() {
+		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
+		reservedAnswer <- reserved
+		answer <- err
+	}()
+	<-entered
+
+	queued := make(chan error, 1)
+	go func() { queued <- DecreaseTokenQuota(token.Id, token.Key, 30) }()
+	select {
+	case err := <-queued:
+		require.NoError(t, err)
+		release()
+		<-answer
+		t.Fatal("a committed spend was queued between the balance the reserve decided on and the row it wrote")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	release()
+	require.NoError(t, <-answer)
+	assert.True(t, <-reservedAnswer, "the token held 100 when the reserve wrote")
+	require.NoError(t, <-queued)
+
+	batchUpdate()
+	assert.Equal(t, -30, getTokenFromDB(t, token.Id).RemainQuota, "the spend is ordered after the reserve, not inside it")
+}
+
+// A drained wallet whose accumulator holds the spends is still a drained wallet.
+// The Redis-error exit used to hand the reservation to the row with no regard
+// for the accumulator. Measured before the fix: wallet 100, two spends of 30
+// queued, Redis answering LOADING, a reserve of 100 was accepted and the row
+// ended at -60.
+func TestBatchRedisErrorDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, DecreaseUserQuota(user.Id, 30, false))
+	require.NoError(t, DecreaseUserQuota(user.Id, 30, false))
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the accumulator holds both spends")
+
+	server.SetError("LOADING Redis is loading the dataset in memory")
+
+	reserved, err := TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err, "a drained wallet is insufficient, not an internal error")
+	assert.False(t, reserved, "40 is left, not 100")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "a refused reserve does not move the row")
+
+	batchUpdate()
+	assert.Equal(t, 40, getUserQuotaFromDB(t, user.Id))
+}
+
+// The token twin of the Redis-error exit.
+func TestBatchTokenRedisErrorDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	require.NoError(t, DecreaseTokenQuota(token.Id, token.Key, 30))
+	require.NoError(t, DecreaseTokenQuota(token.Id, token.Key, 30))
+	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+
+	server.SetError("LOADING Redis is loading the dataset in memory")
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "40 is left, not 100")
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+
+	batchUpdate()
+	assert.Equal(t, 40, getTokenFromDB(t, token.Id).RemainQuota)
+}
+
+// A credit the accumulator has not flushed yet is money the wallet holds. The
+// guard used to read any unflushed delta as a debit, refuse, and hand the caller
+// an error that `service/billing_session.go` turns into a non-retryable 500.
+// Measured before the fix: wallet 100, credit of 50 queued, a reserve of 140 was
+// refused and only succeeded after the flush.
+//
+// The hash is made unverifiable on purpose: it is the state the reserve falls
+// back from, and the queued credit is then the only record that the wallet holds
+// 150. Without folding it in, the row's 100 refuses a spend the wallet can pay.
+func TestBatchQueuedCreditFundsTheReserve(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, IncreaseUserQuota(user.Id, 50, false))
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the credit is queued, not written")
+	require.Equal(t, 50, unflushedTestDelta(user.Id, BatchUpdateTypeUserQuota))
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
+		"QuotaCredited", 1_000_000).Err())
+
+	reserved, err := TryReserveUserQuota(user.Id, 140)
+	require.NoError(t, err, "a queued credit funds the reserve; it is not a reason to fail the request")
+	assert.True(t, reserved, "the wallet holds 150, so 140 is funded")
+	assert.Equal(t, -40, getUserQuotaFromDB(t, user.Id), "the row is written before the credit lands")
+
+	batchUpdate()
+	assert.Equal(t, 10, getUserQuotaFromDB(t, user.Id))
+
+	reserved, err = TryReserveUserQuota(user.Id, 11)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the wallet holds 10")
+}
+
+// The token twin, and the production-reachable one: the token ledger runs on the
+// proxy with batch accumulation on.
+func TestBatchQueuedTokenCreditFundsTheReserve(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, IncreaseTokenQuota(token.Id, token.Key, 50))
+	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+	require.Equal(t, 50, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota))
+
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
+		"QuotaGranted", 1_000_000).Err())
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 140, false)
+	require.NoError(t, err, "a queued credit funds the reserve; it is not a reason to fail the request")
+	assert.True(t, reserved, "the token holds 150, so 140 is funded")
+	assert.Equal(t, -40, getTokenFromDB(t, token.Id).RemainQuota)
+
+	batchUpdate()
+	assert.Equal(t, 10, getTokenFromDB(t, token.Id).RemainQuota)
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 11, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the token holds 10")
 }
