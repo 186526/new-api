@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -99,13 +98,15 @@ func imageMimeType(image *dto.MessageImageUrl) string {
 	return image.MimeType
 }
 
-// validBase64 reports whether encoded decodes without error. The decoder fails
-// only once the body is being streamed upstream, so the payload is decoded into
-// io.Discard here instead: a malformed image is dropped before the upload URL is
-// dialed, which is what the decode-then-buffer uploader did. Nothing is held.
-func validBase64(encoded string) bool {
-	_, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
-	return err == nil
+// decodedLength reports how many bytes encoded decodes to. The decoder fails
+// only once the body is being streamed upstream, so decoding into io.Discard
+// first keeps the validation the decode-then-buffer uploader got for free: a
+// malformed payload is dropped before the upload URL is dialed, and nothing is
+// held. The count is exact, padding and line breaks included, which is what the
+// declared Content-Length needs; base64.StdEncoding.DecodedLen only estimates.
+func decodedLength(encoded string) (int64, bool) {
+	written, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded)))
+	return written, err == nil
 }
 
 // uploadDifyImage posts one image as multipart/form-data and returns the file
@@ -114,6 +115,12 @@ func validBase64(encoded string) bool {
 // body is never buffered: peak live memory is the request body plus the pipe
 // buffer, instead of the request body plus the decoded image plus a body buffer
 // that doubles while it grows.
+//
+// The boundary, the form prologue before the image and the epilogue after it are
+// built before the request is made, so the request declares an exact
+// Content-Length and goes out with the fixed length the buffered body carried
+// instead of chunked. The declared length is the prologue, the decoded byte
+// count and the epilogue, which is exactly what the pipe writes.
 //
 // Upstream failures keep the surface they had: logged, and the image is dropped
 // from the request. Only a request new-api itself refuses returns an error.
@@ -128,16 +135,21 @@ func uploadDifyImage(info *relaycommon.RelayInfo, user string, image *dto.Messag
 	if decoded := base64.StdEncoding.DecodedLen(len(encoded)); int64(decoded) > limit {
 		return nil, rejectUpload("image decodes to %d bytes, past the %d MB upload limit", decoded, limit>>20)
 	}
-	if !validBase64(encoded) {
+	decodedBytes, ok := decodedLength(encoded)
+	if !ok {
 		common.SysLog(common.LogText("failed to decode base64 image"))
 		return nil, nil
 	}
 
-	mimeType := imageMimeType(image)
+	form, err := newUploadForm(user, imageMimeType(image))
+	if err != nil {
+		common.SysLog(common.LogText("failed to build the upload form: %s", err.Error()))
+		return nil, nil
+	}
+
 	bodyReader, bodyWriter := io.Pipe()
-	writer := multipart.NewWriter(bodyWriter)
 	go func() {
-		bodyWriter.CloseWithError(writeUploadForm(writer, user, mimeType, encoded))
+		bodyWriter.CloseWithError(form.stream(bodyWriter, encoded))
 	}()
 
 	req, err := http.NewRequest(http.MethodPost, uploadURL, bodyReader)
@@ -150,7 +162,8 @@ func uploadDifyImage(info *relaycommon.RelayInfo, user string, image *dto.Messag
 	// including when it failed before reading the whole body.
 	defer bodyReader.Close()
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = form.contentLength(decodedBytes)
+	req.Header.Set("Content-Type", form.contentType())
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", info.ApiKey))
 
 	resp, err := service.GetHttpClient().Do(req)
@@ -173,23 +186,4 @@ func uploadDifyImage(info *relaycommon.RelayInfo, user string, image *dto.Messag
 		Type:         "image",
 		TransferMode: "local_file",
 	}, nil
-}
-
-// writeUploadForm writes the multipart body into the pipe. The decoder reads the
-// base64 payload incrementally and the multipart writer forwards each chunk as
-// it is produced, so neither the decoded image nor the form body is ever held
-// whole.
-func writeUploadForm(writer *multipart.Writer, user, mimeType, encoded string) error {
-	if err := writer.WriteField("user", user); err != nil {
-		return err
-	}
-	part, err := writer.CreateFormFile("file", fmt.Sprintf("image.%s", strings.TrimPrefix(mimeType, "image/")))
-	if err != nil {
-		return err
-	}
-	decoded := base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))
-	if _, err := io.Copy(part, decoded); err != nil {
-		return err
-	}
-	return writer.Close()
 }
