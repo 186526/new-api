@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -1269,112 +1270,188 @@ func TestContendedReservesAreNotReportedAsInsufficient(t *testing.T) {
 	assert.Equal(t, width, accepted, "every reserve the wallet can pay for lands once retried")
 }
 
-// A version 3 hash was published before the live counter was signed. Its
-// signature covers a baseline, and the spend it records may not have reached the
-// database yet, so the first request after the bump must carry that spend across
-// instead of answering from the pre-spend row.
-func TestVersion3HashKeepsItsSpendAcrossTheSchemaBump(t *testing.T) {
+// A schema 2 hash is the layout the deployed build wrote, so the upgrade meets
+// it on every pod. It carries its balance only in the unsigned Quota mirror, so
+// the first read rebuilds it from the database. Under batch accumulation the row
+// lags the spend the accumulator still owes it, and hashing the raw row would
+// sign the pre-debit balance: the rebuilt ledger must carry the balance the wallet
+// holds. This is the shape the read that precedes every reservation produces, so
+// the ledger it leaves behind is the one the reservation then trusts.
+func TestLiveSchema2HashIsRebuiltOverTheAccumulatorBalance(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	useUserCacheMiniRedis(t)
 	common.BatchUpdateEnabled = true
 
 	user := createReserveTestUser(t, 100)
-	require.NoError(t, populateUserCache(user))
-	key := getUserCacheKey(user.Id)
+	key := seedLiveSchema2UserHash(t, user, 40)
+	// The debit the old pod took out of the mirror and queued; the row has not
+	// been flushed, so it still reads 100.
+	require.NoError(t, setUnflushedQuotaDelta(user.Id, -60))
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the accumulator has not flushed the debit")
 
-	// The state a version 3 hash holds after an unflushed spend of 60. The
-	// metadata MAC signs CacheSchema too, so it is signed as version 3 here; a
-	// migration that bumps the version without signing it again fails the
-	// metadata check on the read after this one.
-	const spent = int64(60)
-	var seeded UserBase
-	require.NoError(t, common.RedisHGetObj(key, &seeded))
-	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
-	staleMAC, err := authCacheMAC(key, struct {
-		Id             int
-		AuthVersion    int64
-		CacheSchema    int
-		QuotaCredited  int64
-		QuotaSpentBase int64
-		ExpiresAt      int64
-	}{user.Id, user.AuthVersion, ledgerV3SchemaVersion, 100, 0, expiresAt})
-	require.NoError(t, err)
-	seeded.CacheSchema = ledgerV3SchemaVersion
-	staleMetadataMAC, err := seeded.cacheMAC()
-	require.NoError(t, err)
-	require.NoError(t, common.RDB.HSet(t.Context(), key,
-		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 100, "QuotaSpent", spent,
-		"QuotaSpentBase", 0, "Quota", 40,
-		"QuotaLedgerMAC", staleMAC, "QuotaLedgerExp", expiresAt,
-		"CacheMAC", staleMetadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
-	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the database has not seen the spend yet")
-
-	// First read after the bump: the spend survives, so the balance is 40 and not
-	// the pre-spend 100 the database still holds.
 	balance, err := GetUserQuota(user.Id, false)
 	require.NoError(t, err)
-	assert.Equal(t, 40, balance, "an unflushed debit must not turn into spendable balance")
+	assert.Equal(t, 40, balance, "the rebuild signs the balance the wallet holds, not the row")
 
 	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
-	assert.Equal(t, "60", cacheQuotaField(t, key, "QuotaSpent"), "the migrated ledger keeps the spend")
-	assert.Empty(t, cacheQuotaField(t, key, "QuotaSpentBase"), "the version 3 baseline is gone")
+	assert.Equal(t, "40", cacheQuotaField(t, key, "QuotaCredited"),
+		"the rebuilt ledger carries the debit the row has not seen")
+	assert.Equal(t, "0", cacheQuotaField(t, key, "QuotaSpent"))
 
-	// And a reserve of the restored 100 must stay refused.
-	reserved, err := TryReserveUserQuota(user.Id, 100)
+	// The ledger the rebuild signed is now the authority: the already-spent 60 is
+	// not spendable a second time.
+	reserved, err := TryReserveUserQuota(user.Id, 41)
 	require.NoError(t, err)
-	assert.False(t, reserved, "the migrated ledger still caps the wallet at the remaining 40")
+	assert.False(t, reserved, "41 is past the balance the ledger now carries")
+	reserved, err = TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "40 is exactly what the wallet holds")
 }
 
-// A version 3 hash may record a wallet in arrears, where the spend has passed
-// the signed total. That is a debt the ledger can hold, so the migration must
-// carry it across instead of discarding the hash and reading the pre-debt row.
-func TestVersion3DebtHashKeepsItsOverdraft(t *testing.T) {
+// Once the accumulator flushes, the row and the mirror agree and the rebuild
+// signs the same balance without the fold.
+func TestLiveSchema2HashIsRebuiltFromTheFlushedRow(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	useUserCacheMiniRedis(t)
 	common.BatchUpdateEnabled = true
 
-	user := createReserveTestUser(t, 30)
-	require.NoError(t, populateUserCache(user))
+	user := createReserveTestUser(t, 100)
+	key := seedLiveSchema2UserHash(t, user, 40)
+	// The post-flush state: the accumulator wrote the 60-unit debit into the row.
+	// The row is written directly because DecreaseUserQuota also fires an
+	// asynchronous cache decrement, and this pins the read, not that goroutine.
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Update("quota", 40).Error)
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 40, balance, "the rebuilt ledger carries the flushed spend")
+	assert.Equal(t, "40", cacheQuotaField(t, key, "QuotaCredited"),
+		"the flushed spend is already in the row, so it is the signed total")
+
+	reserved, err := TryReserveUserQuota(user.Id, 40)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the flushed wallet can spend what is left")
+	reserved, err = TryReserveUserQuota(user.Id, 1)
+	require.NoError(t, err)
+	assert.False(t, reserved)
+}
+
+// An unsigned schema raise must not inflate the balance a read reports. CacheSchema
+// sits inside the metadata MAC, so one HSET invalidates the metadata signature and
+// the read discards the hash; the balance must still be 90 of 100, not the row's
+// 100. Two things keep it there, and this pins the pair: the ledger fields survive
+// the rebuild because seedUserQuotaLedger refuses to sign over an existing
+// QuotaLedgerMAC, and the read path folds the accumulator's owed delta in when it
+// has to answer from the row instead. Measured before the fold existed, the same
+// HSET reported 100 and put 100 into the request context.
+func TestAnUnsignedSchemaRaiseKeepsTheSignedBalance(t *testing.T) {
+	for _, raised := range []int{ledgerV2SchemaVersion, userCacheSchemaVersion + 1} {
+		t.Run(fmt.Sprintf("CacheSchema set to %d", raised), func(t *testing.T) {
+			truncateTables(t)
+			resetBatchUpdateTestState(t)
+			useUserCacheMiniRedis(t)
+			common.BatchUpdateEnabled = true
+
+			user := createReserveTestUser(t, 100)
+			require.NoError(t, populateUserCache(user))
+			reserved, err := TryReserveUserQuota(user.Id, 10)
+			require.NoError(t, err)
+			require.True(t, reserved)
+
+			key := getUserCacheKey(user.Id)
+			require.NoError(t, common.RDB.HSet(t.Context(), key, "CacheSchema", raised).Err())
+
+			balance, err := GetUserQuota(user.Id, false)
+			require.NoError(t, err)
+			assert.Equal(t, 90, balance, "the live balance, not the row's 100")
+
+			assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"),
+				"the metadata is republished under the current schema")
+			assert.Equal(t, "10", cacheQuotaField(t, key, "QuotaSpent"),
+				"the ledger the seed refuses to overwrite still holds the spend")
+
+			reserved, err = TryReserveUserQuota(user.Id, 95)
+			require.NoError(t, err)
+			assert.False(t, reserved, "the wallet holds 90, not the row's 100")
+		})
+	}
+}
+
+// A schema 3 hash is a layout no deployment ever wrote, so nothing migrates it.
+// The version 3 ledger could record a wallet in arrears, which the database row
+// never holds: that is the one shape where the two paths answer differently, so
+// it is the shape the test uses. A migration would carry the debt across and
+// report −20; the rebuild reports the row, which is the same 100 here only
+// because nothing was spent yet (see TestLiveSchema2HashIsRebuiltOverTheAccumulatorBalance
+// for the shape where the fold makes the rebuild answer the spend).
+func TestSchema3HashIsRebuiltNotMigrated(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
 	key := getUserCacheKey(user.Id)
-	var seeded UserBase
-	require.NoError(t, common.RedisHGetObj(key, &seeded))
+	require.NoError(t, populateUserCache(user))
 
 	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
-	staleMAC, err := authCacheMAC(key, struct {
+	v3MAC, err := authCacheMAC(key, struct {
 		Id             int
 		AuthVersion    int64
 		CacheSchema    int
 		QuotaCredited  int64
 		QuotaSpentBase int64
 		ExpiresAt      int64
-	}{user.Id, user.AuthVersion, ledgerV3SchemaVersion, 30, 0, expiresAt})
+	}{user.Id, user.AuthVersion, 3, 30, 0, expiresAt})
 	require.NoError(t, err)
-	seeded.CacheSchema = ledgerV3SchemaVersion
-	staleMetadataMAC, err := seeded.cacheMAC()
+	var seeded UserBase
+	require.NoError(t, common.RedisHGetObj(key, &seeded))
+	seeded.CacheSchema = 3
+	metadataMAC, err := seeded.cacheMAC()
 	require.NoError(t, err)
 	require.NoError(t, common.RDB.HSet(t.Context(), key,
-		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 30, "QuotaSpent", 50,
-		"QuotaSpentBase", 0, "Quota", -20,
-		"QuotaLedgerMAC", staleMAC, "QuotaLedgerExp", expiresAt,
-		"CacheMAC", staleMetadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
-	assert.Equal(t, 30, getUserQuotaFromDB(t, user.Id), "the database has not seen the overdraft yet")
+		"CacheSchema", 3, "QuotaCredited", 30, "QuotaSpent", 50, "QuotaSpentBase", 0,
+		"Quota", -20, "QuotaLedgerMAC", v3MAC, "QuotaLedgerExp", expiresAt,
+		"CacheMAC", metadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
 
 	balance, err := GetUserQuota(user.Id, false)
 	require.NoError(t, err)
-	assert.Equal(t, -20, balance, "a debt carried by the version 3 ledger must survive the bump")
-
+	assert.Equal(t, 100, balance,
+		"the hash is rebuilt from the row; a migration would have carried the debt across as -20")
 	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
-	assert.Equal(t, "50", cacheQuotaField(t, key, "QuotaSpent"))
-	assert.Empty(t, cacheQuotaField(t, key, "QuotaSpentBase"))
 }
 
-// A committed delta with no hash to apply it to must be reported, never answered
-// as success. Here the hash is gone and a pending auth fence stops the snapshot
-// from being republished, so there is nowhere to write the delta: a writer told
-// it succeeded would leave the debit applied nowhere while the caller logs
-// nothing.
+// seedLiveSchema2UserHash rewrites a populated hash into the exact shape the
+// deployed build (schema 2) wrote: metadata signed under schema 2, the balance in
+// the unsigned Quota mirror and no ledger fields at all.
+func seedLiveSchema2UserHash(t *testing.T, user User, mirror int) string {
+	t.Helper()
+	key := getUserCacheKey(user.Id)
+	require.NoError(t, populateUserCache(user))
+	var seeded UserBase
+	require.NoError(t, common.RedisHGetObj(key, &seeded))
+	seeded.CacheSchema = ledgerV2SchemaVersion
+	metadataMAC, err := seeded.cacheMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"CacheSchema", ledgerV2SchemaVersion, "Quota", mirror,
+		"CacheMAC", metadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
+	require.NoError(t, common.RDB.HDel(t.Context(), key,
+		"QuotaCredited", "QuotaSpent", "QuotaLedgerMAC", "QuotaLedgerExp").Err())
+	return key
+}
+
+// setUnflushedQuotaDelta queues a user quota delta without writing the row, which
+// is the state a batch-accumulating pod holds between a spend and the next flush.
+func setUnflushedQuotaDelta(userID int, delta int) error {
+	batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+	defer batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+	batchUpdateStores[BatchUpdateTypeUserQuota][userID] += delta
+	return nil
+}
+
 func TestACommittedDeltaWithNoHashIsReportedNotSilentlyAccepted(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -1392,30 +1469,6 @@ func TestACommittedDeltaWithNoHashIsReportedNotSilentlyAccepted(t *testing.T) {
 	assert.Error(t, err, "a delta that cannot be applied is not a success")
 	assert.NotEqual(t, cacheQuotaOK, result)
 	assert.ErrorIs(t, err, errQuotaLedgerHashGone)
-}
-
-// A version 3 hash whose baseline signature does not verify is not migrated: it
-// is rebuilt from the database, which is the one source a forged counter cannot
-// reach.
-func TestForgedVersion3HashIsNotMigrated(t *testing.T) {
-	truncateTables(t)
-	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
-
-	user := createReserveTestUser(t, 100)
-	require.NoError(t, populateUserCache(user))
-	key := getUserCacheKey(user.Id)
-
-	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
-	require.NoError(t, common.RDB.HSet(t.Context(), key,
-		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 100, "QuotaSpent", 0,
-		"QuotaSpentBase", 0, "Quota", 100,
-		"QuotaLedgerMAC", "not-a-signature", "QuotaLedgerExp", expiresAt).Err())
-
-	reserved, err := TryReserveUserQuota(user.Id, 100)
-	require.NoError(t, err)
-	assert.True(t, reserved, "a hash that fails its own signature is answered from the database")
-	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
 }
 
 // Under batch accumulation the row lags every spend until the next flush. When
