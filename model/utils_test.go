@@ -223,3 +223,62 @@ func TestFlushBatchUpdatesWaitsForAnotherFlushToFinish(t *testing.T) {
 		t.Fatal("the shutdown flush did not run once the other flush released the lock")
 	}
 }
+
+func TestDetachedQuotaWorkIsIdleWithNothingRunning(t *testing.T) {
+	pending, finished := WaitDetachedQuotaWork(time.Second)
+	assert.Equal(t, 0, pending)
+	assert.True(t, finished, "an idle tracker must not make shutdown wait")
+}
+
+func TestWaitDetachedQuotaWorkCoversAlreadyRunningGoroutines(t *testing.T) {
+	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(1)
+	GoDetachedQuotaWork(func() {
+		started.Done()
+		<-release
+	})
+	started.Wait()
+
+	waited := make(chan struct{})
+	var pending int
+	var finished bool
+	go func() {
+		defer close(waited)
+		pending, finished = WaitDetachedQuotaWork(5 * time.Second)
+	}()
+
+	select {
+	case <-waited:
+		close(release)
+		t.Fatal("the wait returned while the tracked goroutine was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait did not return after the tracked goroutine finished")
+	}
+	assert.Equal(t, 1, pending)
+	assert.True(t, finished)
+}
+
+// main.go logs the pending count and flushes anyway when the wait expires, so the
+// timeout branch must report what it found rather than block.
+func TestWaitDetachedQuotaWorkReportsTheTimeout(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	var started sync.WaitGroup
+	started.Add(1)
+	GoDetachedQuotaWork(func() {
+		started.Done()
+		<-release
+	})
+	started.Wait()
+
+	pending, finished := WaitDetachedQuotaWork(50 * time.Millisecond)
+	assert.Equal(t, 1, pending, "the count of goroutines still running must reach the caller")
+	assert.False(t, finished, "an expired wait reports that it did not finish")
+}

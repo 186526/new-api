@@ -41,6 +41,65 @@ var batchUpdateTypeNames = [BatchUpdateTypeCount]string{
 	BatchUpdateTypeRequestCount:     "request count",
 }
 
+// detachedQuotaWork counts goroutines that queue accumulator deltas after the
+// request that started them has returned, so shutdown can wait for them before it
+// drains. BillingSession.Refund is the one such path: it returns as soon as it has
+// marked the session refunded, and its goroutine credits the wallet and token a
+// scheduling delay later. A shutdown that flushed without waiting would write the
+// debit and drop the matching credit, charging the user for a request that failed.
+var detachedQuotaWork = &quotaWorkTracker{}
+
+// quotaWorkTracker counts pending detached quota work without sync.WaitGroup,
+// because Add can legitimately race Wait here: a hijacked WebSocket relay can call
+// Refund after shutdown has started waiting. The channel is replaced rather than
+// recreated in place, so a waiter that took the old channel is never closed twice.
+type quotaWorkTracker struct {
+	mu      sync.Mutex
+	pending int
+	idle    chan struct{} // non-nil while pending > 0; closed when it reaches 0
+}
+
+func (t *quotaWorkTracker) start() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pending == 0 {
+		t.idle = make(chan struct{})
+	}
+	t.pending++
+}
+
+func (t *quotaWorkTracker) finish() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pending--
+	if t.pending == 0 {
+		close(t.idle)
+		t.idle = nil
+	}
+}
+
+// waitUntilIdle returns the number of goroutines it found pending and whether they
+// all finished before timeout. Work started after this call is not covered: the
+// guarantee is "everything already running when shutdown began", which is what the
+// caller can honestly claim.
+func (t *quotaWorkTracker) waitUntilIdle(timeout time.Duration) (int, bool) {
+	t.mu.Lock()
+	if t.pending == 0 {
+		t.mu.Unlock()
+		return 0, true
+	}
+	pending := t.pending
+	idle := t.idle
+	t.mu.Unlock()
+
+	select {
+	case <-idle:
+		return pending, true
+	case <-time.After(timeout):
+		return pending, false
+	}
+}
+
 // BatchUpdateFlushSummary is what one flush drained from one accumulator: how many
 // ids it held, how many of those the database accepted, and the sum of all their
 // deltas. The sum saturates at the int64 extremes instead of wrapping, because
@@ -73,6 +132,27 @@ func init() {
 		batchUpdateInFlight = append(batchUpdateInFlight, make(map[int]int))
 		batchUpdateLocks = append(batchUpdateLocks, sync.Mutex{})
 	}
+}
+
+// GoDetachedQuotaWork runs fn in a background goroutine that queues accumulator
+// deltas, and registers it so WaitDetachedQuotaWork can wait for it before the
+// shutdown flush. Callers are the paths where the request has already returned by
+// the time the delta is queued; a delta queued that way is otherwise invisible to
+// shutdown and is dropped when the process exits.
+func GoDetachedQuotaWork(fn func()) {
+	detachedQuotaWork.start()
+	gopool.Go(func() {
+		defer detachedQuotaWork.finish()
+		fn()
+	})
+}
+
+// WaitDetachedQuotaWork blocks until every detached quota goroutine that was running
+// when it was called has finished, or timeout expires, and reports whether it ran
+// out. It must be called before FlushBatchUpdates: waiting afterwards would leave
+// what those goroutines queued in the accumulator again.
+func WaitDetachedQuotaWork(timeout time.Duration) (pending int, finished bool) {
+	return detachedQuotaWork.waitUntilIdle(timeout)
 }
 
 func InitBatchUpdater() {

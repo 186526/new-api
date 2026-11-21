@@ -274,15 +274,27 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
 	}
+	// A refund is two database statements, so this only bounds a stuck goroutine, not
+	// normal work. It stays inside the deployment's 240 s drain budget.
+	shutdownRefundWait := time.Duration(common.GetEnvOrDefault("SHUTDOWN_REFUND_WAIT_SECONDS", 10)) * time.Second
+	// Refunds credit the wallet from a goroutine that the failing request returns
+	// from, so they must be waited for before the flush. A flush that ran first would
+	// write the debit and leave the matching credit unflushed, charging the user for
+	// a request that failed. The wait is bounded because a hijacked WebSocket session
+	// settles its quota at session end, which is not a shutdown concern; on timeout
+	// the wait is logged and the flush still runs.
+	if pending, finished := model.WaitDetachedQuotaWork(shutdownRefundWait); !finished {
+		common.SysError(common.LogText("shutdown stopped waiting after %s with %d refund goroutines still running; flushing what is queued", shutdownRefundWait, pending))
+	}
 	// The listener is closed, so no new request queues a delta. On the routes the
 	// server awaits, every handler has returned too, so what the flush writes is
-	// every delta queued before it on those routes. Two cases sit outside that and
-	// can queue a delta after the flush: Shutdown timed out, and a hijacked
-	// WebSocket relay (RelayFormatOpenAIRealtime, and the responses WebSocket
-	// route), which net/http neither closes nor waits for and which settles its
-	// quota at session end. A delta queued after the flush is lost exactly as it
-	// was before this flush existed; the flush is still a net gain over dropping
-	// the whole accumulator.
+	// every delta queued before it on those routes, refunds included. Two cases sit
+	// outside that and can queue a delta after the flush: Shutdown timed out, and a
+	// hijacked WebSocket relay (RelayFormatOpenAIRealtime, and the responses
+	// WebSocket route), which net/http neither closes nor waits for and which settles
+	// its quota at session end. A delta queued after the flush is lost, as it was
+	// before this flush existed; because refunds are now awaited, an ordinary failed
+	// request can no longer leave its debit written and its credit dropped.
 	if common.BatchUpdateEnabled {
 		model.FlushBatchUpdates()
 	}
