@@ -119,9 +119,14 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			applySystemPromptIfNeeded(c, info, req)
 		}
 
-		jsonData, err := common.Marshal(convertedRequest)
-		if err != nil {
-			return types.NewError(err, types.ErrorCodeJsonMarshalFailed, types.ErrOptionWithSkipRetry())
+		// An adaptor that already produced the upstream bytes hands them back
+		// directly; marshalling them again would encode the slice as base64.
+		jsonData, isRaw := convertedRequest.([]byte)
+		if !isRaw {
+			jsonData, err = common.Marshal(convertedRequest)
+			if err != nil {
+				return types.NewError(err, types.ErrorCodeJsonMarshalFailed, types.ErrOptionWithSkipRetry())
+			}
 		}
 
 		// remove disabled fields for OpenAI API
