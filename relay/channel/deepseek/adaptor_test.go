@@ -7,13 +7,16 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	rootconstant "github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -353,15 +356,91 @@ func TestReasoningHistoryReplay(t *testing.T) {
 	assert.Equal(t, "", *messages[3].ReasoningContent)
 }
 
-func TestConversationKeyFollowsPromptCacheKey(t *testing.T) {
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	first := conversationKey(c, "deepseek-flash", "session-a")
-	assert.NotEmpty(t, first)
-	assert.Equal(t, first, conversationKey(c, "deepseek-flash", "session-a"))
-	assert.NotEqual(t, first, conversationKey(c, "deepseek-flash", "session-b"))
-	assert.NotEqual(t, first, conversationKey(c, "deepseek-v4-pro", "session-a"))
-	assert.Empty(t, conversationKey(c, "deepseek-flash", ""))
+// The caller identity scopes the key: two callers that send the same prompt
+// cache key never share one, and one caller keeps a stable key per cache key.
+func TestConversationKeyBindsTheCaller(t *testing.T) {
+	newContext := func(tokenId int) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		common.SetContextKey(c, rootconstant.ContextKeyTokenId, tokenId)
+		return c
+	}
+	first, second := newContext(11), newContext(12)
+	keyA := conversationKey(first, "deepseek-flash", "session-a")
+	require.NotEmpty(t, keyA)
+	assert.Equal(t, keyA, conversationKey(first, "deepseek-flash", "session-a"))
+	assert.NotEqual(t, keyA, conversationKey(second, "deepseek-flash", "session-a"))
+	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-flash", "session-b"))
+	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-v4-pro", "session-a"))
+	assert.NotEqual(t, keyA, conversationKey(first, "deepseek-flash", ""))
+	assert.Equal(t, conversationKey(first, "deepseek-flash", ""), conversationKey(first, "deepseek-flash", ""))
+}
+
+func TestConversationKeyFallsBackToTheUserAndFailsClosed(t *testing.T) {
+	newContext := func() *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		return c
+	}
+	anonymous := newContext()
+	assert.Empty(t, conversationKey(anonymous, "deepseek-flash", "session-a"))
+	assert.Empty(t, conversationKey(anonymous, "deepseek-flash", ""))
+	assert.Empty(t, conversationKey(nil, "deepseek-flash", "session-a"))
+
+	byUser, byOtherUser := newContext(), newContext()
+	common.SetContextKey(byUser, rootconstant.ContextKeyUserId, 21)
+	common.SetContextKey(byOtherUser, rootconstant.ContextKeyUserId, 22)
+	assert.NotEmpty(t, conversationKey(byUser, "deepseek-flash", "session-a"))
+	assert.NotEqual(t, conversationKey(byUser, "deepseek-flash", "session-a"), conversationKey(byOtherUser, "deepseek-flash", "session-a"))
+}
+
+// One caller's continuation replays its stored reasoning while another caller
+// sending the same prompt cache key reads nothing of it.
+func TestReasoningHistoryStaysWithinOneCaller(t *testing.T) {
+	useReasoningHistoryRedis(t)
+	newContext := func(tokenId int) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		common.SetContextKey(c, rootconstant.ContextKeyTokenId, tokenId)
+		return c
+	}
+	owner := newContext(11)
+	store := &relaycommon.RelayInfo{OriginModelName: "deepseek-flash"}
+	store.DeepSeekReasoningKey = conversationKey(owner, "deepseek-flash", "session-a")
+	require.NotEmpty(t, store.DeepSeekReasoningKey)
+	storeReasoningTurn(owner, store, "first-reasoning")
+
+	replayed := func(c *gin.Context) (*relaycommon.RelayInfo, []dto.Message) {
+		req := &dto.GeneralOpenAIRequest{Model: "deepseek-flash", PromptCacheKey: "session-a", Messages: []dto.Message{{Role: "user", Content: "hi"}, {Role: "assistant"}}}
+		attempt := &relaycommon.RelayInfo{OriginModelName: "deepseek-flash"}
+		replayReasoningHistory(c, attempt, req)
+		return attempt, req.Messages
+	}
+
+	ownerInfo, ownerMessages := replayed(owner)
+	require.NotNil(t, ownerMessages[1].ReasoningContent)
+	assert.Equal(t, "first-reasoning", *ownerMessages[1].ReasoningContent)
+	assert.Equal(t, []string{"first-reasoning"}, ownerInfo.DeepSeekReasoningHistory.Entries)
+
+	strangerInfo, strangerMessages := replayed(newContext(12))
+	assert.NotEqual(t, ownerInfo.DeepSeekReasoningKey, strangerInfo.DeepSeekReasoningKey)
+	assert.NotEmpty(t, strangerInfo.DeepSeekReasoningKey)
+	assert.Equal(t, "", *strangerMessages[1].ReasoningContent)
+	assert.Empty(t, strangerInfo.DeepSeekReasoningHistory.Entries)
+}
+
+// useReasoningHistoryRedis points common.RDB at a throwaway Redis for the
+// duration of one test.
+func useReasoningHistoryRedis(t *testing.T) {
+	t.Helper()
+	server := miniredis.RunT(t)
+	previousRDB, previousEnabled := common.RDB, common.RedisEnabled
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr(), MaxRetries: -1})
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		_ = common.RDB.Close()
+		common.RDB, common.RedisEnabled = previousRDB, previousEnabled
+	})
 }
 
 func TestStoreReasoningTurnSkipsWithoutConversation(t *testing.T) {

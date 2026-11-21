@@ -3,6 +3,7 @@ package deepseek
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,24 +34,36 @@ type reasoningHistory struct {
 }
 
 // conversationKey identifies one client conversation without storing its
-// content: the client's prompt cache key when it sends one, otherwise the
-// calling token.
+// content. The caller identity scopes every key, so two callers that send the
+// same prompt cache key never read each other's stored history; the prompt
+// cache key or X-Session-Id only tells one caller's conversations apart. A
+// request without an identity gets no key, so nothing is read or written.
 func conversationKey(c *gin.Context, modelName string, promptCacheKey string) string {
 	if c == nil {
 		return ""
 	}
-	seed := strings.TrimSpace(promptCacheKey)
-	if seed == "" {
-		seed = strings.TrimSpace(c.GetHeader("X-Session-Id"))
-	}
-	if seed == "" {
-		seed = common.GetContextKeyString(c, constant.ContextKeyTokenId)
-	}
-	if seed == "" {
+	identity := conversationIdentity(c)
+	if identity == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(modelName + "\x00" + seed))
+	discriminator := strings.TrimSpace(promptCacheKey)
+	if discriminator == "" {
+		discriminator = strings.TrimSpace(c.GetHeader("X-Session-Id"))
+	}
+	sum := sha256.Sum256([]byte(modelName + "\x00" + identity + "\x00" + discriminator))
 	return hex.EncodeToString(sum[:16])
+}
+
+// conversationIdentity names the caller a stored history belongs to: the
+// calling token, or the user behind it when the request carries no token.
+func conversationIdentity(c *gin.Context) string {
+	if tokenId := common.GetContextKeyInt(c, constant.ContextKeyTokenId); tokenId > 0 {
+		return "token:" + strconv.Itoa(tokenId)
+	}
+	if userId := common.GetContextKeyInt(c, constant.ContextKeyUserId); userId > 0 {
+		return "user:" + strconv.Itoa(userId)
+	}
+	return ""
 }
 
 func loadReasoningHistory(key string) *reasoningHistory {
