@@ -681,9 +681,12 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	updatePassword := updatedUser.Password != ""
-	// An empty group means the field was left out: EditWithTx still writes it, so
-	// only a non-empty value can move the account to another group.
-	updateGroup := updatedUser.Group != "" && updatedUser.Group != originUser.Group
+	// An empty group means the field was left out, and EditWithTx writes the
+	// field unconditionally: keep the stored group rather than clearing it.
+	if updatedUser.Group == "" {
+		updatedUser.Group = originUser.Group
+	}
+	updateGroup := updatedUser.Group != originUser.Group
 	auditParams := map[string]any{
 		"username": originUser.Username,
 		"id":       updatedUser.Id,

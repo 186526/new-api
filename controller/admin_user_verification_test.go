@@ -284,11 +284,11 @@ func TestAdminUserGroupChangeCompletesOnATargetBoundProof(t *testing.T) {
 func TestAdminUserGroupChangeRequiresProofOnlyWhenTheGroupMoves(t *testing.T) {
 	for _, test := range []struct {
 		name, group string
-		// storedGroup is what EditWithTx writes: an absent group decodes to the
-		// empty string, which it stores, but that is not a move to another group.
+		// An absent group must leave the stored one untouched: EditWithTx writes
+		// the field unconditionally, and an empty group would be a wider one.
 		storedGroup string
 	}{
-		{name: "group absent", storedGroup: ""},
+		{name: "group absent", storedGroup: "default"},
 		{name: "group unchanged", group: "default", storedGroup: "default"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -304,6 +304,9 @@ func TestAdminUserGroupChangeRequiresProofOnlyWhenTheGroupMoves(t *testing.T) {
 			stored, err := model.GetUserById(target.Id, false)
 			require.NoError(t, err)
 			assert.Equal(t, test.storedGroup, stored.Group)
+			// Group equal to the stored one leaves auth_version alone, so the
+			// edit does not sign the account out.
+			assert.EqualValues(t, target.AuthVersion, stored.AuthVersion)
 			var authFlows int64
 			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Count(&authFlows).Error)
 			assert.Zero(t, authFlows)
