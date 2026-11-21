@@ -977,6 +977,109 @@ func TestCommittedTokenDeltasAllLandInTheCache(t *testing.T) {
 	assert.Equal(t, width, cached.UsedQuota)
 }
 
+// The batch window the accumulator cannot close: it flushes between the queue
+// and the cache write, so the re-apply leaves the cache one debit below the row.
+// This pins the invariant the comment on applyUserQuotaDebit states: the drift
+// never authorizes a spend, and reseeding from the row heals it.
+func TestTheBatchFlushWindowDriftsBelowTheRowAndHeals(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	require.NoError(t, persistUserQuotaDelta(user.Id, -10)) // queues the debit
+	batchUpdate()                                           // the flush that lands in the window
+	_, err := cacheApplyUserQuotaDelta(user.Id, -10)
+	require.NoError(t, err)
+
+	cached, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	row := getUserQuotaFromDB(t, user.Id)
+	assert.Equal(t, 90, row)
+	assert.Equal(t, 80, cached, "the window leaves the cache one debit below the row")
+
+	// The drift refuses rather than authorizes: the row funds 90 but the cache
+	// only knows 80.
+	reserved, err := TryReserveUserQuota(user.Id, 90)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the drifted cache never authorizes more than the row holds")
+
+	// Reseeding from the row heals it.
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+	cached, err = GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, row, cached, "a reseed from the row heals the drift")
+}
+
+// In non-batch mode the caller writes the row before handing the delta to the
+// cache, and the row then holds the debit. A hash absent at that moment (for
+// example because its TTL lapsed) must not be republished and re-debited: doing
+// that seeds the ledger from a row that already includes the debit and
+// subtracts it a second time, leaving the cache below the row and refusing a
+// wallet that is funded. The cache may legitimately carry nothing at that
+// instant; the invariant is that the first read equals the row, and a reserve
+// of the row's own balance succeeds.
+func TestNonBatchDeltaWithNoHashLeavesTheCacheEqualToTheRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = false
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.Del(t.Context(), getUserCacheKey(user.Id)).Err())
+
+	// The order DecreaseUserQuota uses in non-batch mode: the row is written
+	// first, then the same delta is handed to the cache.
+	require.NoError(t, persistUserQuotaDelta(user.Id, -10))
+	result, err := cacheApplyUserQuotaDelta(user.Id, -10)
+	require.NoError(t, err, "a delta the row already holds is not an error")
+	assert.Equal(t, cacheQuotaOK, result)
+
+	// No hash means nothing to compare yet, so the first read republishes the
+	// row and must agree with it.
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 90, balance)
+	assert.Equal(t, getUserQuotaFromDB(t, user.Id), balance, "the cache equals the row, not 10 below it")
+
+	// The wallet is funded at 90; a reserve of its whole row balance must land.
+	reserved, err := TryReserveUserQuota(user.Id, 90)
+	require.NoError(t, err)
+	assert.True(t, reserved, "a wallet the row funds must not be refused as empty")
+}
+
+// The token twin of the non-batch case above.
+func TestNonBatchTokenDeltaWithNoHashLeavesTheCacheEqualToTheRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = false
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheKey(token.Key)).Err())
+
+	require.NoError(t, persistTokenQuotaDelta(token.Id, -10))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -10)
+	require.NoError(t, err)
+	assert.Equal(t, cacheQuotaOK, result)
+
+	balance, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 90, balance.RemainQuota)
+	assert.Equal(t, getTokenFromDB(t, token.Id).RemainQuota, balance.RemainQuota, "the cache equals the row")
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 90, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "a token the row funds must not be refused as empty")
+}
+
 // The width here is well past the retry budget (64), which is where the previous
 // revision's discard fired: at 512 the hash was deleted, 323 of 512 writers were
 // told they succeeded while doing nothing, and a reserve of already-spent quota
@@ -1271,6 +1374,9 @@ func TestACommittedDeltaWithNoHashIsReportedNotSilentlyAccepted(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
 	useUserCacheMiniRedis(t)
+	// Batch accumulation is the only mode where an absent hash loses the debit:
+	// the row predates it, so the cache is the only place it can live yet.
+	common.BatchUpdateEnabled = true
 
 	user := createReserveTestUser(t, 10)
 	require.NoError(t, populateUserCache(user))

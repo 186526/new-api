@@ -766,6 +766,28 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 // applyUserQuotaDebit moves the signed spend counter by amount. The caller holds
 // the subject's stripe, so the only writer that can still steal the CAS is
 // another process.
+//
+// Whether an absent hash should be republished depends on whether the row
+// already holds this delta, which is exactly what the batch accumulator decides:
+//
+//   - Non-batch: the caller writes the row before handing the delta to the
+//     cache, so the row already holds it and is authoritative. There is nothing
+//     to apply: the next read seeds the ledger from the row and the debit shows
+//     up once. Republishing here would seed QuotaCredited from a row that
+//     already includes the debit and then subtract it again, which leaves the
+//     cache below the row and refuses a funded wallet.
+//   - Batch: the accumulator holds the debit and the row predates it, so the
+//     cache is the only place that can carry it yet. A missing hash is
+//     republished and the delta applied on top.
+//
+// The batch case has one window it cannot close: the accumulator may flush
+// between addNewRecord and this call, so the row already holds the debit when
+// the hash is reconstructed, and the re-apply then leaves the cache one debit
+// below the row. The accumulator cannot tell the two apart at this point,
+// because the cache write is scheduled before addNewRecord. The resulting drift
+// refuses spends rather than authorizing them, and it heals when the hash
+// expires and is reseeded from the row; the non-batch path, which is what the
+// admin runs, cannot reach it at all.
 func applyUserQuotaDebit(userID int, amount int64) (cacheQuotaResult, error) {
 	hydrated := false
 	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
@@ -774,10 +796,11 @@ func applyUserQuotaDebit(userID int, amount int64) (cacheQuotaResult, error) {
 			if err != nil || result == cacheQuotaUnverified {
 				return result, err
 			}
-			// No hash to apply the delta to. Under batch accumulation the
-			// database row does not hold it yet, so reporting success here would
-			// hide a debit the cache should have carried. Republish the snapshot
-			// once and apply it there; if that fails, report it.
+			if !common.BatchUpdateEnabled {
+				// The row holds the debit; the cache carries nothing until the
+				// next read republishes it. Applying it here would count it twice.
+				return cacheQuotaOK, nil
+			}
 			if hydrated {
 				return cacheQuotaMiss, errQuotaLedgerHashGone
 			}
@@ -876,6 +899,11 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 	return applyTokenQuotaDebit(id, key, -delta)
 }
 
+// applyTokenQuotaDebit mirrors applyUserQuotaDebit on the token hash: an absent
+// hash is only republished when the accumulator still holds the debit. In
+// non-batch mode the caller writes the row first, so the row already holds it
+// and republishing would seed the ledger from a row that includes the debit and
+// subtract it again.
 func applyTokenQuotaDebit(id int, key string, amount int64) (cacheQuotaResult, error) {
 	hydrated := false
 	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
@@ -883,6 +911,9 @@ func applyTokenQuotaDebit(id int, key string, amount int64) (cacheQuotaResult, e
 		if ledger == nil {
 			if err != nil || result == cacheQuotaUnverified {
 				return result, err
+			}
+			if !common.BatchUpdateEnabled {
+				return cacheQuotaOK, nil
 			}
 			if hydrated {
 				return cacheQuotaMiss, errQuotaLedgerHashGone
