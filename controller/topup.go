@@ -1,12 +1,15 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -256,6 +259,135 @@ func paymentError(c *gin.Context, err error) {
 	c.JSON(http.StatusOK, body)
 }
 
+// paymentLogFieldNames are the callback members a log line keeps: they name the
+// order, the amount and the outcome. Every other member stays out of the log,
+// because a signature or key material is reusable and buyer details are not
+// needed to diagnose a rejected callback. Compare case-insensitively.
+var paymentLogFieldNames = map[string]bool{
+	"eventtype":               true,
+	"event_type":              true,
+	"type":                    true,
+	"eventid":                 true,
+	"event_id":                true,
+	"mode":                    true,
+	"id":                      true,
+	"status":                  true,
+	"orderstatus":             true,
+	"order_status":            true,
+	"paymentstatus":           true,
+	"payment_status":          true,
+	"trade_status":            true,
+	"merchantorderid":         true,
+	"merchant_order_id":       true,
+	"ordermerchantexternalid": true,
+	"order_id":                true,
+	"orderid":                 true,
+	"out_trade_no":            true,
+	"client_reference_id":     true,
+	"request_id":              true,
+	"requestid":               true,
+	"amount":                  true,
+	"amount_total":            true,
+	"orderamount":             true,
+	"order_amount":            true,
+	"money":                   true,
+	"currency":                true,
+	"ordercurrency":           true,
+	"order_currency":          true,
+}
+
+// paymentLogSummary renders a callback body as the members paymentLogFieldNames
+// keeps, so the line says what arrived without writing a signature or the whole
+// payload. The providers nest those members at different depths — Stripe under
+// `data.object`, Creem under `object.order` — so the walk descends into maps. A
+// body that does not parse is reported by size only.
+func paymentLogSummary(body []byte) string {
+	var members map[string]any
+	if err := json.Unmarshal(body, &members); err != nil {
+		return fmt.Sprintf("body_bytes=%d unparsed=true", len(body))
+	}
+	return paymentLogMembers(members)
+}
+
+// paymentFormLogSummary renders a form-encoded callback the way
+// paymentLogSummary renders a JSON one.
+func paymentFormLogSummary(params map[string]string) string {
+	members := make(map[string]any, len(params))
+	for name, value := range params {
+		members[name] = value
+	}
+	return paymentLogMembers(members)
+}
+
+// paymentLogMembers renders the members paymentLogFieldNames keeps as one
+// key=value list, sorted so two logs of the same callback read alike.
+func paymentLogMembers(members map[string]any) string {
+	kept := make(map[string]paymentLogMember, len(members))
+	collectPaymentLogMembers(members, kept, 0)
+	if len(kept) == 0 {
+		return "members=none"
+	}
+	names := slices.Sorted(maps.Keys(kept))
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, name+"="+kept[name].text)
+	}
+	return strings.Join(pairs, " ")
+}
+
+// paymentLogMember is a kept member and the depth it was read at. The order id
+// sits inside the order object while the envelope holds an event id of its own,
+// so the deeper value replaces the shallower one and the log names the order.
+type paymentLogMember struct {
+	text  string
+	depth int
+}
+
+// paymentLogNestingLimit bounds the walk; the deepest member the providers use
+// sits two maps down.
+const paymentLogNestingLimit = 4
+
+func collectPaymentLogMembers(members map[string]any, kept map[string]paymentLogMember, depth int) {
+	if depth > paymentLogNestingLimit {
+		return
+	}
+	for name, value := range members {
+		if paymentLogFieldNames[strings.ToLower(name)] {
+			if previous, seen := kept[name]; seen && previous.depth > depth {
+				continue
+			}
+			switch typed := value.(type) {
+			case string:
+				kept[name] = paymentLogMember{text: typed, depth: depth}
+			case float64, bool, nil:
+				kept[name] = paymentLogMember{text: fmt.Sprintf("%v", value), depth: depth}
+			}
+			continue
+		}
+		if nested, ok := value.(map[string]any); ok {
+			collectPaymentLogMembers(nested, kept, depth+1)
+		}
+	}
+}
+
+// paymentSignaturePresence describes a callback signature header without
+// writing any part of it, so a rejected callback still says whether the header
+// was missing or present. It fills a `%q` placeholder written for the raw
+// signature.
+func paymentSignaturePresence(signature string) string {
+	if signature == "" {
+		return "absent"
+	}
+	return "present"
+}
+
+// paymentCallbackPath is the path a callback log line names. The Epay callback
+// signs the query itself, so the request URI would write the signature the line
+// is there to keep out; the path alone still says which endpoint was called.
+func paymentCallbackPath(c *gin.Context) string {
+	return c.Request.URL.Path
+}
+
 func rejectInvalidCreditedQuota(c *gin.Context, userId int, quota decimal.Decimal) bool {
 	creditedQuota, err := validateCreditedQuota(quota)
 	if err == nil {
@@ -358,7 +490,7 @@ func RequestEpay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to create order"))
 		return
 	}
-	logger.LogInfo(c.Request.Context(), common.LogText("Epay top-up order created user_id=%d trade_no=%s payment_method=%s amount=%d money=%.2f uri=%q params=%q", id, tradeNo, req.PaymentMethod, req.Amount, payMoney, uri, common.GetJsonString(params)))
+	logger.LogInfo(c.Request.Context(), common.LogText("Epay top-up order created user_id=%d trade_no=%s payment_method=%s amount=%d money=%.2f uri=%q params=%q", id, tradeNo, req.PaymentMethod, req.Amount, payMoney, uri, paymentFormLogSummary(params)))
 	c.JSON(http.StatusOK, gin.H{"message": "success", "data": params, "url": uri})
 }
 
@@ -406,7 +538,7 @@ func UnlockOrder(tradeNo string) {
 
 func EpayNotify(c *gin.Context) {
 	if !isEpayWebhookEnabled() {
-		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook rejected reason=webhook_disabled path=%q client_ip=%s", paymentCallbackPath(c), c.ClientIP()))
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
@@ -416,7 +548,7 @@ func EpayNotify(c *gin.Context) {
 	if c.Request.Method == "POST" {
 		// POST 请求：从 POST body 解析参数
 		if err := c.Request.ParseForm(); err != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to parse POST form path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to parse POST form path=%q client_ip=%s error=%q", paymentCallbackPath(c), c.ClientIP(), err.Error()))
 			_, _ = c.Writer.Write([]byte("fail"))
 			return
 		}
@@ -431,31 +563,31 @@ func EpayNotify(c *gin.Context) {
 			return r
 		}, map[string]string{})
 	}
-	logger.LogInfo(c.Request.Context(), common.LogText("Epay webhook received request path=%q client_ip=%s method=%s params=%q", c.Request.RequestURI, c.ClientIP(), c.Request.Method, common.GetJsonString(params)))
+	logger.LogInfo(c.Request.Context(), common.LogText("Epay webhook received request path=%q client_ip=%s method=%s params=%q", paymentCallbackPath(c), c.ClientIP(), c.Request.Method, paymentFormLogSummary(params)))
 
 	if len(params) == 0 {
-		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook params are empty path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook params are empty path=%q client_ip=%s", paymentCallbackPath(c), c.ClientIP()))
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
 	client := GetEpayClient()
 	if client == nil {
-		logger.LogError(c.Request.Context(), common.LogText("Epay client is not initialized path=%q client_ip=%s", c.Request.RequestURI, c.ClientIP()))
+		logger.LogError(c.Request.Context(), common.LogText("Epay client is not initialized path=%q client_ip=%s", paymentCallbackPath(c), c.ClientIP()))
 		_, err := c.Writer.Write([]byte("fail"))
 		if err != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", paymentCallbackPath(c), c.ClientIP(), err.Error()))
 		}
 		return
 	}
 	verifyInfo, err := client.Verify(params)
 	if err != nil || !verifyInfo.VerifyStatus {
 		if _, writeErr := c.Writer.Write([]byte("fail")); writeErr != nil {
-			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", c.Request.RequestURI, c.ClientIP(), writeErr.Error()))
+			logger.LogError(c.Request.Context(), common.LogText("Epay webhook failed to write response path=%q client_ip=%s error=%q", paymentCallbackPath(c), c.ClientIP(), writeErr.Error()))
 		}
 		if err != nil {
-			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_error=%q", c.Request.RequestURI, c.ClientIP(), err.Error()))
+			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_error=%q", paymentCallbackPath(c), c.ClientIP(), err.Error()))
 		} else {
-			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_status=false", c.Request.RequestURI, c.ClientIP()))
+			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook signature verification failed path=%q client_ip=%s verify_status=false", paymentCallbackPath(c), c.ClientIP()))
 		}
 		return
 	}
