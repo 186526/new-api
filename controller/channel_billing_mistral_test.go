@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -12,8 +13,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 )
 
 func setupMistralBalanceTest(t *testing.T) {
@@ -33,22 +36,21 @@ func setupMistralBalanceTest(t *testing.T) {
 	})
 }
 
-// newMistralSubscriptionServer serves the console page with an API budget used
-// at apiPercentage percent of apiLimit and a Vibe budget used at
-// vibePercentage percent of vibeLimit.
-func newMistralSubscriptionServer(t *testing.T, apiPercentage float64, apiLimit float64, vibePercentage float64, vibeLimit float64) *httptest.Server {
+// newMistralConsoleServer answers the console trpc budget endpoint with one
+// merged allowance used at percentage percent of limit dollars. It refuses the
+// public billing endpoint, which a console session must never reach.
+func newMistralConsoleServer(t *testing.T, percentage float64, limit float64) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The account's keys are strings only, so the billing endpoint rejects
-		// them and the console page answers, which is what these tests cover.
 		if r.URL.Path == "/v1/billing/budget" {
-			http.Error(w, "no key", http.StatusUnauthorized)
+			http.Error(w, "the public billing endpoint must not answer an account with a session", http.StatusInternalServerError)
 			return
 		}
 		assert.Contains(t, r.Header.Get("Cookie"), "ory_session_")
 		assert.Contains(t, r.Header.Get("User-Agent"), "Mozilla/5.0")
-		_, _ = fmt.Fprintf(w, `<script>self.__next_f.push([1,"\"budget\":{\"usage_percentage\":0,\"initial_budget\":0,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\",\"api_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"},\"vibe_budget\":{\"usage_percentage\":%v,\"initial_budget\":%v,\"currency\":\"USD\",\"reset_at\":\"2026-12-01T00:00:00Z\"}}"])</script>`,
-			apiPercentage, apiLimit, vibePercentage, vibeLimit)
+		_, _ = fmt.Fprintf(w,
+			`{"result":{"data":{"json":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`,
+			percentage, limit)
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -63,37 +65,35 @@ func setMistralQuotaEnv(t *testing.T, serverURL string, accounts string) {
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", accounts)
 }
 
-func TestMistralBalanceUsesTheAllowanceOfTheChannelKey(t *testing.T) {
+// TestMistralBalanceIsTheSameForEveryKeyOfTheAccount requires the channel
+// balance to stop depending on which key the channel carries: Vibe and Studio
+// draw on one monthly allowance, so a Studio key and a Vibe plan key of the same
+// account report the same figure. 65.79% of 150 USD leaves 51.315 USD.
+func TestMistralBalanceIsTheSameForEveryKeyOfTheAccount(t *testing.T) {
 	setupMistralBalanceTest(t)
-	server := newMistralSubscriptionServer(t, 60, 15, 25, 150)
-	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio"}]`)
+	server := newMistralConsoleServer(t, 65.79, 150)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio","monthlyLimitUsd":150}]`)
 
-	studio := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_studio", Name: "Mistral (pro)"}
-	require.NoError(t, model.DB.Create(studio).Error)
-	result, err := updateChannelBalance(studio)
-	require.NoError(t, err)
-	assert.InDelta(t, 6.0, result.Balance, 1e-9)
-	assert.InDelta(t, 6.0, studio.Balance, 1e-9)
-
-	vibe := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_vibe", Name: "Mistral (pro)"}
-	require.NoError(t, model.DB.Create(vibe).Error)
-	result, err = updateChannelBalance(vibe)
-	require.NoError(t, err)
-	assert.InDelta(t, 112.5, result.Balance, 1e-9)
+	for _, key := range []string{"mstrl_studio", "mstrl_vibe", "mstrl_unlisted"} {
+		channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: key, Name: "Mistral (pro)"}
+		require.NoError(t, model.DB.Create(channel).Error)
+		result, err := updateChannelBalance(channel)
+		require.NoError(t, err, "key %q", key)
+		assert.InDelta(t, 51.315, result.Balance, 1e-9, "key %q", key)
+		assert.InDelta(t, 51.315, channel.Balance, 1e-9, "key %q", key)
+	}
 }
 
-func TestMistralBalanceFallsBackToTheVibeAllowance(t *testing.T) {
+func TestMistralBalanceRejectsAnAccountWithoutAPlanAmount(t *testing.T) {
 	setupMistralBalanceTest(t)
-	server := newMistralSubscriptionServer(t, 60, 15, 25, 150)
-	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","vibeKey":"mstrl_vibe","studioKey":"mstrl_studio"}]`)
+	server := newMistralConsoleServer(t, 25, 0)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1"}]`)
 
-	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_unlisted", Name: "Mistral (pro)"}
-	require.NoError(t, model.DB.Create(channel).Error)
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral (pro)"}
 
-	result, err := updateChannelBalance(channel)
+	_, err := updateChannelBalance(channel)
 
-	require.NoError(t, err)
-	assert.InDelta(t, 112.5, result.Balance, 1e-9)
+	require.ErrorContains(t, err, "has no plan amount for its monthly allowance")
 }
 
 func TestMistralBalanceRejectsUnknownChannel(t *testing.T) {
@@ -105,4 +105,135 @@ func TestMistralBalanceRejectsUnknownChannel(t *testing.T) {
 	_, err := updateChannelBalance(channel)
 
 	require.ErrorContains(t, err, `no Mistral quota account is configured for channel "Mistral (other)"`)
+}
+
+// newMistralAutoDisableServer serves the console allowance of one account and
+// flips it between an exhausted and a refilled plan, so a test can take a channel
+// through the disable and the recovery of the same allowance.
+type mistralAutoDisableServer struct {
+	*httptest.Server
+	exhausted bool
+}
+
+func newMistralAutoDisableState(t *testing.T) *mistralAutoDisableServer {
+	t.Helper()
+	state := &mistralAutoDisableServer{}
+	state.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		percentage, limit := 100.0, 150.0
+		if !state.exhausted {
+			percentage, limit = 65.79, 150.0
+		}
+		_, _ = fmt.Fprintf(w,
+			`{"result":{"data":{"json":{"usage_percentage":%v,"initial_budget":%v,"currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}}}`,
+			percentage, limit)
+	}))
+	t.Cleanup(state.Close)
+	return state
+}
+
+// captureMistralSweepLog pins the sweep's pause between channels to zero and
+// returns the buffer its lines land in.
+func captureMistralSweepLog(t *testing.T) {
+	t.Helper()
+	previous := common.RequestInterval
+	common.RequestInterval = 0
+	t.Cleanup(func() { common.RequestInterval = previous })
+}
+
+// TestChannelBalanceSweepReenablesAChannelItDisabled requires a channel the sweep
+// disabled at zero balance to come back once the allowance it draws on resets.
+// The sweep used to visit enabled channels only, so the channel it disabled was
+// never read again and stayed out of service until an admin re-enabled it by
+// hand. The reset is the allowance of a merged monthly plan, which every channel
+// of the account draws on.
+func TestChannelBalanceSweepReenablesAChannelItDisabled(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captureMistralSweepLog(t)
+	state := newMistralAutoDisableState(t)
+	setMistralQuotaEnv(t, state.Server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{
+		Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral (pro)",
+		Status: common.ChannelStatusEnabled, OtherInfo: "{}",
+	}
+	require.NoError(t, model.DB.Create(channel).Error)
+
+	state.exhausted = true
+	require.NoError(t, updateAllChannelsBalance())
+	disabled, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.Equal(t, common.ChannelStatusAutoDisabled, disabled.Status,
+		"a channel with nothing left must be disabled by the sweep")
+	require.Equal(t, channelStatusReasonInsufficientBalance, disabled.GetOtherInfo()["status_reason"])
+
+	state.exhausted = false
+	require.NoError(t, updateAllChannelsBalance())
+	enabled, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusEnabled, enabled.Status,
+		"a refilled allowance must bring the channel back")
+}
+
+// TestChannelBalanceSweepLeavesAManualDisableAlone requires the recovery to stay
+// with the balance: a channel an admin disabled by hand keeps that state even
+// when its allowance is healthy.
+func TestChannelBalanceSweepLeavesAManualDisableAlone(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captureMistralSweepLog(t)
+	server := newMistralConsoleServer(t, 25, 150)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral (pro)"}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.True(t, model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusManuallyDisabled, "manual operation"))
+
+	require.NoError(t, updateAllChannelsBalance())
+
+	stored, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+}
+
+// TestChannelBalanceSweepLeavesARelayDisableAlone requires a channel the relay
+// disabled after upstream failures to stay disabled when its balance is healthy:
+// only a channel the sweep itself took out is the sweep's to bring back.
+func TestChannelBalanceSweepLeavesARelayDisableAlone(t *testing.T) {
+	setupMistralBalanceTest(t)
+	captureMistralSweepLog(t)
+	server := newMistralConsoleServer(t, 25, 150)
+	setMistralQuotaEnv(t, server.URL, `[{"channel":"Mistral (pro)","cookie":"ory_session_x=1","monthlyLimitUsd":150}]`)
+
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_key", Name: "Mistral (pro)"}
+	require.NoError(t, model.DB.Create(channel).Error)
+	require.True(t, model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, "upstream returned 401"))
+
+	require.NoError(t, updateAllChannelsBalance())
+
+	stored, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, "upstream returned 401", stored.GetOtherInfo()["status_reason"])
+}
+
+// TestApplyMistralChannelBalanceReadsTheMergedAllowance requires the stored
+// balance to be the plan amount minus what the merged allowance used, whatever
+// key the channel carries.
+func TestApplyMistralChannelBalanceReadsTheMergedAllowance(t *testing.T) {
+	setupMistralBalanceTest(t)
+	channel := &model.Channel{Type: constant.ChannelTypeMistral, Key: "mstrl_studio", Name: "Mistral (pro)"}
+	quota := &service.MistralQuota{
+		Channel: "Mistral (pro)",
+		Allowance: &service.MistralBudget{
+			UsagePercentage: 65.79,
+			LimitUSD:        150,
+			ResetAt:         time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC),
+		},
+		FetchedAt: time.Unix(1793550000, 0),
+	}
+
+	balance, err := applyMistralChannelBalance(channel, quota)
+
+	require.NoError(t, err)
+	assert.InDelta(t, 51.315, balance, 1e-9)
+	assert.InDelta(t, 51.315, channel.Balance, 1e-9)
 }

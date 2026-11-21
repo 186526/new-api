@@ -18,8 +18,9 @@ import (
 
 const channelUsageFetchTimeout = 30 * time.Second
 
-// mistralUsageBudget is one monthly allowance of the usage dialog. A Mistral
-// plan carries an API/Studio budget and a Vibe Code budget separately.
+// mistralUsageBudget is the merged monthly allowance of the usage dialog.
+// Mistral bills Vibe and Studio from one "Included Vibe & Studio usage" figure,
+// so the account reports one row.
 type mistralUsageBudget struct {
 	Scope           string  `json:"scope"`
 	UsagePercentage float64 `json:"usage_percentage"`
@@ -38,16 +39,14 @@ type mistralUsage struct {
 	FetchedAt   int64                `json:"fetched_at"`
 }
 
-// newMistralUsage turns the monthly allowances into the usage dialog payload.
+// newMistralUsage turns the merged monthly allowance into the usage dialog
+// payload.
 func newMistralUsage(account service.MistralQuotaAccount, quota *service.MistralQuota) mistralUsage {
-	budgets := make([]mistralUsageBudget, 0, 2)
-	for _, budget := range []*service.MistralBudget{quota.API, quota.Vibe} {
-		if budget == nil {
-			continue
-		}
+	budgets := make([]mistralUsageBudget, 0, 1)
+	if budget := quota.Allowance; budget != nil {
 		remainingRatio := clampRatio(1 - budget.UsagePercentage/100)
 		budgets = append(budgets, mistralUsageBudget{
-			Scope:           budget.Scope,
+			Scope:           service.MistralBudgetScopeVibe,
 			UsagePercentage: budget.UsagePercentage,
 			RemainingRatio:  remainingRatio,
 			LimitUSD:        budget.LimitUSD,

@@ -156,22 +156,20 @@ var mistralMissingChannelLog struct {
 	reported string
 }
 
-// mistralQuotaWindows lists every allowance the console reported, so the
-// dashboard can separate the API/Studio budget from the Vibe Code budget.
+// mistralQuotaWindows lists the merged monthly allowance the console reported.
+// Vibe and Studio draw on one allowance, so the account publishes one window:
+// a second scope would show a plan amount every plan has stopped carrying.
 func mistralQuotaWindows(quota *service.MistralQuota) []appmetrics.QuotaWindow {
-	windows := make([]appmetrics.QuotaWindow, 0, 2)
-	for _, budget := range []*service.MistralBudget{quota.API, quota.Vibe} {
-		if budget == nil {
-			continue
-		}
-		windows = append(windows, appmetrics.QuotaWindow{
-			Scope:          budget.Scope,
-			Window:         "monthly",
-			RemainingRatio: clampMistralQuotaRatio(1 - budget.UsagePercentage/100),
-			ResetAt:        budget.ResetAt,
-		})
+	budget := quota.Allowance
+	if budget == nil {
+		return nil
 	}
-	return windows
+	return []appmetrics.QuotaWindow{{
+		Scope:          service.MistralBudgetScopeVibe,
+		Window:         "monthly",
+		RemainingRatio: clampMistralQuotaRatio(1 - budget.UsagePercentage/100),
+		ResetAt:        budget.ResetAt,
+	}}
 }
 
 // StartMistralQuotaRefresh polls the monthly allowances in the background. The

@@ -743,13 +743,36 @@ func UpdateChannelBalance(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// channelStatusReasonInsufficientBalance is the reason the balance sweep records
+// when it disables a channel. It is what separates such a channel from one an
+// admin disabled by hand and from one the relay disabled after upstream
+// failures, so the sweep knows which disabled channel it may bring back.
+const channelStatusReasonInsufficientBalance = "Insufficient balance"
+
+// awaitsBalanceRecovery reports whether a channel is disabled for a reason this
+// sweep owns. A manual disable and a relay disable stay untouched: only the
+// balance that took the channel out brings it back.
+func awaitsBalanceRecovery(channel *model.Channel) bool {
+	if channel.Status != common.ChannelStatusAutoDisabled {
+		return false
+	}
+	reason, _ := channel.GetOtherInfo()["status_reason"].(string)
+	return reason == channelStatusReasonInsufficientBalance
+}
+
+// updateAllChannelsBalance refreshes every channel balance and keeps the
+// automatic status in step with it. A channel disabled for its balance is read
+// too: with the sweep visiting enabled channels alone, a channel it disabled
+// could never be seen to recover, and a refilled allowance left it out of
+// service until an admin re-enabled it by hand.
 func updateAllChannelsBalance() error {
 	channels, err := model.GetAllChannels(0, 0, true, false)
 	if err != nil {
 		return err
 	}
 	for _, channel := range channels {
-		if channel.Status != common.ChannelStatusEnabled {
+		recovering := awaitsBalanceRecovery(channel)
+		if channel.Status != common.ChannelStatusEnabled && !recovering {
 			continue
 		}
 		if channel.ChannelInfo.IsMultiKey {
@@ -761,11 +784,18 @@ func updateAllChannelsBalance() error {
 		//}
 		result, err := updateChannelBalance(channel)
 		if err != nil {
+			time.Sleep(common.RequestInterval)
 			continue
-		} else if result.RawResponse == "" {
+		}
+		if result.RawResponse == "" {
 			// err is nil & balance <= 0 means quota is used up
 			if result.Balance <= 0 {
-				service.DisableChannel(*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, "", channel.GetAutoBan()), "Insufficient balance")
+				if !recovering {
+					service.DisableChannel(*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, "", channel.GetAutoBan()), channelStatusReasonInsufficientBalance)
+				}
+			} else if recovering {
+				common.SysLog(common.LogText("channel %q (#%d) has a balance of %.2f USD again, enabling it", channel.Name, channel.Id, result.Balance))
+				service.EnableChannel(channel.Id, "", channel.Name)
 			}
 		}
 		time.Sleep(common.RequestInterval)
