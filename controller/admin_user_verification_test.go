@@ -283,27 +283,27 @@ func TestAdminUserGroupChangeCompletesOnATargetBoundProof(t *testing.T) {
 
 func TestAdminUserGroupChangeRequiresProofOnlyWhenTheGroupMoves(t *testing.T) {
 	for _, test := range []struct {
-		name, group string
-		// An absent group must leave the stored one untouched: EditWithTx writes
-		// the field unconditionally, and an empty group would be a wider one.
-		storedGroup string
+		name string
+		// groupField is the raw JSON member, so an explicitly empty group can be
+		// told apart from an omitted one; both must leave the stored group alone.
+		groupField string
 	}{
-		{name: "group absent", storedGroup: "default"},
-		{name: "group unchanged", group: "default", storedGroup: "default"},
+		{name: "group absent"},
+		{name: "group explicitly empty", groupField: `,"group":""`},
+		{name: "group unchanged", groupField: `,"group":"default"`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, identity, target := setupAdminGroupChangeTest(t)
-			body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed"}`, target.Id)
-			if test.group != "" {
-				body = fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed","group":%q}`, target.Id, test.group)
-			}
+			body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed"%s}`, target.Id, test.groupField)
 			response := adminUserRequest(http.MethodPut, "/api/user/", body, "", identity, common.RoleAdminUser, nil, UpdateUser)
 			var result securityEnrollmentResponse
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
 			require.True(t, result.Success, response.Body.String())
 			stored, err := model.GetUserById(target.Id, false)
 			require.NoError(t, err)
-			assert.Equal(t, test.storedGroup, stored.Group)
+			// EditWithTx writes the group column unconditionally, so an empty group
+			// must be replaced with the stored one: it is a wider group.
+			assert.Equal(t, "default", stored.Group)
 			// Group equal to the stored one leaves auth_version alone, so the
 			// edit does not sign the account out.
 			assert.EqualValues(t, target.AuthVersion, stored.AuthVersion)
