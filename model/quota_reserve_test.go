@@ -1379,48 +1379,86 @@ func TestAnUnsignedSchemaRaiseKeepsTheSignedBalance(t *testing.T) {
 	}
 }
 
-// A schema 3 hash is a layout no deployment ever wrote, so nothing migrates it.
-// The version 3 ledger could record a wallet in arrears, which the database row
-// never holds: that is the one shape where the two paths answer differently, so
-// it is the shape the test uses. A migration would carry the debt across and
+// A schema 3 hash is a layout no deployed image ever wrote, so nothing migrates
+// it. The version 3 ledger could record a wallet in arrears, which the database
+// row never holds: that is the one shape where the two paths answer differently,
+// so the signed subtest uses it. A migration would carry the debt across and
 // report −20; the rebuild reports the row, which is the same 100 here only
 // because nothing was spent yet (see TestLiveSchema2HashIsRebuiltOverTheAccumulatorBalance
-// for the shape where the fold makes the rebuild answer the spend).
+// for the shape where the fold makes the rebuild answer the spend). The forged
+// subtest covers the hash whose ledger signature verifies nothing, a shape the
+// schema comparison already diverts but no other test pins.
 func TestSchema3HashIsRebuiltNotMigrated(t *testing.T) {
-	truncateTables(t)
-	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
-	common.BatchUpdateEnabled = true
+	// The signed shape: the version 3 ledger agrees with itself and records a
+	// wallet in arrears, which a migration would carry across.
+	t.Run("signed ledger", func(t *testing.T) {
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		useUserCacheMiniRedis(t)
+		common.BatchUpdateEnabled = true
 
-	user := createReserveTestUser(t, 100)
-	key := getUserCacheKey(user.Id)
-	require.NoError(t, populateUserCache(user))
+		user := createReserveTestUser(t, 100)
+		key := getUserCacheKey(user.Id)
+		require.NoError(t, populateUserCache(user))
 
-	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
-	v3MAC, err := authCacheMAC(key, struct {
-		Id             int
-		AuthVersion    int64
-		CacheSchema    int
-		QuotaCredited  int64
-		QuotaSpentBase int64
-		ExpiresAt      int64
-	}{user.Id, user.AuthVersion, 3, 30, 0, expiresAt})
-	require.NoError(t, err)
-	var seeded UserBase
-	require.NoError(t, common.RedisHGetObj(key, &seeded))
-	seeded.CacheSchema = 3
-	metadataMAC, err := seeded.cacheMAC()
-	require.NoError(t, err)
-	require.NoError(t, common.RDB.HSet(t.Context(), key,
-		"CacheSchema", 3, "QuotaCredited", 30, "QuotaSpent", 50, "QuotaSpentBase", 0,
-		"Quota", -20, "QuotaLedgerMAC", v3MAC, "QuotaLedgerExp", expiresAt,
-		"CacheMAC", metadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
+		expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+		v3MAC, err := authCacheMAC(key, struct {
+			Id             int
+			AuthVersion    int64
+			CacheSchema    int
+			QuotaCredited  int64
+			QuotaSpentBase int64
+			ExpiresAt      int64
+		}{user.Id, user.AuthVersion, 3, 30, 0, expiresAt})
+		require.NoError(t, err)
+		var seeded UserBase
+		require.NoError(t, common.RedisHGetObj(key, &seeded))
+		seeded.CacheSchema = 3
+		metadataMAC, err := seeded.cacheMAC()
+		require.NoError(t, err)
+		require.NoError(t, common.RDB.HSet(t.Context(), key,
+			"CacheSchema", 3, "QuotaCredited", 30, "QuotaSpent", 50, "QuotaSpentBase", 0,
+			"Quota", -20, "QuotaLedgerMAC", v3MAC, "QuotaLedgerExp", expiresAt,
+			"CacheMAC", metadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
 
-	balance, err := GetUserQuota(user.Id, false)
-	require.NoError(t, err)
-	assert.Equal(t, 100, balance,
-		"the hash is rebuilt from the row; a migration would have carried the debt across as -20")
-	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+		balance, err := GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 100, balance,
+			"the hash is rebuilt from the row; a migration would have carried the debt across as -20")
+		assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+	})
+
+	// The forged shape: the ledger signature verifies nothing, and the counters
+	// claim ten times what the row holds, so any path that read them would answer
+	// 1000. The schema comparison already diverts this hash, but that judgement is
+	// not one this test exercises for the MAC, so pin the answer here.
+	t.Run("forged ledger", func(t *testing.T) {
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		useUserCacheMiniRedis(t)
+
+		user := createReserveTestUser(t, 100)
+		key := getUserCacheKey(user.Id)
+		require.NoError(t, populateUserCache(user))
+
+		expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+		require.NoError(t, common.RDB.HSet(t.Context(), key,
+			"CacheSchema", 3, "QuotaCredited", 1000, "QuotaSpent", 0, "QuotaSpentBase", 0,
+			"Quota", 1000, "QuotaLedgerMAC", "not-a-signature", "QuotaLedgerExp", expiresAt).Err())
+
+		balance, err := GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 100, balance, "a ledger that verifies nothing is answered from the row")
+		assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+
+		reserved, err := TryReserveUserQuota(user.Id, 101)
+		require.NoError(t, err)
+		assert.False(t, reserved, "the forged 1000 is not spendable")
+		reserved, err = TryReserveUserQuota(user.Id, 100)
+		require.NoError(t, err)
+		assert.True(t, reserved, "the wallet holds the row's 100")
+		assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
+	})
 }
 
 // seedLiveSchema2UserHash rewrites a populated hash into the exact shape the

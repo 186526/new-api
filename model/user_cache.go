@@ -15,23 +15,24 @@ import (
 
 // userCacheSchemaVersion 4 adds the signed quota ledger described on UserBase.
 //
-// The deployed builds wrote version 2: `const userCacheSchemaVersion = 2` on
-// 0c28a7adb (production) and on master. A version 3 layout existed only on
-// commits b512647d2 / c80e3bfbc / 8f315f317, none of them an ancestor of master,
-// so no deployment ever wrote one and no migration runs for it here. A version 2
-// hash carries no ledger fields at all: its only record of a spend is the
-// untrusted Quota mirror, so it is rebuilt from the database rather than
+// No image that ever ran wrote a version 3 hash, so nothing migrates that
+// layout here. Every backend tag in the ReplicaSet history resolves to
+// `const userCacheSchemaVersion = 2`, the running one (0c28a7adb) included. A
+// version 2 hash carries no ledger fields at all: its only record of a spend is
+// the untrusted Quota mirror, so it is rebuilt from the database rather than
 // migrated, and the rebuild signs the balance the accumulator holds rather than
 // the raw row (see seedUserQuotaLedger).
 //
 // The deploy mitigation is a drained restart (stop the pods, let the batch
-// accumulator flush, then start the new build), tracked as M80.
+// accumulator flush, then start the new build), which M80 supplies: `main.go`
+// now waits for detached refunds and then flushes before the process exits.
 const userCacheSchemaVersion = 4
 
-// ledgerV2SchemaVersion is the layout the deployed build wrote: 0c28a7adb and
-// master both carry `const userCacheSchemaVersion = 2`. It has no ledger fields
-// and keeps its balance in the unsigned Quota mirror, so it is matched to
-// recognise a hash the upgrade has to bring forward. Nothing writes it.
+// ledgerV2SchemaVersion is the layout the deployed build wrote: 0c28a7adb, the
+// image in production, carries `const userCacheSchemaVersion = 2`. It has no
+// ledger fields and keeps its balance in the unsigned Quota mirror, so it is
+// matched to recognise a hash the upgrade has to bring forward. Nothing writes
+// it.
 const ledgerV2SchemaVersion = 2
 
 // UserBase is the cached user snapshot. Quota is a mirror of the signed quota
@@ -246,7 +247,7 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
 	// A version 3 hash was published by this branch before the live counter was
-	// signed, on commits no deployment ever ran (see userCacheSchemaVersion).
+	// signed, on commits no deployed image contains (see userCacheSchemaVersion).
 	// Nothing migrates it: it is reported stale and rebuilt from the database, and
 	// the rebuild signs the balance the accumulator holds rather than the raw row.
 	if userCache.CacheSchema != userCacheSchemaVersion {
