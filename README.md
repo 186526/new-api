@@ -219,7 +219,7 @@ git clone https://github.com/QuantumNous/new-api.git
 cd new-api
 ```
 
-Before starting, edit `docker-compose.yml`: replace the database and Redis example passwords in both the services and connection strings, and set a persistent random `SESSION_SECRET` and a distinct random `CRYPTO_SECRET` (generate each one with `openssl rand -hex 32`). The process refuses to start while `CRYPTO_SECRET` is unset; an installation upgraded from a release that defaulted it to `SESSION_SECRET` must set `CRYPTO_SECRET` to that same value to keep its issued task artifact URLs and its auth cache entries valid. For an HTTPS console, configure `SESSION_COOKIE_SECURE=true` and `SESSION_COOKIE_TRUSTED_URL` with its exact public HTTPS origin.
+Before starting, edit `docker-compose.yml`: replace the database and Redis example passwords in both the services and connection strings, and set a persistent random `SESSION_SECRET` and a distinct random `CRYPTO_SECRET` (generate each one with `openssl rand -hex 32`). The process refuses to start while `CRYPTO_SECRET` is unset; an installation upgraded from a release that defaulted it to `SESSION_SECRET` must set `CRYPTO_SECRET` to that same value to keep its issued task artifact URLs and its auth cache entries valid, and neither variable may keep the example value `random_string`. For an HTTPS console, configure `SESSION_COOKIE_SECURE=true` and `SESSION_COOKIE_TRUSTED_URL` with its exact public HTTPS origin.
 
 ```bash
 docker compose up -d
