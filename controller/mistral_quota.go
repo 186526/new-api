@@ -20,9 +20,10 @@ import (
 // the console is polled at: each tick reads every account once, which the
 // deployed one-minute value turns into five requests a minute for the five
 // configured accounts (about 300 an hour), with no pause between them because
-// POLLING_INTERVAL is unset. Only a rejected session slows the loop, and it
-// backs off only after a source has already failed. Each tick still adds jitter
-// so the accounts do not poll on an exact schedule.
+// POLLING_INTERVAL is unset. A failed refresh stretches the wait between ticks:
+// a rejected session backs off to six intervals, any other failed source to
+// two, and a tick in which every account answers re-jitters the interval. Each
+// tick still adds jitter so the accounts do not poll on an exact schedule.
 const MistralQuotaRefreshInterval = time.Minute
 
 const mistralQuotaMaxBackoff = time.Hour
