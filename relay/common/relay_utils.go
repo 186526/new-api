@@ -75,6 +75,7 @@ func isSensitiveURLQueryKey(key string) bool {
 		"api-key",
 		"apikey",
 		"x-api-key",
+		"access",
 		"access_token",
 		"refresh_token",
 		"id_token",

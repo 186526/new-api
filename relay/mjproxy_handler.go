@@ -51,6 +51,36 @@ func BuildMidjourneyImageURL(mjId string, done bool) string {
 	return imageURL
 }
 
+// midjourneyImageMaxAccessLength bounds the encoded signature the route reads,
+// matching the limit the task artifact route puts on the same parameter.
+const midjourneyImageMaxAccessLength = 128
+
+// midjourneyImageAccessParameter reports whether the request carries exactly
+// one non-empty access parameter. A repeated or malformed parameter is rejected
+// the same way a wrong signature is, so the route never picks one of two values
+// by position.
+func midjourneyImageAccessParameter(c *gin.Context) (string, bool) {
+	rawAccess := ""
+	count := 0
+	for part := range strings.SplitSeq(c.Request.URL.RawQuery, "&") {
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil || key != service.TaskArtifactAccessQueryParameter {
+			continue
+		}
+		count++
+		rawAccess = rawValue
+	}
+	if count != 1 || rawAccess == "" || len(rawAccess) > midjourneyImageMaxAccessLength {
+		return "", false
+	}
+	access, err := url.QueryUnescape(rawAccess)
+	if err != nil {
+		return "", false
+	}
+	return access, true
+}
+
 // RelayMidjourneyImage serves one Midjourney image to whoever holds the signed
 // URL. The signature is checked before any database read, and every rejection
 // is the same 404 an unknown id gets, so a caller cannot tell a wrong signature
@@ -59,7 +89,8 @@ func BuildMidjourneyImageURL(mjId string, done bool) string {
 func RelayMidjourneyImage(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
 	taskId := c.Param("id")
-	if !service.VerifyTaskArtifactAccess(c.Query(service.TaskArtifactAccessQueryParameter), taskId, midjourneyImageCapabilityObject) {
+	access, present := midjourneyImageAccessParameter(c)
+	if !present || !service.VerifyTaskArtifactAccess(access, taskId, midjourneyImageCapabilityObject) {
 		if !middleware.AcquireMidjourneyImageAccess(c.ClientIP()) {
 			writeMidjourneyImageAccessLimited(c)
 			return

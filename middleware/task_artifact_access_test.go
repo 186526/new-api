@@ -152,6 +152,32 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
 }
 
+// TestSetUpLoggerNeverWritesMidjourneyImageCapability pins the access log of
+// GET /mj/image/:id, which the artifact redaction middleware does not cover: the
+// sanitizer has to mask the access value instead.
+func TestSetUpLoggerNeverWritesMidjourneyImageCapability(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousWriter := gin.DefaultWriter
+	var output bytes.Buffer
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+	router := gin.New()
+	SetUpLogger(router)
+	router.GET("/mj/image/:id", func(c *gin.Context) {
+		c.Status(http.StatusNotFound)
+	})
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/mj/image/mj-1?access=never-log-this&rand=1",
+		nil,
+	)
+	router.ServeHTTP(httptest.NewRecorder(), request)
+
+	assert.NotContains(t, output.String(), "never-log-this")
+	assert.Contains(t, output.String(), "?access=%2A%2A%2Amasked%2A%2A%2A&rand=1")
+}
+
 func urlQueryEscape(value string) string {
 	replacer := strings.NewReplacer("+", "%2B", "=", "%3D")
 	return replacer.Replace(value)

@@ -185,6 +185,15 @@ func TestMidjourneyImageRouteNeedsTheSignature(t *testing.T) {
 	}
 	assert.NotContains(t, strings.ToLower(unsigned.Body.String()), "signature")
 	assert.Equal(t, int32(1), upstreamHits.Load(), "only the signed request reaches the image")
+
+	// A repeated access parameter is read as malformed, not as "take the first":
+	// the artifact route rejects a count other than one, and this route agrees.
+	repeated := getMidjourneyImage(router, "/mj/image/"+midjourneyImageTestId+"?"+
+		service.TaskArtifactAccessQueryParameter+"="+url.QueryEscape(access)+"&"+
+		service.TaskArtifactAccessQueryParameter+"="+url.QueryEscape(tampered))
+	assert.Equal(t, http.StatusNotFound, repeated.Code)
+	assert.Equal(t, unknown.Body.String(), repeated.Body.String())
+	assert.Equal(t, int32(1), upstreamHits.Load(), "a repeated parameter reads no image")
 }
 
 // utils2FlippedSignature returns a signature of the right shape that is not the
