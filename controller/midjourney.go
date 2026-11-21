@@ -12,9 +12,9 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
-	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
 )
@@ -293,10 +293,7 @@ func GetAllMidjourney(c *gin.Context) {
 	total := model.CountAllTasks(queryParams)
 
 	if setting.MjForwardUrlEnabled {
-		for i, midjourney := range items {
-			midjourney.ImageUrl = system_setting.ServerAddress + "/mj/image/" + midjourney.MjId
-			items[i] = midjourney
-		}
+		midjourneyItemsWithSignedImageURL(items)
 	}
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
@@ -318,12 +315,21 @@ func GetUserMidjourney(c *gin.Context) {
 	total := model.CountAllUserTask(userId, queryParams)
 
 	if setting.MjForwardUrlEnabled {
-		for i, midjourney := range items {
-			midjourney.ImageUrl = system_setting.ServerAddress + "/mj/image/" + midjourney.MjId
-			items[i] = midjourney
-		}
+		midjourneyItemsWithSignedImageURL(items)
 	}
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
+}
+
+// midjourneyItemsWithSignedImageURL points every listed task at the signed
+// address of its image, so a task list never hands out a URL the image route
+// answers with 404. A task whose signature the process cannot issue keeps the
+// ImageUrl the database holds.
+func midjourneyItemsWithSignedImageURL(items []*model.Midjourney) {
+	for _, midjourney := range items {
+		if signed := relay.BuildMidjourneyImageURL(midjourney.MjId, midjourney.Status == "SUCCESS"); signed != "" {
+			midjourney.ImageUrl = signed
+		}
+	}
 }

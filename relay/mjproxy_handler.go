@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -26,13 +28,55 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// midjourneyImageCapabilityObject names the capability a Midjourney image URL
+// carries. IssueTaskArtifactAccess binds it to the public Midjourney id alone,
+// so the URL stays stable across users and sessions and a shared link keeps
+// working.
+const midjourneyImageCapabilityObject = "image"
+
+// BuildMidjourneyImageURL returns the address a client uses to open one
+// Midjourney image: ServerAddress, the path, the signed access parameter and,
+// for a task that is not SUCCESS yet, a cache-busting rand. It returns "" when
+// no signature can be issued, and RelayMidjourneyImage then serves no image.
+func BuildMidjourneyImageURL(mjId string, done bool) string {
+	baseAddress := strings.TrimRight(strings.TrimSpace(system_setting.ServerAddress), "/")
+	access, err := service.IssueTaskArtifactAccess(mjId, midjourneyImageCapabilityObject)
+	if err != nil || baseAddress == "" {
+		return ""
+	}
+	imageURL := baseAddress + "/mj/image/" + url.PathEscape(mjId) + "?" + service.TaskArtifactAccessQueryParameter + "=" + url.QueryEscape(access)
+	if !done {
+		imageURL += "&rand=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return imageURL
+}
+
+// RelayMidjourneyImage serves one Midjourney image to whoever holds the signed
+// URL. The signature is checked before any database read, and every rejection
+// is the same 404 an unknown id gets, so a caller cannot tell a wrong signature
+// from a missing task. Concurrent fetches of one image and repeated bad
+// signatures are limited by the limiter the task artifact route uses.
 func RelayMidjourneyImage(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
 	taskId := c.Param("id")
+	if !service.VerifyTaskArtifactAccess(c.Query(service.TaskArtifactAccessQueryParameter), taskId, midjourneyImageCapabilityObject) {
+		if !middleware.AcquireMidjourneyImageAccess(c.ClientIP(), taskId) {
+			writeMidjourneyImageAccessLimited(c)
+			return
+		}
+		writeMidjourneyImageNotFound(c)
+		return
+	}
+	release, ok := middleware.HoldMidjourneyImageAccess(c.ClientIP(), taskId)
+	if !ok {
+		writeMidjourneyImageAccessLimited(c)
+		return
+	}
+	defer release()
+
 	midjourneyTask := model.GetByOnlyMJId(taskId)
 	if midjourneyTask == nil {
-		c.JSON(400, gin.H{
-			"error": "midjourney_task_not_found",
-		})
+		writeMidjourneyImageNotFound(c)
 		return
 	}
 	var httpClient *http.Client
@@ -98,6 +142,19 @@ func RelayMidjourneyImage(c *gin.Context) {
 	return
 }
 
+func writeMidjourneyImageNotFound(c *gin.Context) {
+	c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+		"error": "midjourney_task_not_found",
+	})
+}
+
+func writeMidjourneyImageAccessLimited(c *gin.Context) {
+	c.Header("Retry-After", "60")
+	c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+		"error": "midjourney_task_access_limited",
+	})
+}
+
 func RelayMidjourneyNotify(c *gin.Context) *dto.MidjourneyResponse {
 	var midjRequest dto.MidjourneyDto
 	err := common.UnmarshalBodyReusable(c, &midjRequest)
@@ -151,10 +208,7 @@ func coverMidjourneyTaskDto(c *gin.Context, originTask *model.Midjourney) (midjo
 	midjourneyTask.FinishTime = originTask.FinishTime
 	midjourneyTask.ImageUrl = ""
 	if originTask.ImageUrl != "" && setting.MjForwardUrlEnabled {
-		midjourneyTask.ImageUrl = system_setting.ServerAddress + "/mj/image/" + originTask.MjId
-		if originTask.Status != "SUCCESS" {
-			midjourneyTask.ImageUrl += "?rand=" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		}
+		midjourneyTask.ImageUrl = BuildMidjourneyImageURL(originTask.MjId, originTask.Status == "SUCCESS")
 	} else {
 		midjourneyTask.ImageUrl = originTask.ImageUrl
 	}
