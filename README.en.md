@@ -217,7 +217,7 @@ git clone https://github.com/QuantumNous/new-api.git
 cd new-api
 ```
 
-Before starting, edit `docker-compose.yml`: replace the database and Redis example passwords in both the services and connection strings, and set a persistent random `SESSION_SECRET` (generate one with `openssl rand -hex 32`). For an HTTPS console, configure `SESSION_COOKIE_SECURE=true` and `SESSION_COOKIE_TRUSTED_URL` with its exact public HTTPS origin.
+Before starting, edit `docker-compose.yml`: replace the database and Redis example passwords in both the services and connection strings, and set a persistent random `SESSION_SECRET` and a distinct random `CRYPTO_SECRET` (generate each one with `openssl rand -hex 32`). The process refuses to start while `CRYPTO_SECRET` is unset; an installation upgraded from a release that defaulted it to `SESSION_SECRET` must set `CRYPTO_SECRET` to that same value to keep its issued task artifact URLs and its auth cache entries valid, and neither variable may keep the example value `random_string`. For an HTTPS console, configure `SESSION_COOKIE_SECURE=true` and `SESSION_COOKIE_TRUSTED_URL` with its exact public HTTPS origin.
 
 ```bash
 docker compose up -d
@@ -239,7 +239,7 @@ docker compose logs -f new-api
 | `LOG_SQL_DSN` | Optional separate log database connection |
 | `REDIS_CONN_STRING` | Redis connection string |
 | `SESSION_SECRET` | Persistent authentication secret; all nodes must use the same value |
-| `CRYPTO_SECRET` | Defaults to `SESSION_SECRET`; nodes sharing Redis must use the same effective value |
+| `CRYPTO_SECRET` | Required: signs the task artifact URLs and the auth cache entries and must be the same on every node sharing a cache; set it to a random string, or to `SESSION_SECRET` only to keep artifacts issued before the variable became required, and neither variable may keep the example value `random_string` |
 | `SESSION_COOKIE_SECURE` | Set to `true` for an HTTPS console; enables Secure refresh cookies and strict refresh/logout origin checks |
 | `SESSION_COOKIE_TRUSTED_URL` | Required in Secure mode: comma-separated exact HTTPS origins, without paths or wildcards; leave unset for local HTTP |
 | `TRUSTED_PROXIES` | Trusted reverse-proxy IPs/CIDRs, or `none`; explicitly configure for your network |
