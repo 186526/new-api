@@ -298,9 +298,13 @@ func TestAuthCacheIntegrityDatabaseMatrix(t *testing.T) {
 				assert.Equal(t, "100", cacheQuotaField(t, getUserCacheKey(user.Id), "Quota"),
 					"the non-integer mirror is replaced from the snapshot")
 				assert.Equal(t, 30, cachedUser.Quota, "the signed ledger stays the authority on the balance")
+				// The token mirror is repaired from the snapshot too, and the token
+				// ledger is the authority on its counters for the same reason.
+				assert.Equal(t, "100", cacheQuotaField(t, getTokenCacheKey(token.Key), "RemainQuota"),
+					"the non-integer token mirror is replaced from the snapshot")
 				cachedToken, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
-				assert.Equal(t, token.RemainQuota, cachedToken.RemainQuota)
+				assert.Equal(t, 20, cachedToken.RemainQuota, "the signed token ledger stays the authority")
 				assert.Equal(t, 80, cachedToken.UsedQuota)
 			})
 		})

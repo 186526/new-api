@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -13,10 +14,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// userCacheSchemaVersion 4 adds the signed quota ledger described on UserBase;
-// a hash written under an earlier version carries none (or an older layout) and
-// is reloaded from the database.
+// userCacheSchemaVersion 4 adds the signed quota ledger described on UserBase.
+// A hash written under version 3 carries the ledger with a signed baseline
+// instead of a signed live counter; it is migrated in place on the next read so
+// the spend it records is neither lost nor handed back. Version 2 and earlier
+// carry no ledger at all and are rebuilt from the database.
 const userCacheSchemaVersion = 4
+
+// ledgerV3SchemaVersion is the layout this branch published before the live
+// counter was signed. Its MAC covers the baseline rather than the counter.
+const ledgerV3SchemaVersion = 3
 
 // UserBase is the cached user snapshot. Quota is a mirror of the signed quota
 // ledger, never an authority: a writer holding only Redis access can set the
@@ -89,6 +96,61 @@ func (user UserBase) verifiedQuotaLedger() (int, error) {
 	// wallet in debt, which is a balance it can hold but not spend from. The
 	// difference is the balance either way.
 	return int(user.QuotaCredited - user.QuotaSpent), nil
+}
+
+// migrateV3QuotaLedger re-signs a version 3 hash under the current layout,
+// carrying its spend across. The live counter is not signed by the v3 MAC, so
+// the migration keeps it only when it sits at or above the signed baseline; a
+// value below it cannot have come from this ledger and the hash is left to be
+// rebuilt from the database. The counter may sit above the signed total, which
+// is the debt a wallet in arrears holds.
+func migrateV3QuotaLedger(fields map[string]string, cached UserBase) error {
+	spentBase, err := strconv.ParseInt(fields["QuotaSpentBase"], 10, 64)
+	if err != nil || spentBase < 0 {
+		return fmt.Errorf("%w: the version 3 baseline is unreadable", ErrQuotaLedgerUnverified)
+	}
+	if cached.QuotaSpent < spentBase {
+		return fmt.Errorf("%w: the version 3 counter sits below its baseline", ErrQuotaLedgerUnverified)
+	}
+	expected, err := authCacheMAC(getUserCacheKey(cached.Id), struct {
+		Id             int
+		AuthVersion    int64
+		CacheSchema    int
+		QuotaCredited  int64
+		QuotaSpentBase int64
+		ExpiresAt      int64
+	}{cached.Id, cached.AuthVersion, ledgerV3SchemaVersion, cached.QuotaCredited, spentBase, cached.QuotaLedgerExp})
+	if err != nil {
+		return err
+	}
+	if !validAuthCacheMAC(expected, fields["QuotaLedgerMAC"], cached.QuotaLedgerExp) {
+		return fmt.Errorf("%w: the version 3 signature does not match", ErrQuotaLedgerUnverified)
+	}
+	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+	migrated := cached
+	migrated.CacheSchema = userCacheSchemaVersion
+	migrated.QuotaLedgerExp = expiresAt
+	mac, err := migrated.quotaLedgerMAC()
+	if err != nil {
+		return err
+	}
+	// The metadata MAC signs CacheSchema, so the bump has to be signed again as
+	// well: leaving the version 3 signature would fail the metadata check on the
+	// read after this one, and that read would answer from a database row the
+	// spend has not reached yet.
+	metadataMAC, err := migrated.cacheMAC()
+	if err != nil {
+		return err
+	}
+	const script = `
+redis.call('HSET', KEYS[1], 'CacheSchema', ARGV[1],
+  'QuotaLedgerMAC', ARGV[2], 'QuotaLedgerExp', ARGV[3], 'Quota', ARGV[4],
+  'CacheMAC', ARGV[5])
+redis.call('HDEL', KEYS[1], 'QuotaSpentBase')
+return 1`
+	balance := strconv.FormatInt(cached.QuotaCredited-cached.QuotaSpent, 10)
+	return common.RDB.Eval(context.Background(), script, []string{getUserCacheKey(cached.Id)},
+		userCacheSchemaVersion, mac, strconv.FormatInt(expiresAt, 10), balance, metadataMAC).Err()
 }
 
 // cacheMAC signs everything a reader trusts except Quota and the ledger: both
@@ -215,7 +277,30 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if err != nil {
 		return nil, err
 	}
-	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
+	if userCache.Id != userId || userCache.AuthVersion <= 0 {
+		return nil, fmt.Errorf("user cache schema is stale")
+	}
+	// A version 3 hash was published by this branch before the live counter was
+	// signed. It carries a ledger whose spend has not necessarily reached the
+	// database, so it is migrated instead of discarded: discarding it would
+	// answer from a row that predates the spend and hand the quota back.
+	if userCache.CacheSchema == ledgerV3SchemaVersion {
+		// The baseline the version 3 signature covers has no field on UserBase
+		// any more, so it is read from the raw hash.
+		fields, fieldErr := common.RDB.HGetAll(context.Background(), getUserCacheKey(userId)).Result()
+		if fieldErr != nil {
+			return nil, fieldErr
+		}
+		if err := migrateV3QuotaLedger(fields, userCache); err != nil {
+			return nil, err
+		}
+		// The migration re-signed the hash, so the snapshot in hand no longer
+		// describes it. Reading it back once is cheaper than reconstructing the
+		// two signed fields here.
+		if err := common.RedisHGetObj(getUserCacheKey(userId), &userCache); err != nil {
+			return nil, err
+		}
+	} else if userCache.CacheSchema != userCacheSchemaVersion {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
 	mac, err := userCache.cacheMAC()

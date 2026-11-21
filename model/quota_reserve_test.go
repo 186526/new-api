@@ -1,7 +1,9 @@
 package model
 
 import (
+	"errors"
 	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -871,4 +873,286 @@ func TestCreditBuiltOnAStaleSnapshotDoesNotPublishAnotherBaseline(t *testing.T) 
 	_, result, err = verifiedUserQuotaLedger(user.Id)
 	assert.Equal(t, cacheQuotaOK, result,
 		"whatever the credit wrote must still verify: %v", err)
+}
+
+// A committed delta exists in the database already, so the cache must end up
+// holding it. Before this bound the delta shared the reservation's four-attempt
+// CAS budget, and losing it left the cache authorizing the same quota twice.
+func TestCommittedDeltasAllLandInTheCache(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	const width = 64
+	user := createReserveTestUser(t, width)
+	require.NoError(t, populateUserCache(user))
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		applied int
+		failed  []error
+	)
+	for range width {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// The order DecreaseUserQuota uses: commit first, then apply.
+			if err := persistUserQuotaDelta(user.Id, -1); err != nil {
+				mu.Lock()
+				failed = append(failed, err)
+				mu.Unlock()
+				return
+			}
+			result, err := cacheApplyUserQuotaDelta(user.Id, -1)
+			mu.Lock()
+			if err == nil && result == cacheQuotaOK {
+				applied++
+			} else {
+				failed = append(failed, err)
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	assert.Empty(t, failed, "no committed delta may be dropped")
+	assert.Equal(t, width, applied, "every committed delta reaches the cache")
+
+	cached, err := cacheGetUserBase(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cached.Quota, "the cache holds the balance the database holds")
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
+}
+
+// The same on the token ledger.
+func TestCommittedTokenDeltasAllLandInTheCache(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	const width = 64
+	token := createReserveTestToken(t, width)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		applied int
+		failed  []error
+	)
+	for range width {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := persistTokenQuotaDelta(token.Id, -1); err != nil {
+				mu.Lock()
+				failed = append(failed, err)
+				mu.Unlock()
+				return
+			}
+			result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -1)
+			mu.Lock()
+			if err == nil && result == cacheQuotaOK {
+				applied++
+			} else {
+				failed = append(failed, err)
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	assert.Empty(t, failed, "no committed token delta may be dropped")
+	assert.Equal(t, width, applied)
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Zero(t, cached.RemainQuota, "the cached remainder follows the database")
+	assert.Equal(t, width, cached.UsedQuota)
+}
+
+// Contention is a transient, not an empty wallet: a reservation that loses the
+// signature race must never come back as a plain "insufficient".
+func TestContendedReservesAreNotReportedAsInsufficient(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	const wallet = int64(1_000_000)
+	user := createReserveTestUser(t, int(wallet))
+	require.NoError(t, populateUserCache(user))
+
+	const width = 32
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		accepted  int
+		silent    int
+		contended int
+		other     []error
+	)
+	for range width {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reserved, err := TryReserveUserQuota(user.Id, 1)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil && errors.Is(err, errQuotaLedgerContended):
+				contended++
+			case err != nil:
+				other = append(other, err)
+			case reserved:
+				accepted++
+			default:
+				silent++
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Empty(t, other, "a contended reserve reports contention, not another error")
+	assert.Zero(t, silent, "contention is never answered as an empty wallet")
+
+	// A contended reserve is a transient, so retrying it lands: the wallet has
+	// room for every one of them.
+	for range contended + width {
+		if accepted >= width {
+			break
+		}
+		reserved, err := TryReserveUserQuota(user.Id, 1)
+		require.NoError(t, err)
+		if reserved {
+			accepted++
+		}
+	}
+	assert.Equal(t, width, accepted, "every reserve the wallet can pay for lands once retried")
+}
+
+// A version 3 hash was published before the live counter was signed. Its
+// signature covers a baseline, and the spend it records may not have reached the
+// database yet, so the first request after the bump must carry that spend across
+// instead of answering from the pre-spend row.
+func TestVersion3HashKeepsItsSpendAcrossTheSchemaBump(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+
+	// The state a version 3 hash holds after an unflushed spend of 60. The
+	// metadata MAC signs CacheSchema too, so it is signed as version 3 here; a
+	// migration that bumps the version without signing it again fails the
+	// metadata check on the read after this one.
+	const spent = int64(60)
+	var seeded UserBase
+	require.NoError(t, common.RedisHGetObj(key, &seeded))
+	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+	staleMAC, err := authCacheMAC(key, struct {
+		Id             int
+		AuthVersion    int64
+		CacheSchema    int
+		QuotaCredited  int64
+		QuotaSpentBase int64
+		ExpiresAt      int64
+	}{user.Id, user.AuthVersion, ledgerV3SchemaVersion, 100, 0, expiresAt})
+	require.NoError(t, err)
+	seeded.CacheSchema = ledgerV3SchemaVersion
+	staleMetadataMAC, err := seeded.cacheMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 100, "QuotaSpent", spent,
+		"QuotaSpentBase", 0, "Quota", 40,
+		"QuotaLedgerMAC", staleMAC, "QuotaLedgerExp", expiresAt,
+		"CacheMAC", staleMetadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the database has not seen the spend yet")
+
+	// First read after the bump: the spend survives, so the balance is 40 and not
+	// the pre-spend 100 the database still holds.
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 40, balance, "an unflushed debit must not turn into spendable balance")
+
+	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+	assert.Equal(t, "60", cacheQuotaField(t, key, "QuotaSpent"), "the migrated ledger keeps the spend")
+	assert.Empty(t, cacheQuotaField(t, key, "QuotaSpentBase"), "the version 3 baseline is gone")
+
+	// And a reserve of the restored 100 must stay refused.
+	reserved, err := TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the migrated ledger still caps the wallet at the remaining 40")
+}
+
+// A version 3 hash may record a wallet in arrears, where the spend has passed
+// the signed total. That is a debt the ledger can hold, so the migration must
+// carry it across instead of discarding the hash and reading the pre-debt row.
+func TestVersion3DebtHashKeepsItsOverdraft(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 30)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+	var seeded UserBase
+	require.NoError(t, common.RedisHGetObj(key, &seeded))
+
+	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+	staleMAC, err := authCacheMAC(key, struct {
+		Id             int
+		AuthVersion    int64
+		CacheSchema    int
+		QuotaCredited  int64
+		QuotaSpentBase int64
+		ExpiresAt      int64
+	}{user.Id, user.AuthVersion, ledgerV3SchemaVersion, 30, 0, expiresAt})
+	require.NoError(t, err)
+	seeded.CacheSchema = ledgerV3SchemaVersion
+	staleMetadataMAC, err := seeded.cacheMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 30, "QuotaSpent", 50,
+		"QuotaSpentBase", 0, "Quota", -20,
+		"QuotaLedgerMAC", staleMAC, "QuotaLedgerExp", expiresAt,
+		"CacheMAC", staleMetadataMAC, "CacheExpiresAt", seeded.CacheExpiresAt).Err())
+	assert.Equal(t, 30, getUserQuotaFromDB(t, user.Id), "the database has not seen the overdraft yet")
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, -20, balance, "a debt carried by the version 3 ledger must survive the bump")
+
+	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+	assert.Equal(t, "50", cacheQuotaField(t, key, "QuotaSpent"))
+	assert.Empty(t, cacheQuotaField(t, key, "QuotaSpentBase"))
+}
+
+// A version 3 hash whose baseline signature does not verify is not migrated: it
+// is rebuilt from the database, which is the one source a forged counter cannot
+// reach.
+func TestForgedVersion3HashIsNotMigrated(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+
+	expiresAt := nextLedgerExpiry(time.Now().UnixMilli(), userCacheTTLSeconds())
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"CacheSchema", ledgerV3SchemaVersion, "QuotaCredited", 100, "QuotaSpent", 0,
+		"QuotaSpentBase", 0, "Quota", 100,
+		"QuotaLedgerMAC", "not-a-signature", "QuotaLedgerExp", expiresAt).Err())
+
+	reserved, err := TryReserveUserQuota(user.Id, 100)
+	require.NoError(t, err)
+	assert.True(t, reserved, "a hash that fails its own signature is answered from the database")
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
 }

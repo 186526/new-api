@@ -75,8 +75,9 @@ func invalidateTokenCacheForMutation(key string) error {
 // writer with Redis access can raise them without breaking it, and seeding from
 // them would sign the forgery. A hash that predates the ledger therefore gets
 // its counters reset to the snapshot once. A hash whose live counter is already
-// above the snapshot keeps it and is signed at that counter, so an unflushed
-// batch spend is neither lost nor signed under a baseline it does not match.
+// above the snapshot is signed at that counter, and the seed script only runs
+// while the hash still holds it, so an unflushed batch spend is neither lost nor
+// signed under a value nobody verified.
 //
 // The counters are compared as decimal strings and the remainder is derived
 // with HINCRBY, because a sum near the wallet ceiling loses its last digit when
@@ -203,6 +204,10 @@ return 1`
 }
 
 // cacheGetTokenByKey 从缓存读取 token；不完整的哈希（如仅有配额字段）会被拒绝。
+// The quota counters come from the signed ledger, as they do for a user: the
+// mirror fields are outside the metadata MAC, so a writer holding only Redis
+// access can set them, and every reader of this snapshot (the panel, the trust
+// bypass) would otherwise be handed that forgery.
 func cacheGetTokenByKey(key string) (*Token, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
@@ -218,6 +223,10 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	mac, err := token.cacheMAC()
 	if err != nil || !validAuthCacheMAC(mac, token.CacheMAC, token.CacheExpiresAt) {
 		return nil, fmt.Errorf("token cache integrity check failed")
+	}
+	if ledger, result, ledgerErr := verifiedTokenQuotaLedger(token.Id, key); result == cacheQuotaOK && ledgerErr == nil {
+		token.RemainQuota = int(ledger.granted - ledger.used)
+		token.UsedQuota = int(ledger.used)
 	}
 	return &token, nil
 }

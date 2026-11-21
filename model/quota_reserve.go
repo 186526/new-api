@@ -33,15 +33,14 @@ var ErrQuotaLedgerUnverified = errors.New("cached quota ledger failed verificati
 var errQuotaLedgerBoundsRefused = errors.New("cached quota ledger cannot hold the committed delta")
 
 // errQuotaLedgerContended reports that every attempt lost the signature race to
-// a concurrent writer. The caller answers the reservation as insufficient
-// instead of falling back to the database, because a database spend the ledger
-// never sees is exactly the over-spend the ledger exists to prevent.
+// a concurrent writer. It is a transient the caller retries: answering it as an
+// empty wallet, or from the database, would both be wrong, because the wallet
+// was never consulted and the database row may predate the batch accumulator.
 var errQuotaLedgerContended = errors.New("cached quota ledger contention")
 
-// The cached quota counters sit in a hash whose metadata MAC zeroes them on
-// purpose: they move on every spend, so signing them there would invalidate the
-// hash on the first reservation and the following miss would reload a balance
-// the batch accumulator has not flushed yet. The spend authority is therefore a
+// The cached quota counters sit in a hash whose metadata MAC covers neither of
+// them: they move on every spend, and signing them there would invalidate the
+// whole hash on the first reservation. The spend authority is therefore a
 // separate ledger with its own signature:
 //
 //	QuotaCredited  every quota credited into the hash since it was published
@@ -51,20 +50,21 @@ var errQuotaLedgerContended = errors.New("cached quota ledger contention")
 // it. The ledger MAC binds the user, the authentication version, the schema,
 // both counters and the expiry.
 //
-// Signing the live counter, rather than a baseline it may sit above, is what
-// makes a rollback impossible: every write signs the exact value it leaves
-// behind, so no earlier value of QuotaSpent carries a signature that still
-// matches. A writer holding only Redis access may move the counter to any
-// number, and every number but the current one fails the MAC. That is why there
-// is no separate baseline field: a baseline that only advanced when the balance
-// was exhausted let a partial spend be rolled back to it, and it also refused
-// the refund of an exhausting reservation that failed to persist, because the
-// reservation itself had just moved the baseline past the refund.
+// Signing the live counter is what makes a rollback impossible: every write
+// signs the exact value it leaves behind, so no earlier value of QuotaSpent
+// carries a signature that still matches. A writer holding only Redis access
+// may move the counter to any number, and every number but the current one
+// fails the MAC. There is no baseline field to sit above: a baseline that only
+// advanced when the balance was exhausted let a partial spend be rolled back to
+// it, and it also refused the refund of an exhausting reservation that failed
+// to persist, because the reservation itself had just moved the baseline past
+// the refund.
 //
-// Each write also passes the counter value it signed, so the script re-signs
-// only a state it actually verified: a committed delta that lands between the
-// read and the write makes the script refuse and the caller retry, instead of
-// publishing a signature that describes another hash.
+// Each write also proves the state it signs: it passes both the signature it
+// verified and the counter it is about to write, and the script refuses any
+// state that no longer matches either. A committed delta that lands between the
+// read and the write therefore makes the script refuse and the caller retry,
+// instead of publishing a signature that describes another hash.
 //
 // The counters are decimal strings and the scripts never do arithmetic on
 // them: Lua numbers are doubles, and a sum near the wallet ceiling (2^53-1)
@@ -360,9 +360,20 @@ if not sign('UsedQuota', amountDigits) then
 end
 return 1`
 
-// quotaLedgerRetryAttempts bounds how often a concurrent credit may make a
-// verified ledger stale before the attempt is reported as contended.
+// quotaLedgerRetryAttempts bounds how often a concurrent writer may make a
+// verified ledger stale before a reservation reports itself contended. A
+// reservation that gives up is answered as contention, so the bound only costs
+// a retry, which the caller makes.
 const quotaLedgerRetryAttempts = 4
+
+// quotaLedgerDeltaAttempts bounds how many times a committed delta re-reads a
+// ledger another writer moved. A delta already exists in the database, so
+// dropping it would leave the cache authorizing the same quota again: the bound
+// is the churn it will walk through, and the fallback at the end of it
+// republishes the hash from the database instead of dropping anything. Each
+// lost attempt means another writer advanced the ledger, so the cap only binds
+// far past the 64-way concurrency where this many attempts lost none.
+const quotaLedgerDeltaAttempts = 64
 
 // quotaLedgerMinWindowSeconds is the shortest life a signed ledger gets, in
 // seconds.
@@ -699,7 +710,14 @@ func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResu
 
 // cacheApplyUserQuotaDelta applies a delta the database already committed. A
 // positive delta is quota credited and re-signs the ledger; a negative one is a
-// committed spend that only moves the unsigned counter.
+// committed spend that moves the signed counter.
+//
+// The delta must land: the database already holds it, so dropping it would let
+// the cache authorize the same quota a second time. Retrying is therefore
+// bounded by progress rather than by a fixed attempt count. Each lost attempt
+// means another writer re-signed the ledger and made progress, so a fresh read
+// always makes the next one win; only a hash that stops changing (nothing moved
+// under us) or contradicts its own signature ends the loop early.
 func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error) {
 	if delta == 0 {
 		return cacheQuotaOK, nil
@@ -711,7 +729,8 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 		return cacheCreditUserQuota(userID, delta)
 	}
 	amount := -delta
-	for range quotaLedgerRetryAttempts {
+	stalledMAC := ""
+	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
 		ledger, result, err := verifiedUserQuotaLedger(userID)
 		if ledger == nil {
 			return result, err
@@ -739,15 +758,28 @@ func cacheApplyUserQuotaDelta(userID int, delta int64) (cacheQuotaResult, error)
 			return cacheQuotaOK, nil
 		case -2:
 			return cacheQuotaUnverified, ledgerRefusalError(raw)
-		case -3:
-			return cacheQuotaInsufficient, errQuotaLedgerBoundsRefused
 		}
+		// The ledger moved under the read. If it moved since the previous
+		// attempt, another delta or reservation landed and the retry has a new
+		// state to sign; if it did not, nothing is racing us and retrying would
+		// only spin.
+		if ledger.mac == stalledMAC {
+			break
+		}
+		stalledMAC = ledger.mac
 	}
+	// The loop only ends here after 64 re-reads that each lost to another
+	// writer, which means the ledger was changing on every attempt. Dropping the
+	// hash is the honest answer: the next read republishes it from the database,
+	// which already holds this delta, so it is never authorized twice and the
+	// caller is told the cache entry is gone rather than that the delta landed.
+	discardUnverifiedUserQuotaCache(userID, "kept changing under a committed delta")
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
 // cacheReleaseUserQuota returns quota a reservation took but could not persist.
-// It is not a credit: it only restores the unsigned counter it advanced.
+// It is not a credit: it only moves the signed counter back and re-signs, so the
+// signed total stays where it was and a release can never widen a wallet.
 func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 	if amount <= 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
@@ -787,6 +819,8 @@ func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
+// cacheApplyTokenQuotaDelta mirrors cacheApplyUserQuotaDelta on the token
+// ledger: the delta is already committed, so it retries until it lands.
 func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResult, error) {
 	if delta == 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
@@ -795,7 +829,8 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 		return cacheReleaseTokenQuota(id, key, delta)
 	}
 	amount := -delta
-	for range quotaLedgerRetryAttempts {
+	stalledMAC := ""
+	for attempt := 0; attempt < quotaLedgerDeltaAttempts; attempt++ {
 		ledger, result, err := verifiedTokenQuotaLedger(id, key)
 		if ledger == nil {
 			return result, err
@@ -820,10 +855,13 @@ func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResul
 			return cacheQuotaOK, nil
 		case -2:
 			return cacheQuotaUnverified, ledgerRefusalError(raw)
-		case -3:
-			return cacheQuotaInsufficient, errQuotaLedgerBoundsRefused
 		}
+		if ledger.mac == stalledMAC {
+			break
+		}
+		stalledMAC = ledger.mac
 	}
+	discardUnverifiedTokenQuotaCache(id, key, "kept changing under a committed delta")
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
@@ -863,9 +901,10 @@ func cacheReleaseTokenQuota(id int, key string, amount int64) (cacheQuotaResult,
 	return cacheQuotaMiss, errQuotaLedgerContended
 }
 
-// cacheCreditUserQuota raises the signed total. It re-signs the ledger, so the
-// unsigned counter is re-based at the same moment and a concurrent reservation
-// makes the attempt stale instead of losing a spend.
+// cacheCreditUserQuota raises the signed total and re-signs the ledger. It
+// passes the counter it signs, so a concurrent spend makes the attempt stale
+// and the caller retries instead of publishing a signature that describes
+// another hash.
 func cacheCreditUserQuota(userID int, delta int64) (cacheQuotaResult, error) {
 	if delta <= 0 || !common.RedisEnabled {
 		return cacheQuotaMiss, nil
@@ -932,9 +971,9 @@ func seedUserQuotaLedger(userID int, quota int, authVersion int64) error {
 
 // tokenQuotaLedgerSeedArgs builds the arguments that let cacheInitToken publish
 // a token ledger in the same script that writes the snapshot. granted is the
-// snapshot total and usedBase the counter the snapshot was taken at; a hash
-// still holding a higher counter is signed at that counter, so an unflushed
-// batch spend is neither lost nor signed under a baseline it does not match.
+// snapshot total and used the counter the seed signs; the script only runs while
+// the hash still holds that counter, so an unflushed batch spend is neither lost
+// nor signed under a value nobody verified.
 func tokenQuotaLedgerSeedArgs(key string, id int, granted, used int64, ttlSeconds int) (string, int64, error) {
 	if granted < 0 || used < 0 {
 		return "", 0, fmt.Errorf("token %d holds a negative granted quota", id)
@@ -1027,6 +1066,7 @@ func discardUnverifiedTokenQuotaCache(id int, key string, reason string) {
 // would refuse a spend the account can pay for.
 func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err error) {
 	hydrated := false
+	contended := 0
 	for range quotaLedgerRetryAttempts {
 		result, reserveErr := cacheTryReserveUserQuota(id, int64(quota))
 		switch {
@@ -1035,7 +1075,10 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 			reserved, err = reserveUserQuotaDB(id, quota)
 			return reserved, true, err
 		case errors.Is(reserveErr, errQuotaLedgerContended):
-			return false, false, nil
+			// A transient: the wallet was never consulted, so answering it as
+			// insufficient would report an empty balance that is not empty.
+			contended++
+			continue
 		case reserveErr != nil:
 			return false, false, reserveErr
 		case result == cacheQuotaOK:
@@ -1051,6 +1094,9 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 			return false, false, hydrateErr
 		}
 	}
+	if contended > 0 {
+		return false, false, errQuotaLedgerContended
+	}
 	// The hash could not be published: a fence blocks it, or the balance never
 	// arrived. The database still answers the reservation.
 	reserved, err = reserveUserQuotaDB(id, quota)
@@ -1059,6 +1105,7 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 
 func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, fromDB bool, err error) {
 	hydrated := false
+	contended := 0
 	for range quotaLedgerRetryAttempts {
 		result, reserveErr := cacheTryReserveTokenQuota(id, key, int64(quota))
 		switch {
@@ -1067,7 +1114,8 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 			reserved, err = reserveTokenQuotaDB(id, quota)
 			return reserved, true, err
 		case errors.Is(reserveErr, errQuotaLedgerContended):
-			return false, false, nil
+			contended++
+			continue
 		case reserveErr != nil:
 			return false, false, reserveErr
 		case result == cacheQuotaOK:
@@ -1082,6 +1130,9 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 		if _, hydrateErr := GetTokenByKey(key, true); hydrateErr != nil {
 			return false, false, hydrateErr
 		}
+	}
+	if contended > 0 {
+		return false, false, errQuotaLedgerContended
 	}
 	reserved, err = reserveTokenQuotaDB(id, quota)
 	return reserved, true, err
@@ -1107,6 +1158,12 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	reserved, fromDB, err := reserveUserQuotaCached(id, quota)
 	if fromDB {
 		return reserved, err
+	}
+	if errors.Is(err, errQuotaLedgerContended) {
+		// Falling back here is the over-spend the ledger exists to stop: under
+		// batch accumulation the database row predates the debit. The wheel is
+		// busy, not empty, so the caller is told to try again.
+		return false, err
 	}
 	if err != nil {
 		common.SysLog(common.LogText("user quota cache reserve unavailable, falling back to database: %s", err.Error()))
@@ -1144,6 +1201,9 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	reserved, fromDB, err := reserveTokenQuotaCached(id, key, quota)
 	if fromDB {
 		return reserved, err
+	}
+	if errors.Is(err, errQuotaLedgerContended) {
+		return false, err
 	}
 	if err != nil {
 		common.SysLog(common.LogText("token quota cache reserve unavailable, falling back to database: %s", err.Error()))
