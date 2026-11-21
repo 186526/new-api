@@ -40,12 +40,22 @@ func requestOpenAI2Mistral(c *gin.Context, request *dto.GeneralOpenAIRequest) ([
 }
 
 // clientRequestBody is the body the client sent. A channel tried without a
-// stored body falls back to the body the caller parsed.
+// stored body falls back to the body the caller parsed. A storage that holds
+// nothing counts as no storage: the channel test in controller/channel-test.go
+// builds a request with no body, so the relay records a storage of zero bytes
+// for it, and parsing those bytes fails with "unexpected end of JSON input"
+// before the parsed request is ever read.
 func clientRequestBody(c *gin.Context, request *dto.GeneralOpenAIRequest) ([]byte, error) {
 	if c != nil && c.Request != nil {
 		storage, err := common.GetBodyStorage(c)
 		if err == nil {
-			return storage.Bytes()
+			body, err := storage.Bytes()
+			if err != nil {
+				return nil, err
+			}
+			if len(body) > 0 {
+				return body, nil
+			}
 		}
 	}
 	if request == nil {

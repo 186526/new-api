@@ -30,6 +30,32 @@ func clientBodyForTest(t *testing.T, body string) *gin.Context {
 	return c
 }
 
+// channelTestContextForTest builds the context the channel test in
+// controller/channel-test.go builds: a gin test context whose request carries
+// no body at all, so the storage the relay records for it holds nothing.
+func channelTestContextForTest(t *testing.T) *gin.Context {
+	t.Helper()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	return c
+}
+
+// The channel test never writes a request body, yet the relay still records a
+// storage for the request. This pins that shape, so a test below that reads an
+// empty body keeps testing what the channel test produces.
+func TestChannelTestRequestStoresAnEmptyBody(t *testing.T) {
+	c := channelTestContextForTest(t)
+
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		t.Fatalf("get body storage: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if size := storage.Size(); size != 0 {
+		t.Fatalf("stored body size = %d, want 0", size)
+	}
+}
+
 // conversionForTest runs the conversion on the client body. The typed request
 // is left empty: the conversion reads the body, not its fields.
 func conversionForTest(t *testing.T, body string) []byte {
@@ -205,6 +231,79 @@ func TestRequestOpenAI2MistralSendsTheMappedModel(t *testing.T) {
 	body, _ := decodedForTest(t, encoded)
 	if got := jsonString(body["model"]); got != "deepseek-v4-1-flash-1017" {
 		t.Errorf("model = %q, want the mapped upstream model %q", got, "deepseek-v4-1-flash-1017")
+	}
+}
+
+// A channel test builds its context without a request body, so the stored body
+// is empty. The conversion must read the request the caller parsed instead of
+// parsing the empty body, which fails with "unexpected end of JSON input" and
+// leaves the channel test reporting an unrelated conversion error.
+func TestRequestOpenAI2MistralFallsBackToTheParsedRequestWhenTheStoredBodyIsEmpty(t *testing.T) {
+	maxTokens := uint(16)
+	request := &dto.GeneralOpenAIRequest{
+		Model:     "deepseek-v4-1-flash-1017",
+		MaxTokens: &maxTokens,
+		Messages:  []dto.Message{{Role: "user", Content: "hi"}},
+	}
+
+	encoded, err := requestOpenAI2Mistral(channelTestContextForTest(t), request)
+	if err != nil {
+		t.Fatalf("convert a request whose stored body is empty: %v", err)
+	}
+
+	marshalled, err := common.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal the parsed request: %v", err)
+	}
+	want := conversionForTest(t, string(marshalled))
+	if !bytes.Equal(encoded, want) {
+		t.Errorf("converted body = %s, want the conversion of the parsed request %s", encoded, want)
+	}
+}
+
+// A request with neither a stored body nor a parsed one is refused by name. An
+// empty body must not surface as a JSON parse failure, and a nil request must
+// not read as success.
+func TestRequestOpenAI2MistralRefusesWithoutAStoredBodyOrAParsedRequest(t *testing.T) {
+	_, err := requestOpenAI2Mistral(channelTestContextForTest(t), nil)
+
+	if err == nil {
+		t.Fatalf("convert a request with neither a stored body nor a parsed request: error = nil, want an explicit refusal")
+	}
+	if strings.Contains(err.Error(), "unexpected end of JSON input") {
+		t.Errorf("error = %q, want a refusal that names the missing request rather than a JSON parse failure", err)
+	}
+	if !strings.Contains(err.Error(), "neither stored nor parsed") {
+		t.Errorf("error = %q, want it to name the missing request body", err)
+	}
+}
+
+// A stored body is what the client sent, so it is forwarded as it stands and
+// the parsed request does not replace it: the upstream prompt cache is keyed on
+// the request body, and a rebuilt body misses the cache on every call.
+func TestRequestOpenAI2MistralForwardsAStoredBodyInsteadOfTheParsedRequest(t *testing.T) {
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"temperature":0.25,"prompt_cache_key":"a1b2c3"}`
+	temperature := 0.9
+	request := &dto.GeneralOpenAIRequest{
+		Model:       "deepseek-v4-1-flash-1017",
+		Temperature: &temperature,
+		Messages:    []dto.Message{{Role: "user", Content: "rebuilt"}},
+	}
+
+	encoded, err := requestOpenAI2Mistral(clientBodyForTest(t, body), request)
+	if err != nil {
+		t.Fatalf("convert a request with a stored body: %v", err)
+	}
+
+	converted, messages := decodedForTest(t, encoded)
+	if got := string(converted["temperature"]); got != "0.25" {
+		t.Errorf("temperature = %s, want the client's 0.25", got)
+	}
+	if got := string(converted["prompt_cache_key"]); got != `"a1b2c3"` {
+		t.Errorf("prompt_cache_key = %s, want the client's %q", got, "a1b2c3")
+	}
+	if got := jsonString(messages[0]["content"]); got != "hi" {
+		t.Errorf("message content = %q, want the client's %q", got, "hi")
 	}
 }
 

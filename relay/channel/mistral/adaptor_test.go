@@ -1,11 +1,14 @@
 package mistral
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -42,6 +45,44 @@ func setupHeaderForAPIKey(t *testing.T, apiKey string) http.Header {
 		t.Fatalf("SetupRequestHeader() error: %v", err)
 	}
 	return header
+}
+
+// The channel test in controller/channel-test.go converts the request it built
+// in memory over a context whose request carries no body. An empty stored body
+// must not turn into "unexpected end of JSON input" here.
+func TestConvertOpenAIRequestReadsTheParsedRequestWhenTheStoredBodyIsEmpty(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ApiKey: "mstrl_test_key_123"}}
+	request := &dto.GeneralOpenAIRequest{
+		Model:    "deepseek-v4-1-flash-1017",
+		Messages: []dto.Message{{Role: "user", Content: "hi"}},
+	}
+
+	converted, err := (&Adaptor{}).ConvertOpenAIRequest(c, info, request)
+	if err != nil {
+		t.Fatalf("ConvertOpenAIRequest() error = %v, want the converted parsed request", err)
+	}
+
+	body, ok := converted.([]byte)
+	if !ok {
+		t.Fatalf("ConvertOpenAIRequest() = %T, want []byte", converted)
+	}
+	var decoded map[string]json.RawMessage
+	if err := common.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("unmarshal converted body %s: %v", body, err)
+	}
+	var model string
+	if err := common.Unmarshal(decoded["model"], &model); err != nil {
+		t.Fatalf("unmarshal converted model %s: %v", decoded["model"], err)
+	}
+	if model != "deepseek-v4-1-flash-1017" {
+		t.Errorf("model = %q, want %q", model, "deepseek-v4-1-flash-1017")
+	}
+	if !strings.Contains(string(body), `"content":"hi"`) {
+		t.Errorf("converted body = %s, want the parsed request's message", body)
+	}
 }
 
 func TestConvertClaudeRequestRefusesWithATypedError(t *testing.T) {
