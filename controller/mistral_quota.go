@@ -15,10 +15,14 @@ import (
 )
 
 // MistralQuotaRefreshInterval is how often the configured Mistral accounts
-// publish their monthly allowances to the metrics endpoint. The billing endpoint
-// answers an API key directly, so a coarse interval reserved for the Cloudflare
-// protected console is no longer needed; each tick still adds jitter so the
-// accounts do not poll on an exact schedule.
+// publish their monthly allowance to the metrics endpoint. The console is the
+// primary source for every account that has a session, so this interval is what
+// the console is polled at: each tick reads every account once, which the
+// deployed one-minute value turns into five requests a minute for the five
+// configured accounts (about 300 an hour), with no pause between them because
+// POLLING_INTERVAL is unset. Only a rejected session slows the loop, and it
+// backs off only after a source has already failed. Each tick still adds jitter
+// so the accounts do not poll on an exact schedule.
 const MistralQuotaRefreshInterval = time.Minute
 
 const mistralQuotaMaxBackoff = time.Hour

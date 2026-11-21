@@ -45,9 +45,9 @@ const (
 	// and a new value would leave every existing Mistral row without a sample.
 	MistralBudgetScopeVibe = "vibe"
 
-	// The console answers session cookies only with browser-like headers, and
-	// the refresh loop keeps the request rate low so the session is not treated
-	// as automated traffic.
+	// The console answers session cookies only with browser-like headers. No
+	// pause separates the accounts of one refresh, so the refresh interval is the
+	// only brake on how often the console is asked.
 	mistralBrowserUserAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 	mistralBrowserAcceptLanguage = "zh-CN,zh;q=0.9,en-GB;q=0.8,en;q=0.7"
 	mistralBrowserClientHint     = `"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"`
