@@ -62,7 +62,6 @@ func seedShutdownOrderingUser(t *testing.T, id int, quota int) {
 func TestShutdownWaitsForTheRefundBeforeFlushingTheAccumulator(t *testing.T) {
 	truncate(t)
 	common.BatchUpdateEnabled = true
-	common.RedisEnabled = false
 	t.Cleanup(func() { common.BatchUpdateEnabled = false })
 
 	const (
