@@ -198,7 +198,7 @@ git clone https://github.com/QuantumNous/new-api.git
 cd new-api
 ```
 
-Avant de démarrer, modifiez `docker-compose.yml` : remplacez les mots de passe d'exemple de la base et de Redis dans les services et les chaînes de connexion, puis définissez un `SESSION_SECRET` aléatoire et persistant (générable avec `openssl rand -hex 32`). Pour une console HTTPS, définissez `SESSION_COOKIE_SECURE=true` et renseignez son origine HTTPS publique exacte dans `SESSION_COOKIE_TRUSTED_URL`.
+Avant de démarrer, modifiez `docker-compose.yml` : remplacez les mots de passe d'exemple de la base et de Redis dans les services et les chaînes de connexion, puis définissez un `SESSION_SECRET` aléatoire et persistant et un `CRYPTO_SECRET` aléatoire distinct (générez chacun avec `openssl rand -hex 32`). Le processus refuse de démarrer tant que `CRYPTO_SECRET` n'est pas défini ; une installation mise à jour depuis une version qui le valait `SESSION_SECRET` par défaut doit donner à `CRYPTO_SECRET` cette même valeur pour conserver les URL d'artefacts de tâche déjà émises et les entrées du cache d'authentification, et aucune des deux variables ne peut garder la valeur d'exemple `random_string`. Pour une console HTTPS, définissez `SESSION_COOKIE_SECURE=true` et renseignez son origine HTTPS publique exacte dans `SESSION_COOKIE_TRUSTED_URL`.
 
 ```bash
 docker compose up -d
@@ -220,7 +220,7 @@ docker compose logs -f new-api
 | `LOG_SQL_DSN` | Connexion facultative à une base de journaux distincte |
 | `REDIS_CONN_STRING` | Chaîne de connexion Redis |
 | `SESSION_SECRET` | Secret d'authentification persistant, identique sur tous les nœuds |
-| `CRYPTO_SECRET` | Vaut `SESSION_SECRET` par défaut ; même valeur effective pour les nœuds partageant Redis |
+| `CRYPTO_SECRET` | Obligatoire : signe les URL d'artefacts de tâche et les entrées du cache d'authentification, avec la même valeur sur les nœuds qui partagent un cache ; utilisez une chaîne aléatoire, et `SESSION_SECRET` seulement pour conserver les artefacts émis avant que la variable ne devienne obligatoire ; aucune des deux variables ne peut garder `random_string` |
 | `SESSION_COOKIE_SECURE` | `true` pour une console HTTPS ; active les cookies de renouvellement Secure et les contrôles stricts d'origine du renouvellement et de la déconnexion |
 | `SESSION_COOKIE_TRUSTED_URL` | Obligatoire en mode Secure : origines HTTPS exactes séparées par des virgules, sans chemin ni joker ; à laisser non définie en HTTP local |
 | `TRUSTED_PROXIES` | IP/CIDR des proxys de confiance, ou `none` ; à configurer selon votre réseau |
