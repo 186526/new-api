@@ -925,11 +925,20 @@ func UpdateChannelUsedQuota(id int, quota int) {
 	updateChannelUsedQuota(id, quota)
 }
 
-func updateChannelUsedQuota(id int, quota int) {
-	err := DB.Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota)).Error
-	if err != nil {
-		common.SysLog(common.LogText("failed to update channel used quota: channel_id=%d, delta_quota=%d, error=%v", id, quota, err))
+// updateChannelUsedQuota adds quota to the channel's used_quota and reports whether
+// the row was accepted. RowsAffected != 1 means the channel no longer exists, which
+// is a write nothing can apply rather than a successful one.
+func updateChannelUsedQuota(id int, quota int) error {
+	result := DB.Model(&Channel{}).Where("id = ?", id).Update("used_quota", gorm.Expr("used_quota + ?", quota))
+	if result.Error != nil {
+		common.SysLog(common.LogText("failed to update channel used quota: channel_id=%d, delta_quota=%d, error=%v", id, quota, result.Error))
+		return result.Error
 	}
+	if result.RowsAffected != 1 {
+		common.SysLog(common.LogText("failed to update channel used quota: channel_id=%d, delta_quota=%d, error=%v", id, quota, gorm.ErrRecordNotFound))
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {

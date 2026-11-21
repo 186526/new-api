@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -54,11 +55,19 @@ func TestFlushBatchUpdatesReportsEveryDrainedAccumulator(t *testing.T) {
 
 	user := createReserveTestUser(t, 1000)
 	token := createReserveTestToken(t, 100)
+	channel := Channel{
+		Id:        77,
+		Name:      "flush-test-channel",
+		Key:       "sk-flush-test",
+		Status:    common.ChannelStatusEnabled,
+		UsedQuota: 0,
+	}
+	require.NoError(t, DB.Create(&channel).Error)
 	addNewRecord(BatchUpdateTypeUserQuota, user.Id, -30)
 	addNewRecord(BatchUpdateTypeUsedQuota, user.Id, 30)
 	addNewRecord(BatchUpdateTypeRequestCount, user.Id, 1)
 	addNewRecord(BatchUpdateTypeTokenQuota, token.Id, -30)
-	addNewRecord(BatchUpdateTypeChannelUsedQuota, 77, 30)
+	addNewRecord(BatchUpdateTypeChannelUsedQuota, channel.Id, 30)
 
 	summaries := FlushBatchUpdates()
 	require.Len(t, summaries, BatchUpdateTypeCount)
@@ -66,6 +75,7 @@ func TestFlushBatchUpdatesReportsEveryDrainedAccumulator(t *testing.T) {
 		summary, ok := findFlushSummary(summaries, batchUpdateTypeNames[i])
 		require.True(t, ok, "accumulator %d must be reported", i)
 		assert.Equal(t, 1, summary.Entries)
+		assert.Equal(t, 1, summary.Accepted, "accumulator %d wrote a row that exists, so the database accepted it", i)
 	}
 
 	assert.Equal(t, 970, getUserQuotaFromDB(t, user.Id))
@@ -75,11 +85,63 @@ func TestFlushBatchUpdatesReportsEveryDrainedAccumulator(t *testing.T) {
 	assert.Equal(t, 70, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
+// A delta queued for a row that no longer exists is drained but not written, so the
+// flush must report fewer accepted entries than it drained instead of claiming the
+// write happened. The token path already returned ErrRecordNotFound; the user and
+// channel paths now check RowsAffected for the same reason.
+func TestFlushBatchUpdatesCountsOnlyAcceptedRows(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+
+	const missingID = 987654
+	addNewRecord(BatchUpdateTypeTokenQuota, missingID, -50)
+	addNewRecord(BatchUpdateTypeUserQuota, missingID, -50)
+	addNewRecord(BatchUpdateTypeChannelUsedQuota, missingID, 50)
+
+	summaries := FlushBatchUpdates()
+	for _, i := range []int{BatchUpdateTypeTokenQuota, BatchUpdateTypeUserQuota, BatchUpdateTypeChannelUsedQuota} {
+		summary, ok := findFlushSummary(summaries, batchUpdateTypeNames[i])
+		require.True(t, ok, "accumulator %d must be reported even when its row is gone", i)
+		assert.Equal(t, 1, summary.Entries, "the delta was drained")
+		assert.Equal(t, 0, summary.Accepted, "no row existed, so the database accepted nothing")
+	}
+}
+
 func TestFlushBatchUpdatesIsEmptyWithoutAccumulatedDeltas(t *testing.T) {
 	resetBatchUpdateTestState(t)
 	common.BatchUpdateEnabled = true
 
 	assert.Empty(t, FlushBatchUpdates(), "a process with nothing accumulated writes nothing")
+}
+
+// addNewRecord saturates one id at the int extremes, so two such ids added together
+// must saturate the reported total too: int64 arithmetic would otherwise report -2
+// for two rows that each received MaxInt.
+func TestFlushBatchUpdatesSaturatesTheReportedDelta(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	common.BatchUpdateEnabled = true
+
+	first := createReserveTestUser(t, 0)
+	second := createReserveTestUser(t, 0)
+	addNewRecord(BatchUpdateTypeUserQuota, first.Id, math.MaxInt)
+	addNewRecord(BatchUpdateTypeUserQuota, second.Id, math.MaxInt)
+
+	summaries := FlushBatchUpdates()
+	summary, ok := findFlushSummary(summaries, batchUpdateTypeNames[BatchUpdateTypeUserQuota])
+	require.True(t, ok)
+	assert.Equal(t, 2, summary.Entries)
+	assert.Equal(t, int64(math.MaxInt64), summary.Delta, "the reported total saturates instead of wrapping negative")
+	assert.Equal(t, math.MaxInt, getUserQuotaFromDB(t, first.Id))
+	assert.Equal(t, math.MaxInt, getUserQuotaFromDB(t, second.Id))
+}
+
+func TestAccumulateFlushDeltaSaturatesBothDirections(t *testing.T) {
+	assert.Equal(t, int64(math.MaxInt64), accumulateFlushDelta(math.MaxInt64, 1))
+	assert.Equal(t, int64(math.MinInt64), accumulateFlushDelta(math.MinInt64, -1))
+	assert.Equal(t, int64(math.MaxInt64), accumulateFlushDelta(int64(math.MaxInt)-1, math.MaxInt))
+	assert.Equal(t, int64(-60), accumulateFlushDelta(0, -60), "an ordinary sum is unchanged")
 }
 
 // A value queued while the periodic ticker is flushing must reach the database

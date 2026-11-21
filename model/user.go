@@ -1475,21 +1475,31 @@ func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 	//}
 }
 
-func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, requestCount int) {
+// updateUserQuotaUsedQuotaAndRequestCount applies the three user accumulators for one
+// id in a single write and reports whether the row was accepted. RowsAffected != 1
+// means the user no longer exists, which is a write nothing can apply rather than a
+// successful one; the caller counts accepted rows for the flush log.
+func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, requestCount int) error {
 	if quota == 0 && usedQuota == 0 && requestCount == 0 {
-		return
+		return nil
 	}
 
-	err := DB.Model(&User{}).Where("id = ?", id).Updates(
+	result := DB.Model(&User{}).Where("id = ?", id).Updates(
 		map[string]any{
 			"quota":         gorm.Expr("quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
 			"request_count": gorm.Expr("request_count + ?", requestCount),
 		},
-	).Error
-	if err != nil {
-		common.SysLog(common.LogText("failed to batch update user quota, used quota and request count: %s", err.Error()))
+	)
+	if result.Error != nil {
+		common.SysLog(common.LogText("failed to batch update user quota, used quota and request count: %s", result.Error.Error()))
+		return result.Error
 	}
+	if result.RowsAffected != 1 {
+		common.SysLog(common.LogText("failed to batch update user quota, used quota and request count: %s", gorm.ErrRecordNotFound.Error()))
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 // GetUsernameById gets username from Redis first, falls back to DB if needed

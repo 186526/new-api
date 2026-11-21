@@ -274,12 +274,15 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		common.SysError(common.LogText("server forced to shutdown: %v", err))
 	}
-	// Once the listener is closed no new request queues a delta, and a clean
-	// Shutdown means every in-flight request has returned too, so the accumulator
-	// then holds all of this process's unflushed deltas. Write them before the
-	// process exits: a scale-down or a restart must not drop them. When Shutdown
-	// timed out, a handler still running can queue another delta after this flush;
-	// that one is lost, which is the same loss the unflushed accumulator had before.
+	// The listener is closed, so no new request queues a delta. On the routes the
+	// server awaits, every handler has returned too, so what the flush writes is
+	// every delta queued before it on those routes. Two cases sit outside that and
+	// can queue a delta after the flush: Shutdown timed out, and a hijacked
+	// WebSocket relay (RelayFormatOpenAIRealtime, and the responses WebSocket
+	// route), which net/http neither closes nor waits for and which settles its
+	// quota at session end. A delta queued after the flush is lost exactly as it
+	// was before this flush existed; the flush is still a net gain over dropping
+	// the whole accumulator.
 	if common.BatchUpdateEnabled {
 		model.FlushBatchUpdates()
 	}

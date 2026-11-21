@@ -42,12 +42,29 @@ var batchUpdateTypeNames = [BatchUpdateTypeCount]string{
 }
 
 // BatchUpdateFlushSummary is what one flush drained from one accumulator: how many
-// ids it held and the sum of their deltas. Delta is int64 so a store holding the
-// extremes of int still sums without wrapping.
+// ids it held, how many of those the database accepted, and the sum of all their
+// deltas. The sum saturates at the int64 extremes instead of wrapping, because
+// addNewRecord already saturates a single id at the int extremes and two such ids
+// added together would otherwise report a small total for rows that each received a
+// huge one.
 type BatchUpdateFlushSummary struct {
-	Type    string
-	Entries int
-	Delta   int64
+	Type     string
+	Entries  int
+	Accepted int
+	Delta    int64
+}
+
+// accumulateFlushDelta adds value to sum and saturates at the int64 extremes on
+// overflow, the way addNewRecord saturates a single id at the int extremes.
+func accumulateFlushDelta(sum int64, value int) int64 {
+	total := sum + int64(value)
+	if (value > 0 && total < sum) || (value < 0 && total > sum) {
+		if value > 0 {
+			return math.MaxInt64
+		}
+		return math.MinInt64
+	}
+	return total
 }
 
 func init() {
@@ -82,7 +99,7 @@ func FlushBatchUpdates() []BatchUpdateFlushSummary {
 		return nil
 	}
 	for _, summary := range summaries {
-		common.SysLog(common.LogText("batch update flush wrote %d entries of %s, total delta %d", summary.Entries, summary.Type, summary.Delta))
+		common.SysLog(common.LogText("batch update flush wrote %d of %d entries of %s, total delta %d", summary.Accepted, summary.Entries, summary.Type, summary.Delta))
 	}
 	return summaries
 }
@@ -161,34 +178,33 @@ func takeBatchUpdateStores() ([]map[int]int, bool) {
 }
 
 // writeBatchUpdateStores writes the swapped-out maps to their rows and reports one
-// summary per accumulator that held data.
+// summary per accumulator that held data, counting only the entries the database
+// accepted.
 func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
-	summaries := make([]BatchUpdateFlushSummary, 0, BatchUpdateTypeCount)
-	for i, store := range stores {
-		if len(store) == 0 {
-			continue
-		}
-		summary := BatchUpdateFlushSummary{Type: batchUpdateTypeNames[i], Entries: len(store)}
-		for _, value := range store {
-			summary.Delta += int64(value)
-		}
-		summaries = append(summaries, summary)
-	}
-
+	accepted := make([]int, BatchUpdateTypeCount)
 	for i, store := range stores {
 		if i == BatchUpdateTypeUserQuota || i == BatchUpdateTypeUsedQuota || i == BatchUpdateTypeRequestCount {
 			continue
 		}
 		for key, value := range store {
+			if value == 0 {
+				// Nothing to add, so no write can fail and nothing can be lost.
+				accepted[i]++
+				continue
+			}
 			switch i {
 			case BatchUpdateTypeTokenQuota:
 				err := increaseTokenQuota(key, value)
 				if err != nil {
 					common.SysLog(common.LogText("failed to batch update token quota: %s", err.Error()))
+					continue
 				}
 			case BatchUpdateTypeChannelUsedQuota:
-				updateChannelUsedQuota(key, value)
+				if err := updateChannelUsedQuota(key, value); err != nil {
+					continue
+				}
 			}
+			accepted[i]++
 		}
 	}
 
@@ -206,8 +222,31 @@ func writeBatchUpdateStores(stores []map[int]int) []BatchUpdateFlushSummary {
 	for key := range requestCountStore {
 		userIDs[key] = struct{}{}
 	}
+	userStoreTypes := [...]int{BatchUpdateTypeUserQuota, BatchUpdateTypeUsedQuota, BatchUpdateTypeRequestCount}
 	for key := range userIDs {
-		updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
+		err := updateUserQuotaUsedQuotaAndRequestCount(key, userQuotaStore[key], usedQuotaStore[key], requestCountStore[key])
+		if err != nil {
+			continue
+		}
+		// One write covers the three user accumulators, so it accepts the entry of
+		// whichever of them held this id.
+		for _, i := range userStoreTypes {
+			if _, ok := stores[i][key]; ok {
+				accepted[i]++
+			}
+		}
+	}
+
+	summaries := make([]BatchUpdateFlushSummary, 0, BatchUpdateTypeCount)
+	for i, store := range stores {
+		if len(store) == 0 {
+			continue
+		}
+		summary := BatchUpdateFlushSummary{Type: batchUpdateTypeNames[i], Entries: len(store), Accepted: accepted[i]}
+		for _, value := range store {
+			summary.Delta = accumulateFlushDelta(summary.Delta, value)
+		}
+		summaries = append(summaries, summary)
 	}
 	return summaries
 }
