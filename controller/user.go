@@ -681,13 +681,17 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	updatePassword := updatedUser.Password != ""
+	// An empty group means the field was left out: EditWithTx still writes it, so
+	// only a non-empty value can move the account to another group.
+	updateGroup := updatedUser.Group != "" && updatedUser.Group != originUser.Group
 	auditParams := map[string]any{
 		"username": originUser.Username,
 		"id":       updatedUser.Id,
 	}
-	// Resetting a password or rewriting the admin permission matrix changes what
-	// the managed account can do or who can sign in to it.
-	if updatePassword || updatedUser.AdminPermissions != nil {
+	// Resetting a password, rewriting the admin permission matrix or moving the
+	// account to another group changes what the account can do or who can sign in
+	// to it; the group picks the channels and the billing ratio.
+	if updatePassword || updatedUser.AdminPermissions != nil || updateGroup {
 		authorization := requireAdminUserProof(c, service.VerificationScopeAdminUserUpdate, service.AdminUserContext{UserID: updatedUser.Id})
 		if authorization == nil {
 			return
@@ -695,6 +699,7 @@ func UpdateUser(c *gin.Context) {
 		auditParams["verification_method"] = authorization.Method
 		auditParams["password_reset"] = updatePassword
 		auditParams["admin_permissions_updated"] = updatedUser.AdminPermissions != nil
+		auditParams["group_updated"] = updateGroup
 	}
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {

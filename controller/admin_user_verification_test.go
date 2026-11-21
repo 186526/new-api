@@ -115,6 +115,29 @@ func TestAdminUserRiskOperationsRequireProofBeforeMutation(t *testing.T) {
 			},
 		},
 		{
+			name: "group change", method: http.MethodPut, path: "/api/user/", handler: UpdateUser,
+			body: func(target *model.User) string {
+				return fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed","group":"vip"}`, target.Id)
+			},
+			unchanged: func(t *testing.T, target *model.User) {
+				stored, err := model.GetUserById(target.Id, false)
+				require.NoError(t, err)
+				assert.Equal(t, "default", stored.Group)
+			},
+		},
+		{
+			name: "group and password change", method: http.MethodPut, path: "/api/user/", handler: UpdateUser,
+			body: func(target *model.User) string {
+				return fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed","group":"vip","password":"replacement-pass"}`, target.Id)
+			},
+			unchanged: func(t *testing.T, target *model.User) {
+				stored, err := model.GetUserById(target.Id, true)
+				require.NoError(t, err)
+				assert.Equal(t, "default", stored.Group)
+				assert.True(t, common.ValidatePasswordAndHash("managed-password", stored.Password))
+			},
+		},
+		{
 			name: "create administrator", method: http.MethodPost, path: "/api/user/", handler: CreateUser,
 			body: func(*model.User) string { return `{"username":"new-admin","password":"admin-password-1","role":10}` },
 			unchanged: func(t *testing.T, _ *model.User) {
@@ -189,8 +212,107 @@ func TestAdminUserRiskOperationsRequireProofBeforeMutation(t *testing.T) {
 	}
 }
 
-// An administrator (not root) exercises the routine paths without touching the
-// Casbin policy store, which the security fixture does not provision.
+// An administrator (not root) exercises the group-change paths without touching
+// the Casbin policy store, which the security fixture does not provision.
+func setupAdminGroupChangeTest(t *testing.T) (*model.User, service.AuthIdentity, *model.User) {
+	t.Helper()
+	operator, identity, target := setupAdminUserTest(t)
+	require.NoError(t, model.DB.Model(operator).Update("role", common.RoleAdminUser).Error)
+	require.NoError(t, model.PublishUserAuthCache(operator.Id))
+	return operator, identity, target
+}
+
+func TestAdminUserGroupChangeCompletesOnATargetBoundProof(t *testing.T) {
+	groupBody := func(id int, group string) string {
+		return fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed","group":%q}`, id, group)
+	}
+	t.Run("proof bound to another user", func(t *testing.T) {
+		_, identity, target := setupAdminGroupChangeTest(t)
+		other := &model.User{Username: "other-user", Password: target.Password, Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-aff"}
+		require.NoError(t, model.DB.Create(other).Error)
+		proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{
+			Scope:   service.VerificationScopeAdminUserUpdate,
+			Context: []byte(fmt.Sprintf(`{"user_id":%d}`, other.Id)),
+		}, service.VerificationMethodPassword)
+		response := adminUserRequest(http.MethodPut, "/api/user/", groupBody(target.Id, "vip"), proof, identity, common.RoleAdminUser, nil, UpdateUser)
+		var result securityEnrollmentResponse
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, http.StatusForbidden, response.Code)
+		assert.Equal(t, "SECURITY_PROOF_CONTEXT_MISMATCH", result.Code)
+		stored, err := model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, "default", stored.Group)
+	})
+	t.Run("proof bound to this user", func(t *testing.T) {
+		_, identity, target := setupAdminGroupChangeTest(t)
+		proofOf := func() string {
+			return issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{
+				Scope:   service.VerificationScopeAdminUserUpdate,
+				Context: []byte(fmt.Sprintf(`{"user_id":%d}`, target.Id)),
+			}, service.VerificationMethodPassword)
+		}
+		proof := proofOf()
+		response := adminUserRequest(http.MethodPut, "/api/user/", groupBody(target.Id, "vip"), proof, identity, common.RoleAdminUser, nil, UpdateUser)
+		var result securityEnrollmentResponse
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		require.True(t, result.Success, response.Body.String())
+		stored, err := model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, "vip", stored.Group)
+		var audit model.AuditLog
+		require.NoError(t, model.LOG_DB.Where("action = ?", "user.update").Last(&audit).Error)
+		require.NotNil(t, audit.Other.Op)
+		groupUpdated, err := common.Marshal(audit.Other.Op.Params["group_updated"])
+		require.NoError(t, err)
+		assert.JSONEq(t, "true", string(groupUpdated))
+		verificationMethod, err := common.Marshal(audit.Other.Op.Params["verification_method"])
+		require.NoError(t, err)
+		assert.JSONEq(t, `"password"`, string(verificationMethod))
+
+		// The proof was spent on the change above; moving the group again with
+		// the same token replays nothing.
+		response = adminUserRequest(http.MethodPut, "/api/user/", groupBody(target.Id, "svip"), proof, identity, common.RoleAdminUser, nil, UpdateUser)
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, http.StatusForbidden, response.Code)
+		assert.Equal(t, "SECURITY_PROOF_CONSUMED", result.Code)
+		stored, err = model.GetUserById(target.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, "vip", stored.Group)
+	})
+}
+
+func TestAdminUserGroupChangeRequiresProofOnlyWhenTheGroupMoves(t *testing.T) {
+	for _, test := range []struct {
+		name, group string
+		// storedGroup is what EditWithTx writes: an absent group decodes to the
+		// empty string, which it stores, but that is not a move to another group.
+		storedGroup string
+	}{
+		{name: "group absent", storedGroup: ""},
+		{name: "group unchanged", group: "default", storedGroup: "default"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, identity, target := setupAdminGroupChangeTest(t)
+			body := fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed"}`, target.Id)
+			if test.group != "" {
+				body = fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Managed","group":%q}`, target.Id, test.group)
+			}
+			response := adminUserRequest(http.MethodPut, "/api/user/", body, "", identity, common.RoleAdminUser, nil, UpdateUser)
+			var result securityEnrollmentResponse
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			require.True(t, result.Success, response.Body.String())
+			stored, err := model.GetUserById(target.Id, false)
+			require.NoError(t, err)
+			assert.Equal(t, test.storedGroup, stored.Group)
+			var authFlows int64
+			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Count(&authFlows).Error)
+			assert.Zero(t, authFlows)
+		})
+	}
+}
+
+// An administrator (not root) edits routine fields without touching the Casbin
+// policy store, which the security fixture does not provision.
 func TestAdminUserRoutineEditsDoNotRequireProof(t *testing.T) {
 	_, identity, target := setupAdminUserTest(t)
 	response := adminUserRequest(http.MethodPut, "/api/user/", fmt.Sprintf(`{"id":%d,"username":"managed-user","display_name":"Renamed","group":"default"}`, target.Id), "", identity, common.RoleAdminUser, nil, UpdateUser)
