@@ -94,6 +94,10 @@ func rewriteMistralMessage(message json.RawMessage) (json.RawMessage, error) {
 		return nil, err
 	}
 	role := jsonString(members["role"])
+	// Mistral rejects every member of a message it does not declare, so the
+	// reasoning text the client stores on an assistant turn is dropped here:
+	// the earlier rebuild of the request happened to drop it too.
+	delete(members, "reasoning_content")
 	if role == "developer" {
 		members["role"] = json.RawMessage(`"system"`)
 		role = "system"

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -185,5 +186,12 @@ func TestRequestOpenAI2MistralForwardsTopLevelMembersUntouched(t *testing.T) {
 		if _, ok := sent[name]; !ok {
 			t.Errorf("the converted body has a member the client did not send: %q", name)
 		}
+	}
+}
+
+func TestRequestOpenAI2MistralDropsReasoningContent(t *testing.T) {
+	encoded := conversionForTest(t, `{"model":"m","messages":[{"role":"assistant","content":"hi","reasoning_content":"why"}]}`)
+	if strings.Contains(string(encoded), "reasoning_content") {
+		t.Errorf("converted body still carries reasoning_content: %s", encoded)
 	}
 }
