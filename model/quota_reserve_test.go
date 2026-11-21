@@ -147,8 +147,11 @@ func TestBatchUpdateAccumulatesTwoMaximumRequestCharges(t *testing.T) {
 	common.BatchUpdateEnabled = true
 
 	user := createReserveTestUser(t, common.MaxQuota*2+100)
-	require.NoError(t, DecreaseUserQuota(user.Id, common.MaxQuota, false))
-	require.NoError(t, DecreaseUserQuota(user.Id, common.MaxQuota, false))
+	// The persist call queues the same delta DecreaseUserQuota would, without the
+	// gopool goroutine that outlives this test and reads the Redis globals the
+	// next test replaces.
+	queueCommittedUserQuotaDebit(t, user.Id, common.MaxQuota)
+	addNewRecord(BatchUpdateTypeUserQuota, user.Id, -common.MaxQuota)
 
 	batchUpdate()
 	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
@@ -2012,13 +2015,22 @@ func TestReadAfterLedgerExpiryHoldsTheLiveBalance(t *testing.T) {
 // pauseNextQuotaUpdate registers a gorm hook that holds the first UPDATE after
 // it is called until the returned release function runs, so a test can observe
 // what is allowed to happen between a decision and the write it authorizes.
-func pauseNextQuotaUpdate(t *testing.T, name string) (entered <-chan struct{}, release func()) {
+// pauseNextQuotaUpdate registers a gorm hook that holds the first UPDATE after
+// it is called until the returned release function runs, so a test can observe
+// what is allowed to happen between a decision and the write it authorizes. The
+// optional probe runs once, concurrently, as soon as the hook is entered.
+func pauseNextQuotaUpdate(t *testing.T, name string, probe func()) (entered <-chan struct{}, release func()) {
 	t.Helper()
 	enteredCh := make(chan struct{})
 	releaseCh := make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once
 	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
-		enteredOnce.Do(func() { close(enteredCh) })
+		enteredOnce.Do(func() {
+			close(enteredCh)
+			if probe != nil {
+				go probe()
+			}
+		})
 		<-releaseCh
 	}))
 	t.Cleanup(func() {
@@ -2028,8 +2040,63 @@ func pauseNextQuotaUpdate(t *testing.T, name string) (entered <-chan struct{}, r
 	return enteredCh, func() { releaseOnce.Do(func() { close(releaseCh) }) }
 }
 
+// tryQueueWithin reports whether a delta could be queued into the accumulator
+// within window. It calls addNewRecord itself — the exact call
+// DecreaseUserQuota and persistUserQuotaDelta make — so a test measures the real
+// queuing path with no wrapper and no goroutine that outlives the test.
+func tryQueueWithin(kind int, subject int, delta int, window time.Duration) bool {
+	queued := make(chan struct{})
+	go func() {
+		addNewRecord(kind, subject, delta)
+		close(queued)
+	}()
+	select {
+	case <-queued:
+		return true
+	case <-time.After(window):
+		return false
+	}
+}
+
 func unflushedTestDelta(subject int, kind int) int {
 	return batchUpdateStores[kind][subject] + batchUpdateInFlight[kind][subject]
+}
+
+// queueCommittedUserQuotaDebit and queueCommittedTokenQuotaDebit queue a delta
+// the way a committed spend reaches the accumulator, and assert it landed.
+//
+// They call persistUserQuotaDelta / persistTokenQuotaDelta rather than
+// DecreaseUserQuota / DecreaseTokenQuota on purpose. The Decrease wrappers also
+// fire a `gopool.Go` cache write, and gopool has no join: that goroutine can
+// outlive the test and touch the Redis client and the accumulator global the
+// next test replaces, which is a whole-package `-race` failure in the next
+// test's name. The persist calls are the same addNewRecord with the same sign
+// and no goroutine, so a test that only needs the accumulator to hold the delta
+// gets one it can drain.
+func queueCommittedUserQuotaDebit(t *testing.T, id int, quota int) {
+	t.Helper()
+	require.NoError(t, persistUserQuotaDelta(id, -quota))
+	require.Equal(t, -quota, batchUpdateStores[BatchUpdateTypeUserQuota][id],
+		"the spend reaches the accumulator directly, with no goroutine to drain")
+}
+
+func queueCommittedUserQuotaCredit(t *testing.T, id int, quota int) {
+	t.Helper()
+	require.NoError(t, persistUserQuotaDelta(id, quota))
+	require.Equal(t, quota, batchUpdateStores[BatchUpdateTypeUserQuota][id])
+}
+
+func queueCommittedTokenQuotaDebit(t *testing.T, id int, quota int) {
+	t.Helper()
+	require.NoError(t, persistTokenQuotaDelta(id, -quota))
+	require.Equal(t, -quota, batchUpdateStores[BatchUpdateTypeTokenQuota][id],
+		"the spend reaches the accumulator directly, with no goroutine to drain")
+}
+
+func queueCommittedTokenQuotaCredit(t *testing.T, id int, quota int) {
+	t.Helper()
+	require.NoError(t, persistTokenQuotaDelta(id, quota))
+	require.Equal(t, quota, batchUpdateStores[BatchUpdateTypeTokenQuota][id])
 }
 
 // The conditional update and the delta it must respect have to be one critical
@@ -2038,6 +2105,11 @@ func unflushedTestDelta(subject int, kind int) int {
 // balance it decided on and the balance it wrote, and then the wallet pays both.
 // Measured before the fix: reserve accepted, spend queued during the paused
 // UPDATE, wallet 100 paid 30+100.
+//
+// The probe queues the spend while the reserve's UPDATE is paused. Every
+// goroutine this test starts is joined before it returns, including one that was
+// still waiting on the lock when the window closed, so no goroutine of this test
+// can touch the accumulator global into the next test.
 func TestBatchReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -2049,33 +2121,33 @@ func TestBatchReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
 	// The hash cannot be verified, so the reserve has to answer from the row.
 	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
 
-	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve")
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve", nil)
 	defer release()
 
-	answer := make(chan error, 1)
-	reservedAnswer := make(chan bool, 1)
+	var outstanding sync.WaitGroup
+	outstanding.Add(1)
 	go func() {
-		reserved, err := TryReserveUserQuota(user.Id, 100)
-		reservedAnswer <- reserved
-		answer <- err
+		defer outstanding.Done()
+		_, _ = TryReserveUserQuota(user.Id, 100)
 	}()
 	<-entered
 
-	queued := make(chan error, 1)
-	go func() { queued <- DecreaseUserQuota(user.Id, 30, false) }()
-	select {
-	case err := <-queued:
-		require.NoError(t, err)
+	if tryQueueWithin(BatchUpdateTypeUserQuota, user.Id, -30, 150*time.Millisecond) {
 		release()
-		<-answer
+		outstanding.Wait()
 		t.Fatal("a committed spend was queued between the balance the reserve decided on and the row it wrote")
-	case <-time.After(300 * time.Millisecond):
 	}
 
 	release()
-	require.NoError(t, <-answer)
-	assert.True(t, <-reservedAnswer, "the wallet held 100 when the reserve wrote")
-	require.NoError(t, <-queued)
+	outstanding.Wait()
+	// The queuing attempt above was abandoned while it waited on the lock, so it
+	// lands after the reserve's row write; drain it before leaving.
+	require.Eventually(t, func() bool {
+		batchUpdateLocks[BatchUpdateTypeUserQuota].Lock()
+		defer batchUpdateLocks[BatchUpdateTypeUserQuota].Unlock()
+		return batchUpdateStores[BatchUpdateTypeUserQuota][user.Id] == -30
+	}, 2*time.Second, 5*time.Millisecond, "the spend that waited out the reserve is queued after it")
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the reserve wrote its row")
 
 	batchUpdate()
 	assert.Equal(t, -30, getUserQuotaFromDB(t, user.Id), "the spend is ordered after the reserve, not inside it")
@@ -2093,36 +2165,173 @@ func TestBatchTokenReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) 
 	require.NoError(t, err)
 	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
 
-	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve")
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve", nil)
 	defer release()
 
-	answer := make(chan error, 1)
-	reservedAnswer := make(chan bool, 1)
+	var outstanding sync.WaitGroup
+	outstanding.Add(1)
 	go func() {
-		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
-		reservedAnswer <- reserved
-		answer <- err
+		defer outstanding.Done()
+		_, _ = TryReserveTokenQuota(token.Id, token.Key, 100, false)
 	}()
 	<-entered
 
-	queued := make(chan error, 1)
-	go func() { queued <- DecreaseTokenQuota(token.Id, token.Key, 30) }()
-	select {
-	case err := <-queued:
-		require.NoError(t, err)
+	if tryQueueWithin(BatchUpdateTypeTokenQuota, token.Id, -30, 150*time.Millisecond) {
 		release()
-		<-answer
+		outstanding.Wait()
 		t.Fatal("a committed spend was queued between the balance the reserve decided on and the row it wrote")
-	case <-time.After(300 * time.Millisecond):
 	}
 
 	release()
-	require.NoError(t, <-answer)
-	assert.True(t, <-reservedAnswer, "the token held 100 when the reserve wrote")
-	require.NoError(t, <-queued)
+	outstanding.Wait()
+	require.Eventually(t, func() bool {
+		batchUpdateLocks[BatchUpdateTypeTokenQuota].Lock()
+		defer batchUpdateLocks[BatchUpdateTypeTokenQuota].Unlock()
+		return batchUpdateStores[BatchUpdateTypeTokenQuota][token.Id] == -30
+	}, 2*time.Second, 5*time.Millisecond, "the spend that waited out the reserve is queued after it")
+	assert.Equal(t, 0, getTokenFromDB(t, token.Id).RemainQuota, "the reserve wrote its row")
 
 	batchUpdate()
 	assert.Equal(t, -30, getTokenFromDB(t, token.Id).RemainQuota, "the spend is ordered after the reserve, not inside it")
+}
+
+// holdMidFlush writes the row a delta owes and stops before the in-flight
+// record is cleared, which is exactly the state batchUpdate passes through
+// between writeBatchUpdateStores and clearBatchUpdateInFlight: the row carries
+// the delta and the in-flight map still owes it. The caller holds the flush lock
+// across this and across the assertion that follows, the way a flush holds it.
+func holdMidFlush(t *testing.T, kind int, subject int, delta int, writeRow func()) (release func()) {
+	t.Helper()
+	batchUpdateFlushLock.Lock()
+	var once sync.Once
+	release = func() { once.Do(batchUpdateFlushLock.Unlock) }
+	// A failing assertion below must not leave the flush lock held: the rest of
+	// the package would deadlock on it rather than report this test's failure.
+	t.Cleanup(release)
+	batchUpdateLocks[kind].Lock()
+	batchUpdateStores[kind] = map[int]int{subject: delta}
+	batchUpdateInFlight[kind] = batchUpdateStores[kind]
+	batchUpdateStores[kind] = map[int]int{}
+	batchUpdateLocks[kind].Unlock()
+	writeRow()
+	require.Equal(t, delta, unflushedTestDelta(subject, kind),
+		"the in-flight record still owes the delta the row now carries")
+	return release
+}
+
+// requireBlockedWithin reports whether f does not return within window, and
+// returns the channel that closes when it does, so the caller can join it.
+func requireBlockedWithin(t *testing.T, name string, window time.Duration, f func()) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	select {
+	case <-done:
+		t.Fatalf("%s returned while the flush had written the row but not cleared its in-flight record", name)
+	case <-time.After(window):
+	}
+	// Bounded on purpose: cleanups run last-in-first-out, so an unbounded wait
+	// here could outlive the release that lets f through and hang the package.
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("%s never returned after the test ended", name)
+		}
+	})
+	return done
+}
+
+// The flush lock is what stops a reserve from reading the same delta twice.
+// batchUpdate swaps the accumulator out, writes the rows, then clears the
+// in-flight record; between the write and the clear the row carries the delta
+// AND the in-flight map still owes it, so a folded read of row plus owed counts
+// it twice. A wallet whose row already reached 150 while the in-flight record
+// still holds its +50 therefore reads as 200, and a reserve of 200 would be
+// accepted against a wallet that genuinely holds 150.
+//
+// The swap half of the window needs no lock of its own: takeBatchUpdateStores
+// records the in-flight map in the same critical section that empties the
+// stores, so a mid-swap read is already right. This test drives the half that
+// only the flush lock covers, and would pass without the lock at all.
+func TestBatchReserveHoldsTheFlushWindowStillAcrossItsUpdate(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
+
+	release := holdMidFlush(t, BatchUpdateTypeUserQuota, user.Id, 50, func() {
+		require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
+			Update("quota", gorm.Expr("quota + ?", 50)).Error)
+	})
+	require.Equal(t, 150, getUserQuotaFromDB(t, user.Id), "the row already holds the credit")
+
+	var reserved bool
+	var reserveErr error
+	answered := requireBlockedWithin(t, "a reserve", 150*time.Millisecond, func() {
+		reserved, reserveErr = TryReserveUserQuota(user.Id, 200)
+	})
+
+	clearBatchUpdateInFlight()
+	release()
+
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reserve did not return after the in-flight record was cleared")
+	}
+	require.NoError(t, reserveErr)
+	assert.False(t, reserved, "the wallet holds 150, so a reserve of 200 is refused")
+	assert.Equal(t, 150, getUserQuotaFromDB(t, user.Id), "and the refused reserve moved nothing")
+
+	reserved, reserveErr = TryReserveUserQuota(user.Id, 150)
+	require.NoError(t, reserveErr)
+	assert.True(t, reserved, "the wallet holds 150 and pays 150")
+	assert.Equal(t, 150, getUserQuotaFromDB(t, user.Id), "a ledger reservation is queued, not written")
+}
+
+// The token twin of the flush window.
+func TestBatchTokenReserveHoldsTheFlushWindowStillAcrossItsUpdate(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
+
+	release := holdMidFlush(t, BatchUpdateTypeTokenQuota, token.Id, 50, func() {
+		require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).
+			Update("remain_quota", gorm.Expr("remain_quota + ?", 50)).Error)
+	})
+	require.Equal(t, 150, getTokenFromDB(t, token.Id).RemainQuota)
+
+	var reserved bool
+	var reserveErr error
+	answered := requireBlockedWithin(t, "a token reserve", 150*time.Millisecond, func() {
+		reserved, reserveErr = TryReserveTokenQuota(token.Id, token.Key, 200, false)
+	})
+
+	clearBatchUpdateInFlight()
+	release()
+
+	select {
+	case <-answered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the token reserve did not return after the in-flight record was cleared")
+	}
+	require.NoError(t, reserveErr)
+	assert.False(t, reserved, "the token holds 150, so a reserve of 200 is refused")
+	assert.Equal(t, 150, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
 // A drained wallet whose accumulator holds the spends is still a drained wallet.
@@ -2138,9 +2347,10 @@ func TestBatchRedisErrorDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 
 	user := createReserveTestUser(t, 100)
 	require.NoError(t, populateUserCache(user))
-	require.NoError(t, DecreaseUserQuota(user.Id, 30, false))
-	require.NoError(t, DecreaseUserQuota(user.Id, 30, false))
-	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the accumulator holds both spends")
+	queueCommittedUserQuotaDebit(t, user.Id, 30)
+	addNewRecord(BatchUpdateTypeUserQuota, user.Id, -30)
+	require.Equal(t, -60, unflushedTestDelta(user.Id, BatchUpdateTypeUserQuota), "the accumulator holds both spends")
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
 
 	server.SetError("LOADING Redis is loading the dataset in memory")
 
@@ -2161,8 +2371,9 @@ func TestBatchTokenRedisErrorDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 	common.BatchUpdateEnabled = true
 
 	token := createReserveTestToken(t, 100)
-	require.NoError(t, DecreaseTokenQuota(token.Id, token.Key, 30))
-	require.NoError(t, DecreaseTokenQuota(token.Id, token.Key, 30))
+	queueCommittedTokenQuotaDebit(t, token.Id, 30)
+	addNewRecord(BatchUpdateTypeTokenQuota, token.Id, -30)
+	require.Equal(t, -60, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota), "the accumulator holds both spends")
 	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 
 	server.SetError("LOADING Redis is loading the dataset in memory")
@@ -2193,7 +2404,7 @@ func TestBatchQueuedCreditFundsTheReserve(t *testing.T) {
 
 	user := createReserveTestUser(t, 100)
 	require.NoError(t, populateUserCache(user))
-	require.NoError(t, IncreaseUserQuota(user.Id, 50, false))
+	queueCommittedUserQuotaCredit(t, user.Id, 50)
 	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the credit is queued, not written")
 	require.Equal(t, 50, unflushedTestDelta(user.Id, BatchUpdateTypeUserQuota))
 
@@ -2224,7 +2435,7 @@ func TestBatchQueuedTokenCreditFundsTheReserve(t *testing.T) {
 	token := createReserveTestToken(t, 100)
 	_, err := GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
-	require.NoError(t, IncreaseTokenQuota(token.Id, token.Key, 50))
+	queueCommittedTokenQuotaCredit(t, token.Id, 50)
 	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 	require.Equal(t, 50, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota))
 

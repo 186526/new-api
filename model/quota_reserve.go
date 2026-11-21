@@ -1223,19 +1223,35 @@ func reserveTokenQuotaDB(id int, quota int, owed int) (bool, error) {
 // update it authorizes are one critical section. The reserve callback is handed
 // that owed delta, which it folds into the comparison.
 //
-// Both locks are part of that section. Queuing a delta takes only the kind lock,
-// so the kind lock has to span the update; releasing it before the write is the
-// check-then-act window the guard exists to close. The flush lock covers the
-// other half: a flush swaps the accumulator out, then writes rows, then clears
-// its in-flight record, and between the swap and the write the row is stale
-// while the accumulator looks empty, so the in-flight record alone would not
-// answer.
+// Both locks are part of that section, and they cover two different windows.
 //
-// The cost is one row update per reservation: the kind lock stalls that kind's
-// queuing and the flush for one database round trip. It is only paid on a path
-// that has already lost its signed ledger, and the read path already holds the
-// flush lock across one row read. The lock order is flush then kind, matching
-// takeBatchUpdateStores, so nothing here can close a cycle with a flush.
+// The kind lock covers the check-then-act window. Queuing a delta takes only the
+// kind lock, so if this released it before the write, a committed spend queued in
+// between would be counted by the accumulator and again by the update, which is
+// how a wallet of 100 came to pay 30+100.
+//
+// The flush lock covers the window after the rows are written and before the
+// in-flight record is cleared. In that window batchUpdateInFlight still holds the
+// delta the rows now carry, so the owed delta counts it twice: a wallet whose row
+// already reached 150 while in-flight still holds its +50 reads as 200, and a
+// reserve of 200 against a drained 150-row is accepted. The swap window needs no
+// lock of its own — takeBatchUpdateStores records the in-flight map in the same
+// critical section that empties the stores, so a mid-swap read of stores plus
+// in-flight is already correct.
+//
+// The cost of holding both is one database round trip while the flush lock and
+// this kind's lock are held, and the kind lock is process-wide for the kind
+// rather than per subject. On the fallback path that stalls addNewRecord for
+// every subject of this kind, and it stalls the flush ticker too, because
+// batchUpdate takes the same flush lock. It is a latency coupling, not a
+// correctness one: the reserve's own debit is queued after the update returns,
+// so nothing is lost. Reading the owed delta and then issuing the conditional
+// update without the kind lock is not an alternative — that reopens exactly the
+// window above, only now with the spend landing mid-round-trip. Narrowing it
+// would take a per-subject lock, which the accumulator does not have; the
+// read path's seed takes the flush lock across a row read and pays the same
+// coupling. The lock order is flush then kind, matching takeBatchUpdateStores,
+// so nothing here can close a cycle with a flush.
 func reserveQuotaHoldingAccumulator(kind int, subject int, reserve func(owed int) (bool, error)) (bool, error) {
 	if !common.BatchUpdateEnabled {
 		return reserve(0)
