@@ -65,6 +65,7 @@ func resetBatchUpdateTestState(t *testing.T) {
 	for i := range BatchUpdateTypeCount {
 		batchUpdateLocks[i].Lock()
 		batchUpdateStores[i] = make(map[int]int)
+		batchUpdateInFlight[i] = nil
 		batchUpdateLocks[i].Unlock()
 	}
 	t.Cleanup(func() {
@@ -72,6 +73,7 @@ func resetBatchUpdateTestState(t *testing.T) {
 		for i := range BatchUpdateTypeCount {
 			batchUpdateLocks[i].Lock()
 			batchUpdateStores[i] = make(map[int]int)
+			batchUpdateInFlight[i] = nil
 			batchUpdateLocks[i].Unlock()
 		}
 	})
@@ -2015,11 +2017,7 @@ func TestReadAfterLedgerExpiryHoldsTheLiveBalance(t *testing.T) {
 // pauseNextQuotaUpdate registers a gorm hook that holds the first UPDATE after
 // it is called until the returned release function runs, so a test can observe
 // what is allowed to happen between a decision and the write it authorizes.
-// pauseNextQuotaUpdate registers a gorm hook that holds the first UPDATE after
-// it is called until the returned release function runs, so a test can observe
-// what is allowed to happen between a decision and the write it authorizes. The
-// optional probe runs once, concurrently, as soon as the hook is entered.
-func pauseNextQuotaUpdate(t *testing.T, name string, probe func()) (entered <-chan struct{}, release func()) {
+func pauseNextQuotaUpdate(t *testing.T, name string) (entered <-chan struct{}, release func()) {
 	t.Helper()
 	enteredCh := make(chan struct{})
 	releaseCh := make(chan struct{})
@@ -2027,9 +2025,6 @@ func pauseNextQuotaUpdate(t *testing.T, name string, probe func()) (entered <-ch
 	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
 		enteredOnce.Do(func() {
 			close(enteredCh)
-			if probe != nil {
-				go probe()
-			}
 		})
 		<-releaseCh
 	}))
@@ -2121,7 +2116,7 @@ func TestBatchReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
 	// The hash cannot be verified, so the reserve has to answer from the row.
 	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
 
-	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve", nil)
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve")
 	defer release()
 
 	var outstanding sync.WaitGroup
@@ -2165,7 +2160,7 @@ func TestBatchTokenReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) 
 	require.NoError(t, err)
 	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
 
-	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve", nil)
+	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve")
 	defer release()
 
 	var outstanding sync.WaitGroup
@@ -2204,10 +2199,17 @@ func holdMidFlush(t *testing.T, kind int, subject int, delta int, writeRow func(
 	t.Helper()
 	batchUpdateFlushLock.Lock()
 	var once sync.Once
-	release = func() { once.Do(batchUpdateFlushLock.Unlock) }
 	// A failing assertion below must not leave the flush lock held: the rest of
 	// the package would deadlock on it rather than report this test's failure.
-	t.Cleanup(release)
+	// The in-flight record this helper wrote is dropped here too, so a failure
+	// before the caller flushes cannot leave the delta owed to the next test.
+	t.Cleanup(func() {
+		batchUpdateLocks[kind].Lock()
+		batchUpdateInFlight[kind] = nil
+		batchUpdateLocks[kind].Unlock()
+		once.Do(batchUpdateFlushLock.Unlock)
+	})
+	release = func() { once.Do(batchUpdateFlushLock.Unlock) }
 	batchUpdateLocks[kind].Lock()
 	batchUpdateStores[kind] = map[int]int{subject: delta}
 	batchUpdateInFlight[kind] = batchUpdateStores[kind]
@@ -2256,7 +2258,7 @@ func requireBlockedWithin(t *testing.T, name string, window time.Duration, f fun
 // The swap half of the window needs no lock of its own: takeBatchUpdateStores
 // records the in-flight map in the same critical section that empties the
 // stores, so a mid-swap read is already right. This test drives the half that
-// only the flush lock covers, and would pass without the lock at all.
+// only the flush lock covers; deleting that lock turns it red.
 func TestBatchReserveHoldsTheFlushWindowStillAcrossItsUpdate(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
