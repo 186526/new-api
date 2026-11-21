@@ -162,6 +162,33 @@ func TestObserveUpstreamQuotaSkipsIncompleteWindows(t *testing.T) {
 	assert.Empty(t, samplesForChannel(t, "newapi_upstream_quota_refresh_timestamp_seconds", channel))
 }
 
+// TestObserveUpstreamQuotaKeepsTheLastFigureWhenATickPublishesNoWindow requires a
+// tick with nothing publishable to leave the previous figure alone. The deletion
+// runs before the writes, so without the guard a tick that reports no usable
+// window would erase the series of the tick before it and leave the channel with
+// no allowance at all, which reads as a channel that vanished rather than one
+// whose lookup returned nothing this time.
+func TestObserveUpstreamQuotaKeepsTheLastFigureWhenATickPublishesNoWindow(t *testing.T) {
+	channel := "Mistral Vibe (nothing publishable test)"
+	reset := time.Unix(1_700_300_000, 0)
+
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel: channel,
+		Windows: []QuotaWindow{{Scope: "vibe", Window: "monthly", RemainingRatio: 0.4, ResetAt: reset}},
+	})
+	// A window without a scope is skipped, so this tick has nothing to publish.
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel:         channel,
+		Windows:         []QuotaWindow{{Scope: "", Window: "monthly", RemainingRatio: 0.1}},
+		ChannelOrphaned: true,
+	})
+
+	counts := seriesCountByConfigured(t, "newapi_upstream_quota_remaining_ratio", channel)
+	assert.Equal(t, 1, counts[channelConfiguredTrue], "the last published figure must survive a tick that reports nothing")
+	assert.Equal(t, 0, counts[channelConfiguredFalse])
+	assert.InDelta(t, 0.4, samplesForChannel(t, "newapi_upstream_quota_remaining_ratio", channel)["vibe|monthly"], 1e-9)
+}
+
 // TestObserveUpstreamQuotaLabelsTheAllowanceOfAnAccountWithoutAChannel requires
 // the allowance of a configured account that no channel carries to publish
 // channel_configured="false" and the allowance of a live channel to publish
@@ -283,6 +310,39 @@ func TestObserveUpstreamQuotaDropsTheSeriesOfTheFlippedConfiguredLabel(t *testin
 	counts = seriesCountByConfigured(t, "newapi_upstream_quota_remaining_ratio", channel)
 	assert.Equal(t, 1, counts[channelConfiguredFalse])
 	assert.Equal(t, 0, counts[channelConfiguredTrue])
+
+	// A tick can also publish fewer windows than the one before it: the console
+	// fallback reports only the Vibe allowance when the subscription page has no
+	// api_budget, so the api window disappears while the account flips to orphan.
+	// The label belongs to the channel and not to a window, so the deletion has to
+	// reach a window this tick no longer publishes; otherwise the dropped window
+	// keeps reporting the value under which it was last written.
+	shrinking := "Mistral Vibe (shrinking windows test)"
+	bothWindows := func() []QuotaWindow {
+		return []QuotaWindow{
+			{Scope: "api", Window: "monthly", RemainingRatio: 0.05, ResetAt: reset},
+			{Scope: "vibe", Window: "monthly", RemainingRatio: 0.5, ResetAt: reset},
+		}
+	}
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel: shrinking, Windows: bothWindows(), RefreshedAt: refresh,
+	})
+	ObserveUpstreamQuota(UpstreamQuota{
+		Channel:         shrinking,
+		Windows:         []QuotaWindow{{Scope: "vibe", Window: "monthly", RemainingRatio: 0.5, ResetAt: reset}},
+		RefreshedAt:     refresh,
+		ChannelOrphaned: true,
+	})
+
+	counts = seriesCountByConfigured(t, "newapi_upstream_quota_remaining_ratio", shrinking)
+	assert.Equal(t, 0, counts[channelConfiguredTrue],
+		"the api window dropped from the tick must not keep its live label")
+	assert.Equal(t, 1, counts[channelConfiguredFalse])
+
+	counts = seriesCountByConfigured(t, "newapi_upstream_quota_reset_timestamp_seconds", shrinking)
+	assert.Equal(t, 0, counts[channelConfiguredTrue],
+		"the reset series of the dropped api window must not keep its live label")
+	assert.Equal(t, 1, counts[channelConfiguredFalse])
 }
 
 // seriesCountByConfigured counts the published series of one metric for a

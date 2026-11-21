@@ -98,14 +98,21 @@ func ObserveUpstreamQuota(quota UpstreamQuota) {
 			worst[key] = window
 		}
 	}
+	// The label belongs to the channel, not to a window, so the opposite value is
+	// deleted for the whole channel before anything is written. Matching on the
+	// window here would only reach the windows of this tick, and a tick that
+	// publishes fewer windows than the last one — the console fallback reports
+	// only the Vibe allowance when the subscription page omits api_budget — would
+	// leave the dropped window reporting under the value it was last written with.
+	// The deletions run only when this tick publishes something, because a channel
+	// with no publishable window has nothing to replace and would otherwise lose
+	// the last figure it reported.
+	if len(worst) > 0 {
+		channelLabels := prometheus.Labels{labelChannel: quota.Channel}
+		dropFlippedConfiguredSeries(upstreamQuotaRemainingRatio, configured, channelLabels)
+		dropFlippedConfiguredSeries(upstreamQuotaResetTimestamp, configured, channelLabels)
+	}
 	for _, window := range worst {
-		series := prometheus.Labels{
-			labelChannel: quota.Channel,
-			labelScope:   window.Scope,
-			labelWindow:  window.Window,
-		}
-		dropFlippedConfiguredSeries(upstreamQuotaRemainingRatio, configured, series)
-		dropFlippedConfiguredSeries(upstreamQuotaResetTimestamp, configured, series)
 		upstreamQuotaRemainingRatio.WithLabelValues(quota.Channel, window.Scope, window.Window, configured).Set(window.RemainingRatio)
 		if !window.ResetAt.IsZero() {
 			upstreamQuotaResetTimestamp.WithLabelValues(quota.Channel, window.Scope, window.Window, configured).Set(float64(window.ResetAt.Unix()))
