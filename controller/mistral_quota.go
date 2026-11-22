@@ -100,7 +100,16 @@ func refreshMistralQuotasContext(ctx context.Context) mistralQuotaRefreshResult 
 		if err := storeMistralChannelBalance(channel, quota); err != nil {
 			common.SysLog(common.LogText("failed to refresh Mistral channel balance: channel=%s, error=%v", account.Channel, err))
 		}
-		time.Sleep(common.RequestInterval)
+		// A zero interval fires the timer at once, so the pause costs nothing
+		// unless POLLING_INTERVAL sets one, and a cancellation ends the wait here
+		// rather than after it.
+		pause := time.NewTimer(common.RequestInterval)
+		select {
+		case <-ctx.Done():
+			pause.Stop()
+			return result
+		case <-pause.C:
+		}
 	}
 	missing.logOnce()
 	return result
