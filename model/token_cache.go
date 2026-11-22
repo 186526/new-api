@@ -182,20 +182,17 @@ local seedLedger = function()
     'QuotaLedgerMAC', args.seed.mac, 'QuotaLedgerExp', args.seed.expiresAt)
   subtractSigned(KEYS[1], 'RemainQuota', args.seed.used)
 end
-local exists = redis.call('EXISTS', KEYS[1])
+	local exists = redis.call('EXISTS', KEYS[1])
 if exists == 1 and (ARGV[21] ~= 'true' or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[22]) then
   seedLedger()
   -- The hash only earns a longer life while it carries a ledger the reservation
-  -- can spend from. A repair that declined leaves a hash nobody can spend, and
-  -- renewing its TTL here would keep it alive past the row that has since caught
-  -- up: the refusal would then repeat for as long as traffic kept refreshing it.
-  -- Leaving the TTL alone lets the hash expire and the next read rebuild it from
-  -- the flushed row.
-  if redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
-    local ledgerExpiry = tonumber(redis.call('HGET', KEYS[1], 'QuotaLedgerExp') or '0')
-    if ledgerExpiry > tonumber(redis.call('TIME')[1]) * 1000 then
-      redis.call('EXPIRE', KEYS[1], ARGV[18])
-    end
+  -- can spend from, which Go decided from the signature before this script ran. A
+  -- repair that declined leaves a hash nobody can spend, and renewing its TTL
+  -- here would keep it alive past the row that has since caught up: the refusal
+  -- would then repeat for as long as traffic kept refreshing it. Leaving the TTL
+  -- alone lets the hash expire and the next read rebuild it from the flushed row.
+  if ARGV[24] == 'true' then
+    redis.call('EXPIRE', KEYS[1], ARGV[18])
   end
   return 2
 end
@@ -246,6 +243,14 @@ return 1`
 	if err != nil {
 		return 0, err
 	}
+	// The hash keeps its lifetime only while it carries a ledger the reservation
+	// can spend from. tokenQuotaLedgerFieldsCarryASignature answers that from the
+	// signature alone, so a genuine ledger whose window has closed still counts:
+	// the reservation answers it from the row plus the accumulator's owed delta,
+	// which is why closing the window must not shorten the hash below it.
+	var liveFields map[string]string
+	liveFields, liveErr := common.RDB.HGetAll(context.Background(), cacheKey).Result()
+	liveLedgerHolds := liveErr == nil && tokenQuotaLedgerFieldsCarryASignature(liveFields, token.Id, token.Key)
 	return common.RDB.Eval(context.Background(), script, []string{
 		cacheKey, getTokenCacheFenceKey(token.Key),
 	},
@@ -257,7 +262,7 @@ return 1`
 		strconv.FormatBool(token.AllowUserQuotaQuery),
 		tokenCacheTTLSeconds(),
 		token.CacheExpiresAt, mac, strconv.FormatBool(repair), existing.CacheMAC,
-		string(ledgerArgs),
+		string(ledgerArgs), strconv.FormatBool(liveLedgerHolds),
 	).Int()
 }
 
