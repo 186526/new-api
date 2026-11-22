@@ -39,12 +39,13 @@ dev-web:
 
 dev: dev-api dev-web
 
-# The main package embeds the ignored web/dist output and is covered after build-web.
+# ./... lists package main itself, so main_test.go runs here; relaykit and
+# tokenkit are separate modules and are tested in their own steps below.
+# The main package embeds the ignored web/dist output, so CI creates
+# web/dist/index.html before this target runs.
 test:
 	@echo "Testing root Go module..."
-	@root_module=$$(GOWORK=off go list -m); \
-		root_packages=$$(GOWORK=off go list -e ./... | grep -vxF "$$root_module"); \
-		GOWORK=off go test $$root_packages
+	@GOWORK=off go test ./...
 	@echo "Testing relaykit Go module..."
 	@cd relaykit && GOWORK=off go test ./...
 	@echo "Testing tokenkit Go module..."
