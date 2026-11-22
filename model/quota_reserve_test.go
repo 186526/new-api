@@ -2220,24 +2220,15 @@ func TestDamageTokenHashKeepsItsOwnTTLSoTheRowCanCatchUp(t *testing.T) {
 
 	server.FastForward(500 * time.Millisecond)
 	for range 3 {
-		_, err := GetTokenByKey(token.Key, false)
+		read, err := GetTokenByKey(token.Key, false)
 		require.NoError(t, err)
-		require.Equal(t, 40, mustReadTokenRemainder(t, token.Key),
+		require.Equal(t, 40, read.RemainQuota,
 			"the read answers from the mirror while the hash is damaged")
 	}
 	ttlAfter := common.RDB.PTTL(t.Context(), key).Val()
 	assert.Less(t, ttlAfter, ttlBefore,
 		"a republish that could not sign must leave the TTL alone, so the hash expires (before=%s after=%s)",
 		ttlBefore, ttlAfter)
-}
-
-func mustReadTokenRemainder(t *testing.T, key string) int {
-	t.Helper()
-	var cached Token
-	require.NoError(t, common.RedisHGetObj(getTokenCacheKey(key), &cached))
-	answer, err := tokenFromItsMirror(&cached)
-	require.NoError(t, err)
-	return answer.RemainQuota
 }
 
 // The two row-first callers write the row themselves and then hand the same
