@@ -175,7 +175,18 @@ redis.call('HSET', KEYS[1],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'AllowUserQuotaQuery', ARGV[17],
   'CacheExpiresAt', ARGV[19], 'CacheMAC', ARGV[20])
-for _, counter in ipairs({{'AccessedTime', ARGV[6]}, {'RemainQuota', ARGV[15]}, {'UsedQuota', ARGV[16]}}) do
+-- UsedQuota is filled with the counter the seed signs, not the snapshot's. The
+-- two differ when the hash vanished while a batch debit was still queued: Go
+-- raises the signed used counter by the delta the accumulator owes, which the
+-- snapshot's row has not reached. Filling the row's value first then left
+-- seedLedger comparing it against the raised counter, so it declined and the
+-- fresh hash carried no ledger — and the reservation refuses a hash with no
+-- signed ledger instead of answering from the row.
+local seedUsed = ARGV[16]
+if args.seed.mac ~= '' then
+  seedUsed = args.seed.used
+end
+for _, counter in ipairs({{'AccessedTime', ARGV[6]}, {'RemainQuota', ARGV[15]}, {'UsedQuota', seedUsed}}) do
   if not string.match(redis.call('HGET', KEYS[1], counter[1]) or '', '^-?%d+$') then
     redis.call('HSET', KEYS[1], counter[1], counter[2])
   end

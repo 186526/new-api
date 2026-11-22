@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"strconv"
@@ -39,6 +40,18 @@ var ErrQuotaLedgerUnverified = errors.New("cached quota ledger failed verificati
 // of discarding it and answering from the row; only the read path rebuilds it,
 // and the rebuild signs the balance the accumulator holds.
 var ErrPreLedgerHashCarriesNoSignature = errors.New("cached user hash carries no signed quota ledger")
+
+// ErrPreLedgerTokenHashCarriesNoSignature is the token twin of
+// ErrPreLedgerHashCarriesNoSignature: a token hash whose ledger signature this
+// build did not produce, whether because it never carried one or because a
+// writer holding only Redis access deleted or changed a field the signature
+// covers. The token signature covers every field the reservation reads (Id,
+// QuotaGranted, UsedQuota and the expiry), so damage to any of them lands here,
+// and the answer must stay away from the database row for the same reason: under
+// batch accumulation the row predates the debit the accumulator still owes it. A
+// reservation refuses such a hash and leaves it in place for its own TTL, after
+// which the next read seeds a ledger from the balance the accumulator holds.
+var ErrPreLedgerTokenHashCarriesNoSignature = errors.New("cached token hash carries no signed quota ledger")
 
 // errQuotaLedgerBoundsRefused reports a committed delta the signed ledger cannot
 // hold. The counter is left alone so the cached balance stays below the
@@ -580,19 +593,12 @@ func ledgerRefusalReason(err error) string {
 	return err.Error()
 }
 
-func requireLedgerInt(fields map[string]string, name string) (int64, error) {
-	value, err := parseLedgerInt(fields, name)
-	if err != nil {
-		return 0, fmt.Errorf("%w: %w", ErrQuotaLedgerUnverified, err)
-	}
-	return value, nil
-}
-
 // parseLedgerInt reads one integer field of a hash. The error it returns says
 // what is wrong with the field and carries no sentinel, so each caller decides
 // which refusal it answers with: an unverifiable ledger is discarded and
 // answered from the row, while a hash whose layout is already known to be
-// unspendable is refused outright (see requireSignedLayoutInt).
+// unspendable is refused outright (see requireSignedLayoutInt and
+// requireSignedTokenLayoutInt).
 func parseLedgerInt(fields map[string]string, name string) (int64, error) {
 	raw, ok := fields[name]
 	if !ok || raw == "" {
@@ -737,22 +743,33 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 	if len(fields) == 0 {
 		return nil, cacheQuotaMiss, nil
 	}
-	cachedID, err := requireLedgerInt(fields, "Id")
+	// Same question and same order as the user twin: the layout is decided by the
+	// ledger signature, not by a non-empty marker, and it is asked before any
+	// field is parsed so that damage to a signed field cannot take the
+	// ErrQuotaLedgerUnverified route that discards the hash and reserves from the
+	// database row. Under batch accumulation that row predates the debit the
+	// accumulator still owes it, so a deleted field there handed the spend back.
+	if !tokenQuotaLedgerFieldsCarryASignature(fields, id, key) {
+		// Refused, not discarded: the hash is left in place for its own TTL, after
+		// which the next read seeds a ledger from the balance the accumulator holds.
+		return nil, cacheQuotaUnverified, ErrPreLedgerTokenHashCarriesNoSignature
+	}
+	cachedID, err := requireSignedTokenLayoutInt(fields, "Id")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
 	if int(cachedID) != id {
-		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash belongs to token %d", ErrQuotaLedgerUnverified, cachedID)
+		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash belongs to token %d", ErrPreLedgerTokenHashCarriesNoSignature, cachedID)
 	}
-	granted, err := requireLedgerInt(fields, "QuotaGranted")
+	granted, err := requireSignedTokenLayoutInt(fields, "QuotaGranted")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	used, err := requireLedgerInt(fields, "UsedQuota")
+	used, err := requireSignedTokenLayoutInt(fields, "UsedQuota")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	expiresAt, err := requireLedgerInt(fields, "QuotaLedgerExp")
+	expiresAt, err := requireSignedTokenLayoutInt(fields, "QuotaLedgerExp")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
@@ -760,6 +777,10 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 	if err != nil {
 		return nil, cacheQuotaMiss, err
 	}
+	// The signature matched above, so the only way it fails here is the clock: a
+	// genuine ledger whose window has closed. That stays an unverified *ledger*,
+	// which the reservation answers from the row plus the accumulator's owed
+	// delta, exactly as it did before the pre-parse refusal existed.
 	if !validAuthCacheMAC(expectedMAC, fields["QuotaLedgerMAC"], expiresAt) {
 		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the token ledger signature does not match", ErrQuotaLedgerUnverified)
 	}
@@ -770,6 +791,49 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 		id: id, granted: granted, used: used,
 		expiresAt: expiresAt, mac: fields["QuotaLedgerMAC"],
 	}, cacheQuotaOK, nil
+}
+
+// tokenQuotaLedgerFieldsCarryASignature reports whether the raw token hash holds a
+// ledger this build signed, without regarding the window. It is the token twin of
+// userLedgerFieldsCarryASignature and answers the one question the reservation
+// guard asks: is this the signed layout? A field that does not parse, or a MAC
+// that does not match the counters, counts as no signature rather than as an
+// unverified ledger, because the two are indistinguishable to a writer holding
+// only Redis access and only the signed layout may be spent from. The clock is
+// deliberately not consulted: an expired ledger is still this layout, and
+// answering it as pre-ledger would send the caller away from the row-plus-
+// accumulator answer it is entitled to.
+func tokenQuotaLedgerFieldsCarryASignature(fields map[string]string, id int, key string) bool {
+	if fields["QuotaLedgerMAC"] == "" {
+		return false
+	}
+	granted, grantedErr := parseLedgerInt(fields, "QuotaGranted")
+	used, usedErr := parseLedgerInt(fields, "UsedQuota")
+	expiresAt, expiresErr := parseLedgerInt(fields, "QuotaLedgerExp")
+	if grantedErr != nil || usedErr != nil || expiresErr != nil {
+		return false
+	}
+	expected, err := tokenQuotaLedgerMAC(key, id, granted, used, expiresAt)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal([]byte(expected), []byte(fields["QuotaLedgerMAC"]))
+}
+
+// requireSignedTokenLayoutInt reads a field of a token hash whose ledger signature
+// already held. The token signature covers every field the reservation reads, so
+// any field this rejects has been deleted or made unparseable behind a signature
+// that still covers the rest; the hash is not this build's layout any more, and its
+// answer has to stay away from the database row, which under batch accumulation
+// predates the debit the accumulator still owes it. The error is therefore
+// ErrPreLedgerTokenHashCarriesNoSignature, not ErrQuotaLedgerUnverified, whose
+// callers discard the hash and reserve from the row.
+func requireSignedTokenLayoutInt(fields map[string]string, name string) (int64, error) {
+	value, err := parseLedgerInt(fields, name)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrPreLedgerTokenHashCarriesNoSignature, err)
+	}
+	return value, nil
 }
 
 // cacheTryReserveUserQuota reserves quota from the signed ledger. A hash whose
@@ -1483,6 +1547,11 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 	return reserved, true, err
 }
 
+// reserveTokenQuotaCached is the token twin of reserveUserQuotaCached. A hash
+// whose ledger a writer contradicted is discarded and answered from the database,
+// with the accumulator's owed delta folded in, never from zero. A hash that carries
+// no signed ledger at all, or whose signed field was deleted, is refused instead,
+// because the row is not an answer for it.
 func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, fromDB bool, err error) {
 	stripe := quotaLedgerStripe(id)
 	stripe.Lock()
@@ -1492,6 +1561,12 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 	for range quotaLedgerRetryAttempts {
 		result, reserveErr := cacheTryReserveTokenQuota(id, key, int64(quota))
 		switch {
+		case errors.Is(reserveErr, ErrPreLedgerTokenHashCarriesNoSignature):
+			// See the user twin: a hash with no signed ledger cannot be spent from
+			// and must not be answered from the row, which under batch accumulation
+			// predates the debit the accumulator still owes it. The hash is left in
+			// place for its own TTL to rebuild, and the reservation is refused.
+			return false, false, reserveErr
 		case errors.Is(reserveErr, ErrQuotaLedgerUnverified) || result == cacheQuotaUnverified:
 			discardUnverifiedTokenQuotaCache(id, key, ledgerRefusalReason(reserveErr))
 			reserved, err = reserveTokenQuotaFromRow(id, quota)
@@ -1579,6 +1654,9 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 
 // TryReserveTokenQuota atomically checks and deducts a token quota. Unlimited
 // tokens skip the balance check but still update remain/used accounting.
+// 哈希里没有本版本签出的账本（或某个被签字段被删）时直接拒绝并返回
+// ErrPreLedgerTokenHashCarriesNoSignature：批量模式下数据库行还是扣款前的值，
+// 回退到行会把已花的额度再花一次。
 func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota cannot be negative")
@@ -1598,6 +1676,12 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return reserved, err
 	}
 	if errors.Is(err, errQuotaLedgerContended) {
+		return false, err
+	}
+	if errors.Is(err, ErrPreLedgerTokenHashCarriesNoSignature) {
+		// See the user twin: the fallback would answer from a row the accumulator
+		// has not reached yet, so refusing is the only answer that cannot hand
+		// quota back.
 		return false, err
 	}
 	if err != nil {

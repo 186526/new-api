@@ -710,6 +710,13 @@ func TestLedgerCountersStayExactPastTheDoubleCeiling(t *testing.T) {
 	assert.Equal(t, "-9007199254740990", cacheQuotaField(t, key, "Quota"))
 }
 
+// The token twin of TestReserveRefusesAForgedSignedTotal. Raising a counter the
+// signature covers breaks the signature, and a hash that does not carry this
+// build's signature is refused outright: it is indistinguishable from one that
+// never carried a ledger, and answering either from the database row would hand
+// back the pre-debit balance. Measured before the pre-parse refusal existed, this
+// case answered reserved=false with no error and discarded the hash, which raised
+// the mutation fence and reserved from the row; the refusal now leaves the hash.
 func TestTokenReserveRefusesAForgedSignedTotal(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
@@ -721,22 +728,26 @@ func TestTokenReserveRefusesAForgedSignedTotal(t *testing.T) {
 
 	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
 	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 100, false)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrPreLedgerTokenHashCarriesNoSignature,
+		"a raised signed total breaks its MAC, so the hash is refused rather than answered from the row")
 	assert.False(t, reserved)
-	assert.Zero(t, common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val(),
-		"the unverified token hash is discarded")
-	assert.Equal(t, int64(1), common.RDB.Exists(t.Context(), getTokenCacheFenceKey(token.Key)).Val(),
-		"the discard raises the mutation fence so the forged hash is not republished")
-	assert.Equal(t, 2, getTokenFromDB(t, token.Id).RemainQuota)
+	assert.Equal(t, int64(1), common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val(),
+		"the refusal leaves the hash in place for its own TTL, unlike the discard it replaced")
+	assert.Zero(t, common.RDB.Exists(t.Context(), getTokenCacheFenceKey(token.Key)).Val(),
+		"no discard runs, so no mutation fence is raised")
+	assert.Equal(t, 2, getTokenFromDB(t, token.Id).RemainQuota, "and no row spend either")
 }
 
 func TestTokenRepairSeedsTheLedgerFromTheSnapshot(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 
 	token := createReserveTestToken(t, 40)
 	require.NoError(t, token.Update())
+	// Update leaves a mutation fence behind, and a fenced publish writes nothing.
+	// The seed is what this case is about, so the fence is waited out first.
+	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
 	_, err := GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
 
@@ -744,6 +755,8 @@ func TestTokenRepairSeedsTheLedgerFromTheSnapshot(t *testing.T) {
 	// the seed must not trust them.
 	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
 		"RemainQuota", 10_000, "UsedQuota", 0).Err())
+	// The metadata MAC still verifies, so this read republishes the snapshot's
+	// metadata and seeds the ledger the hash no longer carries.
 	_, err = GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 
@@ -1675,8 +1688,12 @@ func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingTokenRow(t *testing.T) 
 	require.Equal(t, 70, live.RemainQuota)
 	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "the row has not been flushed")
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
-		"QuotaLedgerExp", int64(1)).Err())
+	// The signed window closes while the hash itself is still there. The expiry is
+	// part of the ledger MAC, so it is re-signed with a past value: the signature
+	// matches and only the window has gone, which is what makes this the expiry
+	// case rather than a forged one — and the one case a reservation still answers
+	// from the row plus the accumulator's owed delta.
+	expireSignedTokenLedger(t, token.Key)
 
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
 	require.NoError(t, err, "the row answers, with the owed debit folded in")
@@ -1963,6 +1980,114 @@ func TestReserveRefusesASignedLedgerWithADeletedField(t *testing.T) {
 	})
 }
 
+// The token twin of TestReserveRefusesASignedLedgerWithADeletedField. The token
+// ledger signature covers every field the reservation reads — Id, QuotaGranted,
+// UsedQuota and the expiry — so damage to any one of them leaves counters that
+// are signed and a hash whose layout is not. verifiedTokenQuotaLedger used to
+// parse those fields before it asked whether the signature held, so the damage
+// came out as ErrQuotaLedgerUnverified and reserveTokenQuotaCached took that
+// error's route: discard the hash and reserve from the database row. Under batch
+// accumulation that row predates the debit the accumulator still owes it, so
+// deleting one field handed the spend back.
+//
+// The shape here puts the debit in the signed ledger alone: the token holds 100,
+// the ledger records 60 used, the row still holds 100, and this process's
+// accumulator is empty because the debit sits in another pod. A reservation of 60
+// against the row fits and spends quota the token no longer has.
+//
+// Measured on the parent commit, all five sub-cases failed: each returned
+// reserved=true with a nil error, logged the missing field and reserved from the
+// database, taking the row from 100 to 40. The pre-ledger sub-case failed the same
+// way, because the parent had no refusal to return at all.
+func TestTokenReserveRefusesASignedLedgerWithADeletedField(t *testing.T) {
+	seedLedgerOnlyTokenDebit := func(t *testing.T) (Token, string) {
+		t.Helper()
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		useUserCacheMiniRedis(t)
+		common.BatchUpdateEnabled = true
+
+		token := createReserveTestToken(t, 100)
+		_, err := GetTokenByKey(token.Key, true)
+		require.NoError(t, err)
+		key := getTokenCacheKey(token.Key)
+
+		// The debit lives in the signed ledger only: the row still holds the
+		// pre-debit 100 and this process's accumulator never saw the spend.
+		result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -60)
+		require.NoError(t, err)
+		require.Equal(t, cacheQuotaOK, result)
+		require.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"))
+		require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "the row still holds the pre-debit balance")
+		require.Zero(t, unflushedQuotaDelta(token.Id, BatchUpdateTypeTokenQuota),
+			"the debit is held outside this process's accumulator, which is what makes the row fallback a double spend")
+		return token, key
+	}
+
+	assertRefused := func(t *testing.T, token Token, key string, damage string) {
+		t.Helper()
+		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 60, false)
+		rowAfter := getTokenFromDB(t, token.Id).RemainQuota
+		require.ErrorIs(t, err, ErrPreLedgerTokenHashCarriesNoSignature,
+			"a signed ledger %s is refused rather than answered from the row (reserved=%t, row=%d)",
+			damage, reserved, rowAfter)
+		assert.False(t, reserved)
+		assert.Equal(t, 100, rowAfter, "the pre-debit row must not fund the spend")
+		assert.Equal(t, int64(1), common.RDB.Exists(t.Context(), key).Val(),
+			"the refusal leaves the hash in place for its own TTL to rebuild")
+	}
+
+	// Every field the signature covers is parsed, so deleting any one of them has
+	// to reach the refusal. QuotaLedgerMAC is the signature itself.
+	for _, field := range []string{"Id", "QuotaGranted", "UsedQuota", "QuotaLedgerExp", "QuotaLedgerMAC"} {
+		t.Run("deleted "+field, func(t *testing.T) {
+			token, key := seedLedgerOnlyTokenDebit(t)
+			require.NoError(t, common.RDB.HDel(t.Context(), key, field).Err())
+			assertRefused(t, token, key, "with "+field+" deleted")
+		})
+	}
+}
+
+// A token hash written before this build signed the token ledger carries no
+// ledger fields at all, and the reservation must refuse it rather than discard it
+// and answer from the row. The shape is the one a deployed pre-ledger image left
+// behind: complete metadata, the RemainQuota mirror, and no QuotaGranted,
+// UsedQuota, QuotaLedgerMAC or QuotaLedgerExp. Measured on the parent commit the
+// reservation discarded the hash and reserved from the row, which under batch
+// accumulation is the pre-debit balance; the refusal leaves the hash for its own
+// TTL, after which the next read seeds a ledger from the balance the accumulator
+// holds.
+func TestTokenReserveRefusesAHashWithNoSignedLedger(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+
+	require.NoError(t, common.RDB.HDel(t.Context(), key,
+		"QuotaGranted", "UsedQuota", "QuotaLedgerMAC", "QuotaLedgerExp").Err())
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 60, false)
+	require.ErrorIs(t, err, ErrPreLedgerTokenHashCarriesNoSignature,
+		"a token hash with no signed ledger is refused rather than answered from the row")
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "no database spend either")
+	assert.Equal(t, int64(1), common.RDB.Exists(t.Context(), key).Val(),
+		"the refusal leaves the hash for its own TTL, unlike the discard it replaced")
+
+	// The refusal repeats: nothing on the reserve path republishes the hash over
+	// the mirrored counters.
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 60, false)
+	require.ErrorIs(t, err, ErrPreLedgerTokenHashCarriesNoSignature,
+		"the second attempt is refused the same way")
+	assert.False(t, reserved)
+	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
+}
+
 // The two row-first callers write the row themselves and then hand the same
 // delta to the cache. Measured before the fix under batch accumulation, that
 // sequence left cache=60 against row=100 (the debit was applied twice): the
@@ -2174,8 +2299,10 @@ func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameTokenReserve(t *testing.T)
 	require.NoError(t, err)
 	require.True(t, reserved)
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
-		"QuotaLedgerExp", int64(1)).Err())
+	// The signed window closes while the hash is still there, and the expiry is
+	// re-signed: only the window may be gone, or the hash would be refused as
+	// pre-ledger instead of answered from the row.
+	expireSignedTokenLedger(t, token.Key)
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		reserved, err := TryReserveTokenQuota(token.Id, token.Key, 71, false)
@@ -2505,6 +2632,43 @@ func expireSignedUserLedger(t *testing.T, userID int) {
 		"and that window is in the past")
 }
 
+// expireSignedTokenLedger is the token twin of expireSignedUserLedger: it closes
+// the signed window of a live token ledger without breaking its signature. The
+// expiry is inside the token ledger MAC, so writing a past expiry alone leaves a
+// hash whose signature matches nothing; this re-signs the counters the hash
+// already carries with an expiry in the past, which is the shape a genuine ledger
+// reaches when its window runs out — and the shape a reservation is still
+// entitled to answer from the row plus the accumulator's owed delta.
+func expireSignedTokenLedger(t *testing.T, key string) {
+	t.Helper()
+	tokenKey := getTokenCacheKey(key)
+	fields := hashFields(t, tokenKey)
+	tokenID, err := parseLedgerInt(fields, "Id")
+	require.NoError(t, err, "the hash must carry the signed id")
+	granted, err := parseLedgerInt(fields, "QuotaGranted")
+	require.NoError(t, err, "the hash must carry the signed granted counter")
+	used, err := parseLedgerInt(fields, "UsedQuota")
+	require.NoError(t, err, "the hash must carry the signed used counter")
+
+	expiresAt := time.Now().Add(-time.Second).UnixMilli()
+	mac, err := tokenQuotaLedgerMAC(key, int(tokenID), granted, used, expiresAt)
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), tokenKey,
+		"QuotaLedgerExp", expiresAt, "QuotaLedgerMAC", mac).Err())
+
+	require.True(t, tokenQuotaLedgerFieldsCarryASignature(hashFields(t, tokenKey), int(tokenID), key),
+		"the re-signed ledger still carries this build's signature, so only its window has closed")
+}
+
+// hashFields reads one hash whole, for the helpers that re-sign what a hash
+// already carries.
+func hashFields(t *testing.T, key string) map[string]string {
+	t.Helper()
+	fields, err := common.RDB.HGetAll(t.Context(), key).Result()
+	require.NoError(t, err)
+	return fields
+}
+
 // queueCommittedUserQuotaDebit and queueCommittedTokenQuotaDebit queue a delta
 // the way a committed spend reaches the accumulator, and assert it landed.
 //
@@ -2608,7 +2772,10 @@ func TestBatchTokenReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) 
 	token := createReserveTestToken(t, 100)
 	_, err := GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
-	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
+	// The ledger's window has closed, so the reserve answers from the row. The
+	// expiry is re-signed: writing it alone would leave the hash pre-ledger, and
+	// that shape is now refused outright instead of reaching the row.
+	expireSignedTokenLedger(t, token.Key)
 
 	entered, release := pauseNextQuotaUpdate(t, "m79:pause-token-reserve")
 	defer release()
@@ -2762,7 +2929,10 @@ func TestBatchTokenReserveHoldsTheFlushWindowStillAcrossItsUpdate(t *testing.T) 
 	token := createReserveTestToken(t, 100)
 	_, err := GetTokenByKey(token.Key, true)
 	require.NoError(t, err)
-	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key), "QuotaGranted", 1_000_000).Err())
+	// Only the window is closed, and the expiry is re-signed so it is: a bare
+	// expiry write would make the hash pre-ledger and the reserve would refuse
+	// before the row read this test exists to observe.
+	expireSignedTokenLedger(t, token.Key)
 
 	release := holdMidFlush(t, BatchUpdateTypeTokenQuota, token.Id, 50, func() {
 		require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).
@@ -2897,8 +3067,10 @@ func TestBatchQueuedTokenCreditFundsTheReserve(t *testing.T) {
 	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 	require.Equal(t, 50, unflushedTestDelta(token.Id, BatchUpdateTypeTokenQuota))
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getTokenCacheKey(token.Key),
-		"QuotaGranted", 1_000_000).Err())
+	// The ledger's window has closed, so the reserve answers from the row with the
+	// accumulator's owed credit folded in. A forged field would now be refused
+	// outright instead of reaching the row, so the expiry is re-signed.
+	expireSignedTokenLedger(t, token.Key)
 
 	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 140, false)
 	require.NoError(t, err, "a queued credit funds the reserve; it is not a reason to fail the request")
