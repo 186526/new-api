@@ -143,10 +143,14 @@ func main() {
 	// account entry carries, so the refresh is started by the entries the loader
 	// accepts rather than by one credential's environment variable. The context is
 	// cancelled at shutdown so the loop stops with the listener.
-	mistralQuotaCtx, stopMistralQuotaRefresh := context.WithCancel(context.Background())
-	defer stopMistralQuotaRefresh()
+	mistralQuotaCtx, cancelMistralQuotaCtx := context.WithCancel(context.Background())
+	defer cancelMistralQuotaCtx()
 	if common.RunsAdmin() {
-		startMistralQuotaRefreshIfConfigured(mistralQuotaCtx)
+		if started, stopMistralQuotaRefresh := startMistralQuotaRefreshIfConfigured(mistralQuotaCtx); started {
+			// Runs before the context is cancelled because it was deferred later:
+			// it cancels its own child context and waits for the loop to return.
+			defer stopMistralQuotaRefresh()
+		}
 	}
 
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
@@ -302,25 +306,37 @@ func main() {
 	common.SysLog(common.LogText("server exited"))
 }
 
-// startMistralQuotaRefreshIfConfigured starts the background allowance refresh
-// and reports whether it did. The entries decide, not the environment variable
-// that feeds one of them: an account reads its allowance with a key or with a
-// console session, so an entry that carries a key alone is as configured as one
-// that carries a cookie. A configuration that does not load is reported and
-// leaves the refresh off, because an unreadable file is a mistake to surface
-// rather than a reason to poll.
-func startMistralQuotaRefreshIfConfigured(ctx context.Context) bool {
+// startMistralQuotaRefreshIfConfigured starts the background allowance refresh and
+// reports whether it did, together with the function that stops it. The entries
+// decide, not the environment variable that feeds one of them: an account reads its
+// allowance with a key or with a console session, so an entry that carries a key
+// alone is as configured as one that carries a cookie. A configuration that does not
+// load is reported and leaves the refresh off, because an unreadable file is a
+// mistake to surface rather than a reason to poll.
+//
+// The returned stop cancels the loop and waits for it to exit, so a caller that is
+// shutting down does not return while a tick can still read the environment or write
+// a channel balance. It is safe to call more than once.
+func startMistralQuotaRefreshIfConfigured(ctx context.Context) (bool, func()) {
 	accounts, err := service.LoadMistralQuotaAccounts()
 	if err != nil {
 		common.SysError(common.LogText(
 			"failed to load the Mistral quota accounts, so their allowance is not refreshed: %s", err.Error()))
-		return false
+		return false, func() {}
 	}
 	if len(accounts) == 0 {
-		return false
+		return false, func() {}
 	}
-	go controller.StartMistralQuotaRefresh(ctx, mistralQuotaRefreshFrequency())
-	return true
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		controller.StartMistralQuotaRefresh(loopCtx, mistralQuotaRefreshFrequency())
+	}()
+	return true, func() {
+		cancel()
+		<-done
+	}
 }
 
 // mistralQuotaRefreshFrequency reads the configured refresh period. The variable

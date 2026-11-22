@@ -26,70 +26,105 @@ import (
 )
 
 const (
-	// mistralQuotaGateTestChannel is the channel name the key-only entry below is
-	// matched to, so the published series is labelled with a channel the table
-	// still carries rather than an orphan.
-	mistralQuotaGateTestChannel = "Mistral (gate, key only)"
 	// mistralQuotaGateTestKey is the key the entry carries and the channel carries,
 	// so the allowance is read from the billing endpoint with it.
 	mistralQuotaGateTestKey = "mstrl_gatekey"
-	// mistralQuotaGateTestWindow is the scope and window the refresh publishes the
-	// merged monthly allowance under.
+	// mistralQuotaGateTestScope and mistralQuotaGateTestWindow are the scope and
+	// window the refresh publishes the merged monthly allowance under.
 	mistralQuotaGateTestScope  = "vibe"
 	mistralQuotaGateTestWindow = "monthly"
-	// mistralQuotaGateTestAccounts is a key-only entry: it carries a channel and a
-	// key, and no console session. An entry shaped like this reads its allowance
-	// from the public billing endpoint with that key.
-	mistralQuotaGateTestAccounts = `[{"channel":"` + mistralQuotaGateTestChannel +
-		`","vibeKey":"` + mistralQuotaGateTestKey + `","monthlyLimitUsd":150}]`
 )
+
+// mistralQuotaGateRuns numbers the channel each run is seeded with. The metrics
+// registry is process-wide and keeps every series it ever created, so a channel
+// name reused by the sibling subtest or by a second run under -count would read as
+// an allowance this run already published. A fresh name per run is what makes the
+// publish the proof that this run's loop reached the endpoint.
+var mistralQuotaGateRuns atomic.Int32
+
+func mistralQuotaGateChannel(source string) string {
+	return fmt.Sprintf("Mistral (gate, %s %d)", source, mistralQuotaGateRuns.Add(1))
+}
+
+// mistralQuotaGateAccounts is a key-only entry: it carries a channel and a key,
+// and no console session. An entry shaped like this reads its allowance from the
+// public billing endpoint with that key.
+func mistralQuotaGateAccounts(channel string) string {
+	return `[{"channel":"` + channel + `","vibeKey":"` + mistralQuotaGateTestKey +
+		`","monthlyLimitUsd":150}]`
+}
 
 // TestMistralQuotaRefreshStartsForAKeyOnlyEntry requires an account that carries
 // only a key to start the refresh and to publish its allowance, from both sources
-// that can configure one. Neither subtest sets a console session, which is the
-// state the old gate rejected: it started the refresh only when a cookie was
-// configured, so a key-only entry loaded nothing and published nothing.
+// that can configure one. Neither subtest sets a console session.
+//
+// The two subtests do not prove the same thing. The single-account variables are the
+// shape the old gate refused: its disjunction listed the two accounts sources and
+// the cookie, so a channel and a key with no cookie started nothing. The accounts
+// file is not that case — the old gate started on the path alone — so it covers the
+// loader, which accepts a key-only entry, rather than the gate.
 func TestMistralQuotaRefreshStartsForAKeyOnlyEntry(t *testing.T) {
-	configure := map[string]func(t *testing.T){
-		"accounts file": func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "accounts.json")
-			require.NoError(t, os.WriteFile(path, []byte(mistralQuotaGateTestAccounts), 0o600))
-			t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", path)
+	sources := []struct {
+		name  string
+		apply func(t *testing.T, channel string)
+	}{
+		{
+			name: "accounts file",
+			apply: func(t *testing.T, channel string) {
+				path := filepath.Join(t.TempDir(), "accounts.json")
+				require.NoError(t, os.WriteFile(path, []byte(mistralQuotaGateAccounts(channel)), 0o600))
+				t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", path)
+			},
 		},
-		"single-account variables": func(t *testing.T) {
-			t.Setenv("MISTRAL_VIBE_QUOTA_CHANNEL", mistralQuotaGateTestChannel)
-			t.Setenv("MISTRAL_VIBE_QUOTA_VIBE_KEY", mistralQuotaGateTestKey)
+		{
+			name: "single-account variables",
+			apply: func(t *testing.T, channel string) {
+				t.Setenv("MISTRAL_VIBE_QUOTA_CHANNEL", channel)
+				t.Setenv("MISTRAL_VIBE_QUOTA_VIBE_KEY", mistralQuotaGateTestKey)
+			},
 		},
 	}
-	for name, configureSource := range configure {
-		t.Run(name, func(t *testing.T) {
+	for _, source := range sources {
+		t.Run(source.name, func(t *testing.T) {
 			mistralQuotaGateTestEnv(t)
-			seedMistralChannel(t, mistralQuotaGateTestChannel, mistralQuotaGateTestKey)
+			channel := mistralQuotaGateChannel(source.name)
+			seedMistralChannel(t, channel, mistralQuotaGateTestKey)
 			asked := newMistralBillingServer(t, 25, 150)
-			configureSource(t)
+			source.apply(t, channel)
 
-			ctx, stop := context.WithCancel(t.Context())
+			ctx, cancel := context.WithCancel(t.Context())
+			started, stop := startMistralQuotaRefreshIfConfigured(ctx)
+			t.Cleanup(cancel)
+			// Registered after the interval and the database are replaced, so it runs
+			// before they are restored (cleanups run last in, first out) and joins the
+			// loop first: a tick still running would read the interval and write the
+			// balance of a test that already ended.
 			t.Cleanup(stop)
-			require.True(t, startMistralQuotaRefreshIfConfigured(ctx),
-				"an entry that carries only a key must start the refresh")
-			require.Equal(t, 0.75, waitForMistralRemainingRatio(t, mistralQuotaGateTestChannel),
+			require.True(t, started, "an entry that carries only a key must start the refresh")
+
+			require.Equal(t, 0.75, waitForMistralRemainingRatio(t, channel),
 				"the allowance the key answered must be published")
 			requireMistralRefreshStops(t, stop, asked)
 		})
 	}
 }
 
-// requireMistralRefreshStops cancels the context and requires the loop to stop
-// asking the endpoint. The gate starts the loop on a goroutine, so without this
-// the goroutine would outlive the test and poll a server that is already closed.
-func requireMistralRefreshStops(t *testing.T, stop context.CancelFunc, asked *atomic.Int32) {
+// requireMistralRefreshStops stops the loop and requires the endpoint to be left
+// alone afterwards. The stop function cancels the loop and waits for it to return,
+// so nothing is polling once it has been called. The caller waits for the publish
+// before this, which is what tells that the loop had already read the allowance: a
+// cancel landing before the first fetch of a tick is what used to read as a loop
+// that kept polling.
+func requireMistralRefreshStops(t *testing.T, stop func(), asked *atomic.Int32) {
 	t.Helper()
 	stop()
-	before := asked.Load()
+	require.GreaterOrEqual(t, asked.Load(), int32(1),
+		"the refresh must have read the allowance before it is stopped")
+	settled := asked.Load()
 	require.Never(t, func() bool {
-		return asked.Load() != before
-	}, 500*time.Millisecond, 50*time.Millisecond,
-		"a cancelled refresh must not keep polling the endpoint")
+		return asked.Load() != settled
+	}, 300*time.Millisecond, 25*time.Millisecond,
+		"a stopped refresh must not keep polling the endpoint")
 }
 
 // TestMistralQuotaRefreshStaysOffForAnEmptyConfiguration requires no starts and no
@@ -101,7 +136,9 @@ func TestMistralQuotaRefreshStaysOffForAnEmptyConfiguration(t *testing.T) {
 	asked := newMistralBillingServer(t, 25, 150)
 	deleteMistralQuotaAccountsEnv(t)
 
-	assert.False(t, startMistralQuotaRefreshIfConfigured(t.Context()))
+	started, stop := startMistralQuotaRefreshIfConfigured(t.Context())
+	t.Cleanup(stop)
+	assert.False(t, started)
 	assert.Zero(t, asked.Load(), "an unconfigured deployment must not reach Mistral")
 }
 
@@ -119,7 +156,9 @@ func TestMistralQuotaRefreshStaysOffForAnUnloadableConfiguration(t *testing.T) {
 	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS", "")
 	captured := captureMainLog(t)
 
-	assert.False(t, startMistralQuotaRefreshIfConfigured(t.Context()))
+	started, stop := startMistralQuotaRefreshIfConfigured(t.Context())
+	t.Cleanup(stop)
+	assert.False(t, started)
 	assert.Contains(t, captured.String(), "failed to load the Mistral quota accounts")
 	assert.Zero(t, asked.Load(), "a file that does not load must not reach Mistral")
 }
@@ -210,8 +249,10 @@ func seedMistralChannel(t *testing.T, name string, key string) {
 }
 
 // waitForMistralRemainingRatio reads the published series of the channel until it
-// appears, because the refresh runs on its own goroutine. The refresh loop sleeps
-// between ticks, so the value is stable once it is written; the timeout only
+// appears, because the refresh runs on its own goroutine. The channel name is
+// unique to the run, so the series cannot be one an earlier run published; the
+// value is the allowance the fetch of this run returned. The refresh loop sleeps
+// between ticks, so the value is stable once it is written and the timeout only
 // bounds how long the goroutine gets to reach the publish.
 func waitForMistralRemainingRatio(t *testing.T, channel string) float64 {
 	t.Helper()
