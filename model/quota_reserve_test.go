@@ -2088,6 +2088,158 @@ func TestTokenReserveRefusesAHashWithNoSignedLedger(t *testing.T) {
 	assert.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota)
 }
 
+// The token twin of the user read-path repair. A hash whose ledger signature is
+// gone is not spendable, but it is not lost either: the read path reports it
+// stale, GetTokenByKey reloads the row and cacheInitToken republishes the hash.
+// That republish signs the counter the hash still holds, and the counter is the
+// one the seed signs, so the repair keeps the debit instead of handing back the
+// row. The shape is the ledger-only one from the refusal test above: the token
+// holds 100, the signed ledger records 60 used, the row still holds 100 and this
+// process's accumulator is empty because the debit sits in another pod. A repair
+// that seeded from the row would hand 60 of spent quota back.
+//
+// Measured on the parent commit, the reservation after the read failed with
+// `cached token hash carries no signed quota ledger` and the hash kept `mac=""`;
+// the user twin repaired the same damage on its own read and reserved.
+func TestTokenReadRepairsASignedLedgerWithADeletedSignature(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -60)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	require.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"))
+	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "the row still holds the pre-debit balance")
+	require.Zero(t, unflushedQuotaDelta(token.Id, BatchUpdateTypeTokenQuota),
+		"the debit is held outside this process's accumulator")
+
+	require.NoError(t, common.RDB.HDel(t.Context(), key, "QuotaLedgerMAC").Err())
+	_, err = cacheGetTokenByKey(token.Key)
+	require.Error(t, err, "a hash with no signed ledger is not answered from its mirror")
+
+	_, err = GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"),
+		"the republish kept the counter the hash held rather than the row's")
+	assert.Equal(t, "40", cacheQuotaField(t, key, "RemainQuota"),
+		"the repaired remainder is the pre-debit balance minus the ledger's spend")
+	assert.NotEmpty(t, cacheQuotaField(t, key, "QuotaLedgerMAC"), "the republish signed the ledger")
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 40, cached.RemainQuota)
+	assert.Equal(t, 60, cached.UsedQuota)
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 41, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the repaired ledger caps the token at its remaining 40")
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 40, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the next reservation spends from the repaired ledger")
+}
+
+// A token row can carry a negative used counter: IncreaseTokenQuota refunds a
+// charge by lowering used_quota, so refunding a charge that never reached the row
+// leaves it below zero. Such a row is consistent — remain 100 with used -5 means
+// the token holds 100 — but tokenQuotaLedgerSeedArgs refused it, cacheInitToken
+// turned that into an empty ledger MAC, and the reservation then refused every
+// attempt, so the token never became spendable again.
+//
+// Measured on the parent commit, the published hash carried no QuotaGranted and
+// no QuotaLedgerMAC and every reservation failed with
+// `cached token hash carries no signed quota ledger`.
+func TestTokenWithANegativeUsedCounterIsSpendableAfterARepublish(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	token := createReserveTestToken(t, 100)
+	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).
+		Update("used_quota", -5).Error)
+
+	fresh, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 100, fresh.RemainQuota)
+
+	key := getTokenCacheKey(token.Key)
+	assert.Equal(t, "-5", cacheQuotaField(t, key, "UsedQuota"))
+	assert.Equal(t, "95", cacheQuotaField(t, key, "QuotaGranted"),
+		"the signed total is remain plus the negative used counter")
+	assert.Equal(t, "100", cacheQuotaField(t, key, "RemainQuota"))
+	assert.NotEmpty(t, cacheQuotaField(t, key, "QuotaLedgerMAC"),
+		"the republish signs the negative counter instead of refusing the row")
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 100, cached.RemainQuota)
+	assert.Equal(t, -5, cached.UsedQuota)
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 101, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the signed total caps the spend at 95")
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the negative counter does not make the token unspendable")
+}
+
+// A damaged hash answers from its mirror and must not keep being kept alive. The
+// repair path calls cacheInitToken on every read of such a hash, and a republish
+// that renewed its TTL unconditionally would carry the unspendable hash past the
+// row catching up, so the refusal would repeat for as long as traffic arrived.
+// Measured before the TTL guard: the hash's TTL went back up on each read, so the
+// token stayed unspendable instead of recovering when its own TTL ran out.
+func TestDamageTokenHashKeepsItsOwnTTLSoTheRowCanCatchUp(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -60)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+
+	require.NoError(t, common.RDB.HDel(t.Context(), key, "QuotaLedgerMAC", "UsedQuota").Err())
+	require.NoError(t, common.RDB.PExpire(t.Context(), key, 2*time.Second).Err())
+	ttlBefore := common.RDB.PTTL(t.Context(), key).Val()
+	require.Positive(t, ttlBefore)
+
+	server.FastForward(500 * time.Millisecond)
+	for range 3 {
+		_, err := GetTokenByKey(token.Key, false)
+		require.NoError(t, err)
+		require.Equal(t, 40, mustReadTokenRemainder(t, token.Key),
+			"the read answers from the mirror while the hash is damaged")
+	}
+	ttlAfter := common.RDB.PTTL(t.Context(), key).Val()
+	assert.Less(t, ttlAfter, ttlBefore,
+		"a republish that could not sign must leave the TTL alone, so the hash expires (before=%s after=%s)",
+		ttlBefore, ttlAfter)
+}
+
+func mustReadTokenRemainder(t *testing.T, key string) int {
+	t.Helper()
+	var cached Token
+	require.NoError(t, common.RedisHGetObj(getTokenCacheKey(key), &cached))
+	answer, err := tokenFromItsMirror(&cached)
+	require.NoError(t, err)
+	return answer.RemainQuota
+}
+
 // The two row-first callers write the row themselves and then hand the same
 // delta to the cache. Measured before the fix under batch accumulation, that
 // sequence left cache=60 against row=100 (the debit was applied twice): the

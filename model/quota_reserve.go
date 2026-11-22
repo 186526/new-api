@@ -49,9 +49,21 @@ var ErrPreLedgerHashCarriesNoSignature = errors.New("cached user hash carries no
 // QuotaGranted, UsedQuota and the expiry), so damage to any of them lands here,
 // and the answer must stay away from the database row for the same reason: under
 // batch accumulation the row predates the debit the accumulator still owes it. A
-// reservation refuses such a hash and leaves it in place for its own TTL, after
-// which the next read seeds a ledger from the balance the accumulator holds.
+// reservation refuses such a hash and leaves it in place; the read path
+// republishes a hash that carries no MAC at all, signing the counter the hash
+// still holds, and leaves a hash that still carries its MAC to its own TTL.
 var ErrPreLedgerTokenHashCarriesNoSignature = errors.New("cached token hash carries no signed quota ledger")
+
+// ErrDamagedTokenQuotaLedger reports a token hash that still carries a
+// QuotaLedgerMAC but has lost a field that signature covers. It wraps
+// ErrPreLedgerTokenHashCarriesNoSignature, because the reservation answers both
+// the same way: refused, never from the row. The read path keeps them apart. A
+// hash with no MAC at all is reported stale and rebuilt, and the rebuild signs
+// the counter the hash still holds. One whose MAC is still on it cannot be
+// repaired that way, because the seed only signs a hash that carries no MAC at
+// all; the read keeps answering it from the mirror plus the accumulator's owed
+// delta and the hash waits out its own TTL.
+var ErrDamagedTokenQuotaLedger = fmt.Errorf("%w: a field the signature covers is gone or changed", ErrPreLedgerTokenHashCarriesNoSignature)
 
 // errQuotaLedgerBoundsRefused reports a committed delta the signed ledger cannot
 // hold. The counter is left alone so the cached balance stays below the
@@ -159,14 +171,23 @@ end
 local function unsubtract(key, field, amount)
   redis.call('HINCRBY', key, field, amount)
 end
+-- subtractSigned derives a mirror from a counter whose sign is already known
+-- good. A negative counter adds to the mirror instead of subtracting from it,
+-- because HINCRBY has no "--5".
+local function subtractSigned(key, field, raw)
+  local sign, digits = magnitude(raw)
+  if sign == nil or digits == '0' then return end
+  if sign == '-' then
+    redis.call('HINCRBY', key, field, digits)
+  else
+    redis.call('HINCRBY', key, field, '-' .. digits)
+  end
+end
 local function mirrorFrom(key, mirror, total, used)
   redis.call('HSET', key, mirror, redis.call('HGET', key, total))
-  local usedSign, usedDigits = magnitude(redis.call('HGET', key, used))
   -- HINCRBY has no "-0", and subtracting zero adds nothing, so a zero counter
   -- is left alone instead of subtracted.
-  if usedSign ~= nil and usedSign == '' and usedDigits ~= '0' then
-    redis.call('HINCRBY', key, mirror, '-' .. usedDigits)
-  end
+  subtractSigned(key, mirror, redis.call('HGET', key, used) or '0')
 end
 `
 
@@ -344,10 +365,15 @@ local expiry = redis.call('HGET', KEYS[1], 'QuotaLedgerExp')
 local grantedSign, grantedDigits = magnitude(granted)
 local usedSign, usedDigits = magnitude(used)
 local expirySign, expiryDigits = magnitude(expiry)
--- used may exceed granted: the remainder is then a debt, as on the user side,
--- so only the counters themselves have to stay non-negative.
+-- granted may not be negative, because nothing credits a token beyond what its
+-- row holds. used may be: IncreaseTokenQuota refunds a charge by lowering
+-- used_quota, and refunding one that never reached the row leaves a negative
+-- counter on a token that is still funded (remain 100 with used -5 means the
+-- token holds 100). The remainder is granted - used either way, so the mirror
+-- is derived from the sign rather than by subtracting a possibly negative
+-- string.
 if grantedSign == nil or usedSign == nil or expirySign == nil
-  or grantedSign == '-' or usedSign == '-' or expirySign == '-' then
+  or grantedSign == '-' or expirySign == '-' then
   return -2
 end
 -- As on the user side, the caller signed the counter it is about to write, and
@@ -750,8 +776,19 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 	// database row. Under batch accumulation that row predates the debit the
 	// accumulator still owes it, so a deleted field there handed the spend back.
 	if !tokenQuotaLedgerFieldsCarryASignature(fields, id, key) {
-		// Refused, not discarded: the hash is left in place for its own TTL, after
-		// which the next read seeds a ledger from the balance the accumulator holds.
+		// A hash that still carries a QuotaLedgerMAC but fails the signature is
+		// damaged: a field the signature covers was deleted or changed behind it.
+		// Reported apart from the unsigned hash, because a rebuild would sign the
+		// counters it finds and one of them is what was deleted; the read path keeps
+		// answering such a hash from its mirror for the rest of its TTL. The
+		// reservation treats both the same and refuses, never from the row.
+		//
+		// An unsigned hash is left in place too, but the next read republishes it:
+		// the seed signs the counter the hash still holds, so a debit that lives
+		// only in the ledger survives the repair.
+		if fields["QuotaLedgerMAC"] != "" {
+			return nil, cacheQuotaUnverified, ErrDamagedTokenQuotaLedger
+		}
 		return nil, cacheQuotaUnverified, ErrPreLedgerTokenHashCarriesNoSignature
 	}
 	cachedID, err := requireSignedTokenLayoutInt(fields, "Id")
@@ -784,9 +821,13 @@ func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuota
 	if !validAuthCacheMAC(expectedMAC, fields["QuotaLedgerMAC"], expiresAt) {
 		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the token ledger signature does not match", ErrQuotaLedgerUnverified)
 	}
-	if granted < 0 || used < 0 {
+	if granted < 0 {
 		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the token ledger counters contradict each other", ErrQuotaLedgerUnverified)
 	}
+	// used may be negative: IncreaseTokenQuota refunds a charge by lowering
+	// used_quota, and a refund of a charge that never reached the row leaves the
+	// counter below zero on a token that is still funded. granted cap and the
+	// reserve script derive the remainder the same way either sign.
 	return &tokenQuotaLedger{
 		id: id, granted: granted, used: used,
 		expiresAt: expiresAt, mac: fields["QuotaLedgerMAC"],
@@ -821,13 +862,18 @@ func tokenQuotaLedgerFieldsCarryASignature(fields map[string]string, id int, key
 }
 
 // requireSignedTokenLayoutInt reads a field of a token hash whose ledger signature
-// already held. The token signature covers every field the reservation reads, so
-// any field this rejects has been deleted or made unparseable behind a signature
-// that still covers the rest; the hash is not this build's layout any more, and its
-// answer has to stay away from the database row, which under batch accumulation
-// predates the debit the accumulator still owes it. The error is therefore
-// ErrPreLedgerTokenHashCarriesNoSignature, not ErrQuotaLedgerUnverified, whose
-// callers discard the hash and reserve from the row.
+// already held. Only `Id` can reach it in a state it rejects: the signature covers
+// every other field the reservation reads, so a damaged `QuotaGranted`,
+// `UsedQuota` or `QuotaLedgerExp` fails `tokenQuotaLedgerFieldsCarryASignature`
+// first and never gets here. `Id` is different because
+// `tokenQuotaLedgerFieldsCarryASignature` rebuilds the MAC from the caller's id,
+// so the stored `Id` is not compared there at all: deleting or zeroing it leaves
+// a hash whose signature still matches the counters, and this read is the only
+// check left. The answer still has to stay away from the database row, which
+// under batch accumulation predates the debit the accumulator still owes it, so
+// the error is ErrPreLedgerTokenHashCarriesNoSignature, not
+// ErrQuotaLedgerUnverified, whose callers discard the hash and reserve from the
+// row.
 func requireSignedTokenLayoutInt(fields map[string]string, name string) (int64, error) {
 	value, err := parseLedgerInt(fields, name)
 	if err != nil {
@@ -1299,8 +1345,15 @@ func readUserQuotaRow(userID int) (int, error) {
 // snapshot total and used the counter the seed signs; the script only runs while
 // the hash still holds that counter, so an unflushed batch spend is neither lost
 // nor signed under a value nobody verified.
+//
+// used may be negative: IncreaseTokenQuota refunds a charge by lowering
+// used_quota, and refunding one that never reached the row leaves the counter
+// below zero on a token that is still funded. Refusing the row there published a
+// hash with no ledger at all, which every reservation then refused, so the token
+// stayed unspendable for its whole TTL and came back the same way. granted stays
+// non-negative, because nothing credits a token beyond what its row holds.
 func tokenQuotaLedgerSeedArgs(key string, id int, granted, used int64, ttlSeconds int) (string, int64, error) {
-	if granted < 0 || used < 0 {
+	if granted < 0 {
 		return "", 0, fmt.Errorf("token %d holds a negative granted quota", id)
 	}
 	expiresAt := nextLedgerExpiry(0, ttlSeconds)

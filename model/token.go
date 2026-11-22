@@ -282,12 +282,14 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+	needsRepair := false
 	if !fromDB && common.RedisEnabled {
 		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
 			return token, nil
 		}
+		needsRepair = errors.Is(err, errTokenCacheNeedsRepair)
 		// Don't return error - fall through to DB
 	}
 	token = &Token{}
@@ -299,6 +301,23 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// 初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
+		}
+		if needsRepair {
+			// The row's own counters are the pre-debit ones under batch
+			// accumulation, so the answer has to come from the ledger the republish
+			// just signed. A repair that did not sign leaves the hash as it was, and
+			// the answer then is the hash's mirror plus the owed delta — the same
+			// answer the read on the next request gets — never the row.
+			if repaired, cacheErr := cacheGetTokenByKey(key); cacheErr == nil {
+				return repaired, nil
+			}
+			var mirrored Token
+			if readErr := common.RedisHGetObj(getTokenCacheKey(key), &mirrored); readErr == nil {
+				mirrored.Key = key
+				if mirroredToken, mirrorErr := tokenFromItsMirror(&mirrored); mirrorErr == nil {
+					return mirroredToken, nil
+				}
+			}
 		}
 	}
 	return token, nil

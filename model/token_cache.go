@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -65,6 +66,14 @@ func invalidateTokenCacheForMutation(key string) error {
 	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
 }
 
+// errTokenCacheNeedsRepair reports a token hash that carries no ledger signature
+// this build produced. GetTokenByKey answers it from the database row and
+// republishes the hash, as GetUserCache does for "user cache schema is stale".
+// The caller re-reads the cache afterwards and answers from the signature the
+// republish produced, because the row's own balance is the pre-debit one under
+// batch accumulation.
+var errTokenCacheNeedsRepair = errors.New("token cache carries no signed quota ledger")
+
 // cacheInitToken publishes database metadata when the hash is cold or fails
 // verification. Existing quota counters survive repairs because pre-consume
 // can update Redis before the database catches up; counters that are no
@@ -78,6 +87,18 @@ func invalidateTokenCacheForMutation(key string) error {
 // above the snapshot is signed at that counter, and the seed script only runs
 // while the hash still holds it, so an unflushed batch spend is neither lost nor
 // signed under a value nobody verified.
+//
+// The seed only runs on a hash that carries no QuotaLedgerMAC at all. A hash that
+// still carries its MAC but lost a counter is not republished: the seed would
+// have to sign a counter it cannot see, and the only value left to sign is the
+// snapshot's pre-debit one. Such a hash keeps the mirror answer for the rest of
+// its TTL and the reservation refuses it (ErrDamagedTokenQuotaLedger).
+//
+// A negative UsedQuota is signed, not refused. IncreaseTokenQuota refunds a
+// charge by lowering used_quota, so refunding one that never reached the row
+// leaves a funded token with a counter below zero; refusing to seed it published
+// a hash with no ledger, which every reservation refused until the hash expired
+// and the next republish refused it the same way.
 //
 // The counters are compared as decimal strings and the remainder is derived
 // with HINCRBY, because a sum near the wallet ceiling loses its last digit when
@@ -159,12 +180,23 @@ local seedLedger = function()
     'QuotaGranted', args.seed.granted, 'UsedQuota', args.seed.used,
     'RemainQuota', args.seed.granted,
     'QuotaLedgerMAC', args.seed.mac, 'QuotaLedgerExp', args.seed.expiresAt)
-  redis.call('HINCRBY', KEYS[1], 'RemainQuota', '-' .. args.seed.used)
+  subtractSigned(KEYS[1], 'RemainQuota', args.seed.used)
 end
 local exists = redis.call('EXISTS', KEYS[1])
 if exists == 1 and (ARGV[21] ~= 'true' or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[22]) then
   seedLedger()
-  redis.call('EXPIRE', KEYS[1], ARGV[18])
+  -- The hash only earns a longer life while it carries a ledger the reservation
+  -- can spend from. A repair that declined leaves a hash nobody can spend, and
+  -- renewing its TTL here would keep it alive past the row that has since caught
+  -- up: the refusal would then repeat for as long as traffic kept refreshing it.
+  -- Leaving the TTL alone lets the hash expire and the next read rebuild it from
+  -- the flushed row.
+  if redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
+    local ledgerExpiry = tonumber(redis.call('HGET', KEYS[1], 'QuotaLedgerExp') or '0')
+    if ledgerExpiry > tonumber(redis.call('TIME')[1]) * 1000 then
+      redis.call('EXPIRE', KEYS[1], ARGV[18])
+    end
+  end
   return 2
 end
 redis.call('HDEL', KEYS[1], 'DeletedAt')
@@ -254,12 +286,34 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 		token.RemainQuota = int(ledger.granted - ledger.used)
 		token.UsedQuota = int(ledger.used)
 		return &token, nil
+	} else if errors.Is(ledgerErr, ErrPreLedgerTokenHashCarriesNoSignature) && !errors.Is(ledgerErr, ErrDamagedTokenQuotaLedger) {
+		// The hash carries no ledger signature at all: the shape a hash written
+		// before this build signed token ledgers has. errTokenCacheNeedsRepair tells
+		// the caller to republish it from the row, as the user twin's
+		// "user cache schema is stale" does at cacheGetUserBase, and the caller
+		// answers from the signature that comes back.
+		//
+		// The republish is taken only when it lands. cacheInitToken signs the used
+		// counter the hash still holds, which keeps a debit recorded only in the
+		// ledger — the row never reached, the accumulator in another pod — but its
+		// seed declines when the hash no longer holds that counter, because then the
+		// only value it could sign is the row's pre-debit one.
+		return nil, errTokenCacheNeedsRepair
 	}
-	// The ledger is missing, forged or past its signed window. The mirror is the
-	// row as it was published, and under batch accumulation the row lags the
-	// spend the accumulator still owes it, so the mirror alone hands back quota
-	// already spent. The reported remainder is the mirror plus that owed delta,
-	// read as one instant.
+	// The ledger is damaged, or its signature is genuine but past the window. The
+	// mirror is the row as it was published, and under batch accumulation the row
+	// lags the spend the accumulator still owes it, so the mirror alone hands back
+	// quota already spent. The reported remainder is the mirror plus that owed
+	// delta, read as one instant.
+	return tokenFromItsMirror(&token)
+}
+
+// tokenFromItsMirror reports a token hash's counters when its ledger cannot answer
+// for them: the mirror the hash carries plus the delta the accumulator still owes
+// that row, read as one instant. It exists as its own function because
+// GetTokenByKey needs it after a repair it could not use, and the row it just read
+// is exactly what must not be handed back there.
+func tokenFromItsMirror(token *Token) (*Token, error) {
 	balance, balanceErr := quotaBalanceHeldByAccumulator(token.Id, BatchUpdateTypeTokenQuota, func() (int, error) {
 		return token.RemainQuota, nil
 	})
@@ -270,5 +324,5 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 		token.UsedQuota += token.RemainQuota - balance
 		token.RemainQuota = balance
 	}
-	return &token, nil
+	return token, nil
 }
