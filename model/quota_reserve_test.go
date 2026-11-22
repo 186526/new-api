@@ -2183,13 +2183,63 @@ func TestTokenWithANegativeUsedCounterIsSpendableAfterARepublish(t *testing.T) {
 	assert.Equal(t, 100, cached.RemainQuota)
 	assert.Equal(t, -5, cached.UsedQuota)
 
-	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 101, false)
+	// A spend that lands inside the negative region is not a refusal. Before the
+	// two write scripts were relaxed this was the gate the header's acceptance of
+	// a negative counter ran into: one unit was refused, and only a spend of five
+	// or more — one that carried the counter to zero — went through. A caller
+	// asking for one unit against a token the ledger says holds 100 was told the
+	// quota was insufficient.
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 1, false)
 	require.NoError(t, err)
-	assert.False(t, reserved, "the signed total caps the spend at 95")
+	assert.True(t, reserved, "one unit against a token holding 100 must be reservable")
+	assert.Equal(t, "-4", cacheQuotaField(t, key, "UsedQuota"), "the counter moved one unit into the negative region")
+	assert.Equal(t, "99", cacheQuotaField(t, key, "RemainQuota"), "and the mirror followed it")
 
 	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 100, false)
 	require.NoError(t, err)
-	assert.True(t, reserved, "the negative counter does not make the token unspendable")
+	assert.False(t, reserved, "the signed total caps the spend at 95, so 100 is refused after the unit")
+	assert.Equal(t, "-4", cacheQuotaField(t, key, "UsedQuota"), "the refused spend rolled back")
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 95, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the rest of the signed total is still spendable")
+	assert.Equal(t, "91", cacheQuotaField(t, key, "UsedQuota"))
+}
+
+// The compensation path releases a reservation this process took and could not
+// persist. On a token whose used counter is negative it moves the counter further
+// down, and the release script used to read that as a fault: measured on
+// granted=95 used=-5, reserve 10 left used=5 and cacheReleaseTokenQuota(10) came
+// back -3 (cacheQuotaInsufficient), so TryReserveTokenQuota's compensation branch
+// reported failure and the rolled-back reservation stayed charged.
+func TestTokenReleaseBelowAZeroCounterStillCompensates(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	token := createReserveTestToken(t, 100)
+	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).
+		Update("used_quota", -5).Error)
+	_, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+	require.Equal(t, "-5", cacheQuotaField(t, key, "UsedQuota"))
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 10, false)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	require.Equal(t, "5", cacheQuotaField(t, key, "UsedQuota"))
+
+	result, err := cacheReleaseTokenQuota(token.Id, token.Key, 10)
+	require.NoError(t, err)
+	assert.Equal(t, cacheQuotaOK, result, "a release on a token that is not in debt is a normal compensation")
+	assert.Equal(t, "-5", cacheQuotaField(t, key, "UsedQuota"), "the counters are back where they were")
+	assert.Equal(t, "100", cacheQuotaField(t, key, "RemainQuota"))
+	assert.Equal(t, "95", cacheQuotaField(t, key, "QuotaGranted"), "a release never moves the signed total")
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 1, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the token is spendable again after the compensation")
 }
 
 // A damaged hash answers from its mirror and must not keep being kept alive. The
@@ -2229,6 +2279,54 @@ func TestDamageTokenHashKeepsItsOwnTTLSoTheRowCanCatchUp(t *testing.T) {
 	assert.Less(t, ttlAfter, ttlBefore,
 		"a republish that could not sign must leave the TTL alone, so the hash expires (before=%s after=%s)",
 		ttlBefore, ttlAfter)
+}
+
+// The other direction of the same guard: a repair that DOES land signs a full
+// window, so it has to give the hash that window. Measured before this change
+// with the hash one second from expiry: the repair signed a 15-second ledger onto
+// a hash that vanished a second later, the next read rebuilt from a row the
+// accumulator had not caught up with (remain=100 used=0), and a reserve of 60
+// passed — handing the debit back seconds after the repair had preserved it.
+func TestARepairedTokenHashOutlivesTheRowCatchingUp(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	server := useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -60)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	require.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"))
+	require.Equal(t, 100, getTokenFromDB(t, token.Id).RemainQuota, "the row still holds the pre-debit balance")
+
+	// The hash is about to expire and lost only its signature, which is the shape
+	// the read path repairs.
+	require.NoError(t, common.RDB.HDel(t.Context(), key, "QuotaLedgerMAC").Err())
+	require.NoError(t, common.RDB.PExpire(t.Context(), key, time.Second).Err())
+
+	read, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, 40, read.RemainQuota, "the repaired ledger answers from the counter the hash held")
+	assert.NotEmpty(t, cacheQuotaField(t, key, "QuotaLedgerMAC"), "and the repair signed it")
+
+	// Waiting out the TTL the hash had before the repair must not lose it.
+	server.FastForward(2 * time.Second)
+	require.Equal(t, int64(1), common.RDB.Exists(t.Context(), key).Val(),
+		"a repaired hash keeps the window its new signature was signed for")
+	assert.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"))
+
+	reserved, err := TryReserveTokenQuota(token.Id, token.Key, 60, false)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the spend the repair preserved is still gone")
+
+	reserved, err = TryReserveTokenQuota(token.Id, token.Key, 40, false)
+	require.NoError(t, err)
+	assert.True(t, reserved, "and the rest of the repaired balance is spendable")
 }
 
 // The two row-first callers write the row themselves and then hand the same

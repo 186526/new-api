@@ -304,18 +304,28 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		}
 		if needsRepair {
 			// The row's own counters are the pre-debit ones under batch
-			// accumulation, so the answer has to come from the ledger the republish
-			// just signed. A repair that did not sign leaves the hash as it was, and
-			// the answer then is the hash's mirror plus the owed delta — the same
-			// answer the read on the next request gets — never the row.
+			// accumulation, so the counters have to come from the ledger the
+			// republish just signed. A repair that did not sign leaves the hash as it
+			// was, and the counters then are the hash's mirror plus the owed delta —
+			// the same answer the read on the next request gets — never the row's.
+			//
+			// Only the two quota counters are taken from the hash. They are the one
+			// part of it that the metadata MAC deliberately leaves out, and the
+			// mirror answer folds in the accumulator's owed delta; every other field
+			// this call returns (Status, ExpiredTime, ModelLimits, AllowIps,
+			// UnlimitedQuota, Group) stays the database row's, because the hash read
+			// here has not passed cacheGetTokenByKey's cacheMAC check and a writer
+			// holding only Redis access can change those without breaking anything.
 			if repaired, cacheErr := cacheGetTokenByKey(key); cacheErr == nil {
 				return repaired, nil
 			}
 			var mirrored Token
 			if readErr := common.RedisHGetObj(getTokenCacheKey(key), &mirrored); readErr == nil {
 				mirrored.Key = key
-				if mirroredToken, mirrorErr := tokenFromItsMirror(&mirrored); mirrorErr == nil {
-					return mirroredToken, nil
+				if counted, mirrorErr := tokenFromItsMirror(&mirrored); mirrorErr == nil {
+					token.RemainQuota = counted.RemainQuota
+					token.UsedQuota = counted.UsedQuota
+					return token, nil
 				}
 			}
 		}

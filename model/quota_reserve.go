@@ -416,7 +416,11 @@ end
 redis.call('HINCRBY', KEYS[1], 'UsedQuota', amountDigits)
 local after = redis.call('HGET', KEYS[1], 'UsedQuota')
 local afterSign, afterDigits = magnitude(after)
-if afterSign == nil or afterSign == '-' or compareMagnitude(afterDigits, grantedDigits) > 0 then
+-- A negative counter is a token that holds more than its signed total, which
+-- the header accepts and the seed signs, so a spend that lands inside that
+-- region is not a refusal. Only an unparseable counter and a spend that passes
+-- the signed total are; the former is damage, the latter is an empty token.
+if afterSign == nil or compareMagnitude(afterDigits, grantedDigits) > 0 then
   rollback(KEYS[1], 'UsedQuota', amountDigits)
   return 0
 end
@@ -441,6 +445,12 @@ return 1`
 // tokenQuotaReleaseScript returns quota the commit recorded as unspent. The
 // token hash has no credit path: IncreaseTokenQuota moves quota from the used
 // counter back to the remainder, so the granted total never changes.
+//
+// The counter may pass below zero here, and that is the compensation path's
+// normal case rather than a fault: a token seeded from a row whose used counter
+// was negative releases back into a negative counter. Refusing it reported the
+// reserve's own compensation as failed, so a reservation that had already been
+// rolled back stayed charged. The mirror follows the sign through subtractSigned.
 const tokenQuotaReleaseScript = tokenQuotaLedgerScriptHeader + `
 if not advancesExpiry() then
   return -1
@@ -448,7 +458,7 @@ end
 redis.call('HINCRBY', KEYS[1], 'UsedQuota', '-' .. amountDigits)
 local after = redis.call('HGET', KEYS[1], 'UsedQuota')
 local afterSign, _ = magnitude(after)
-if afterSign == nil or afterSign == '-' then
+if afterSign == nil then
   unsubtract(KEYS[1], 'UsedQuota', amountDigits)
   return -3
 end

@@ -165,14 +165,14 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
 end
 local seedLedger = function()
   if args.seed.mac == '' or redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
-    return
+    return false
   end
   -- The signature covers args.seed.used, so the seed only runs while the hash
   -- still holds that counter. A spend that landed since Go read it leaves the
   -- hash without a ledger instead of signing a value nobody verified.
   local liveUsed = redis.call('HGET', KEYS[1], 'UsedQuota')
   if liveUsed ~= nil and liveUsed ~= args.seed.used then
-    return
+    return false
   end
   -- The remainder is derived with HINCRBY because Lua would round a sum near
   -- 2^53.
@@ -181,17 +181,27 @@ local seedLedger = function()
     'RemainQuota', args.seed.granted,
     'QuotaLedgerMAC', args.seed.mac, 'QuotaLedgerExp', args.seed.expiresAt)
   subtractSigned(KEYS[1], 'RemainQuota', args.seed.used)
+  return true
 end
-	local exists = redis.call('EXISTS', KEYS[1])
+local exists = redis.call('EXISTS', KEYS[1])
 if exists == 1 and (ARGV[21] ~= 'true' or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[22]) then
-  seedLedger()
-  -- The hash only earns a longer life while it carries a ledger the reservation
-  -- can spend from, which Go decided from the signature before this script ran. A
-  -- repair that declined leaves a hash nobody can spend, and renewing its TTL
-  -- here would keep it alive past the row that has since caught up: the refusal
-  -- would then repeat for as long as traffic kept refreshing it. Leaving the TTL
-  -- alone lets the hash expire and the next read rebuild it from the flushed row.
-  if ARGV[24] == 'true' then
+  -- The seed reports whether it signed. A ledger it just wrote lives for a full
+  -- window, so it earns the hash that life: otherwise a repair that succeeded one
+  -- second before the hash expired published a 15-second signature onto a hash
+  -- that vanished a second later, and the next read rebuilt from a row the
+  -- accumulator had not caught up with yet — handing back the spend the repair
+  -- had just preserved.
+  local sealed = seedLedger()
+  -- A hash that was not sealed earns a longer life only while it already carries
+  -- a ledger the reservation can spend from, which Go decided from the signature
+  -- before this script ran. A repair that declined leaves a hash nobody can
+  -- spend, and renewing its TTL here would keep it alive past the row that has
+  -- since caught up: the refusal would then repeat for as long as traffic kept
+  -- refreshing it. Leaving the TTL alone lets the hash expire and the next read
+  -- rebuild it from the flushed row.
+  if sealed then
+    redis.call('PEXPIREAT', KEYS[1], args.seed.expiresAt)
+  elseif ARGV[24] == 'true' then
     redis.call('EXPIRE', KEYS[1], ARGV[18])
   end
   return 2
