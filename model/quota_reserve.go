@@ -581,13 +581,26 @@ func ledgerRefusalReason(err error) string {
 }
 
 func requireLedgerInt(fields map[string]string, name string) (int64, error) {
+	value, err := parseLedgerInt(fields, name)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrQuotaLedgerUnverified, err)
+	}
+	return value, nil
+}
+
+// parseLedgerInt reads one integer field of a hash. The error it returns says
+// what is wrong with the field and carries no sentinel, so each caller decides
+// which refusal it answers with: an unverifiable ledger is discarded and
+// answered from the row, while a hash whose layout is already known to be
+// unspendable is refused outright (see requireSignedLayoutInt).
+func parseLedgerInt(fields map[string]string, name string) (int64, error) {
 	raw, ok := fields[name]
 	if !ok || raw == "" {
-		return 0, fmt.Errorf("%w: the hash carries no %s", ErrQuotaLedgerUnverified, name)
+		return 0, fmt.Errorf("the hash carries no %s", name)
 	}
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %s is not an integer", ErrQuotaLedgerUnverified, name)
+		return 0, fmt.Errorf("%s is not an integer", name)
 	}
 	return value, nil
 }
@@ -606,24 +619,6 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 	if len(fields) == 0 {
 		return nil, cacheQuotaMiss, nil
 	}
-	id, err := requireLedgerInt(fields, "Id")
-	if err != nil {
-		return nil, cacheQuotaUnverified, err
-	}
-	if int(id) != userID {
-		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash belongs to user %d", ErrQuotaLedgerUnverified, id)
-	}
-	schema, err := requireLedgerInt(fields, "CacheSchema")
-	if err != nil {
-		return nil, cacheQuotaUnverified, err
-	}
-	authVersion, err := requireLedgerInt(fields, "AuthVersion")
-	if err != nil {
-		return nil, cacheQuotaUnverified, err
-	}
-	if authVersion <= 0 {
-		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash carries no authentication version", ErrQuotaLedgerUnverified)
-	}
 	// The layout is decided by the ledger signature, not by the schema number and
 	// not by the presence of the ledger fields. Every metadata write stamps
 	// writeUserCache's schema on the hash while adding no ledger, so a live
@@ -632,6 +627,12 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 	// decoder fills every field by name, so a writer holding only Redis access can
 	// add a marker that no signature covers. Either test would let one unsigned
 	// write spend from a hash whose balance was never signed.
+	//
+	// It is asked before any field is parsed, because every other answer has to
+	// stay away from the database row: the reservation discards an *unverified
+	// ledger* and answers it from the row, and under batch accumulation that row
+	// predates the debit the accumulator still owes it. A hash whose own parse
+	// failed used to take that route, so deleting one field handed the spend back.
 	if !userLedgerFieldsCarryASignature(fields, userID) {
 		// Typed apart from ErrQuotaLedgerUnverified on purpose: the reservation
 		// below answers an unverified *ledger* from the database row, and that
@@ -640,15 +641,37 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 		// own TTL rebuilds it from the database.
 		return nil, cacheQuotaUnverified, ErrPreLedgerHashCarriesNoSignature
 	}
-	credited, err := requireLedgerInt(fields, "QuotaCredited")
+	// The signature covers the counters and the expiry only, so the fields it
+	// leaves out can be deleted by a writer holding Redis access without breaking
+	// it. They are read through requireSignedLayoutInt, which keeps that damage on
+	// the refusal above instead of on the row.
+	id, err := requireSignedLayoutInt(fields, "Id")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	spent, err := requireLedgerInt(fields, "QuotaSpent")
+	if int(id) != userID {
+		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash belongs to user %d", ErrPreLedgerHashCarriesNoSignature, id)
+	}
+	schema, err := requireSignedLayoutInt(fields, "CacheSchema")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	expiresAt, err := requireLedgerInt(fields, "QuotaLedgerExp")
+	authVersion, err := requireSignedLayoutInt(fields, "AuthVersion")
+	if err != nil {
+		return nil, cacheQuotaUnverified, err
+	}
+	if authVersion <= 0 {
+		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash carries no authentication version", ErrPreLedgerHashCarriesNoSignature)
+	}
+	credited, err := requireSignedLayoutInt(fields, "QuotaCredited")
+	if err != nil {
+		return nil, cacheQuotaUnverified, err
+	}
+	spent, err := requireSignedLayoutInt(fields, "QuotaSpent")
+	if err != nil {
+		return nil, cacheQuotaUnverified, err
+	}
+	expiresAt, err := requireSignedLayoutInt(fields, "QuotaLedgerExp")
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
@@ -674,9 +697,9 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 // and the window is left to verifiedQuotaLedger, which answers with the balance
 // when it holds and reports the expiry when it does not.
 func userLedgerFieldsCarryASignature(fields map[string]string, userID int) bool {
-	credited, creditedErr := requireLedgerInt(fields, "QuotaCredited")
-	spent, spentErr := requireLedgerInt(fields, "QuotaSpent")
-	expiresAt, expiresErr := requireLedgerInt(fields, "QuotaLedgerExp")
+	credited, creditedErr := parseLedgerInt(fields, "QuotaCredited")
+	spent, spentErr := parseLedgerInt(fields, "QuotaSpent")
+	expiresAt, expiresErr := parseLedgerInt(fields, "QuotaLedgerExp")
 	if creditedErr != nil || spentErr != nil || expiresErr != nil {
 		return false
 	}
@@ -684,6 +707,23 @@ func userLedgerFieldsCarryASignature(fields map[string]string, userID int) bool 
 		Id: userID, QuotaCredited: credited, QuotaSpent: spent,
 		QuotaLedgerMAC: fields["QuotaLedgerMAC"], QuotaLedgerExp: expiresAt,
 	}.carriesSignedLedger()
+}
+
+// requireSignedLayoutInt reads a field of a hash whose ledger signature already
+// held. The signature covers the counters and the expiry, not Id, CacheSchema or
+// AuthVersion, so a writer holding Redis access can delete or zero one of those
+// and leave a verifiable ledger behind. Such a hash is not this build's layout
+// any more, and the answer has to stay away from the database row for the same
+// reason the pre-ledger refusal exists: under batch accumulation that row
+// predates the debit the accumulator still owes it. The error is therefore
+// ErrPreLedgerHashCarriesNoSignature, not ErrQuotaLedgerUnverified, whose
+// callers discard the hash and reserve from the row.
+func requireSignedLayoutInt(fields map[string]string, name string) (int64, error) {
+	value, err := parseLedgerInt(fields, name)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrPreLedgerHashCarriesNoSignature, err)
+	}
+	return value, nil
 }
 
 func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuotaResult, error) {

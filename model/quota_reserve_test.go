@@ -1888,6 +1888,81 @@ func TestNoUnsignedFieldMovesAPreLedgerHashIntoThePermissiveBranch(t *testing.T)
 	})
 }
 
+// A signed ledger with a field deleted must be refused, not answered from the
+// row. requireLedgerInt used to run before the layout decision, so a hash whose
+// Id, CacheSchema or AuthVersion had been deleted failed as
+// ErrQuotaLedgerUnverified, and reserveUserQuotaCached routes that error to
+// discardUnverifiedUserQuotaCache plus reserveUserQuotaFromRow. Under batch
+// accumulation that row is the pre-debit balance the guard exists to keep
+// unspendable, so deleting one field handed the spend back.
+//
+// The shape here puts the debit in the signed ledger alone: wallet 100, ledger
+// credited 100 and spent 60, row still 100, and this process's accumulator empty
+// because the debit sits in another pod. A reservation of 60 against the row
+// fits and spends quota the wallet no longer holds.
+//
+// Measured on the parent commit, four sub-cases failed and three already passed.
+// deleted Id, deleted CacheSchema, deleted AuthVersion and zeroed AuthVersion
+// each returned reserved=true with a nil error and took the row from 100 to 40,
+// the log naming the missing field and saying it was reserving from the database.
+// deleted QuotaCredited, deleted QuotaSpent and deleted QuotaLedgerExp passed
+// then as they pass now, because the layout question parses exactly those three
+// and answered false for them.
+func TestReserveRefusesASignedLedgerWithADeletedField(t *testing.T) {
+	seedLedgerOnlyDebit := func(t *testing.T) (User, string) {
+		t.Helper()
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		useUserCacheMiniRedis(t)
+		common.BatchUpdateEnabled = true
+
+		user := createReserveTestUser(t, 100)
+		require.NoError(t, populateUserCache(user))
+		key := getUserCacheKey(user.Id)
+
+		// The debit lives in the signed ledger only: the row still holds the
+		// pre-debit 100 and this process's accumulator never saw the spend.
+		result, err := cacheApplyUserQuotaDelta(user.Id, -60)
+		require.NoError(t, err)
+		require.Equal(t, cacheQuotaOK, result)
+		require.Equal(t, "60", cacheQuotaField(t, key, "QuotaSpent"))
+		require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the row still holds the pre-debit balance")
+		require.Zero(t, unflushedQuotaDelta(user.Id, BatchUpdateTypeUserQuota),
+			"the debit is held outside this process's accumulator, which is what makes the row fallback a double spend")
+		return user, key
+	}
+
+	assertRefused := func(t *testing.T, user User, key string, damage string) {
+		t.Helper()
+		reserved, err := TryReserveUserQuota(user.Id, 60)
+		rowAfter := getUserQuotaFromDB(t, user.Id)
+		require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+			"a signed ledger %s is refused rather than answered from the row (reserved=%t, row=%d)",
+			damage, reserved, rowAfter)
+		assert.False(t, reserved)
+		assert.Equal(t, 100, rowAfter, "the pre-debit row must not fund the spend")
+		assert.Equal(t, int64(1), common.RDB.Exists(t.Context(), key).Val(),
+			"the refusal leaves the hash in place for its own TTL to rebuild")
+	}
+
+	for _, field := range []string{"Id", "CacheSchema", "AuthVersion", "QuotaCredited", "QuotaSpent", "QuotaLedgerExp"} {
+		t.Run("deleted "+field, func(t *testing.T) {
+			user, key := seedLedgerOnlyDebit(t)
+			require.NoError(t, common.RDB.HDel(t.Context(), key, field).Err())
+			assertRefused(t, user, key, "with "+field+" deleted")
+		})
+	}
+
+	// AuthVersion is outside the ledger MAC, so zeroing it leaves the counters
+	// signed; the check that it is positive is all that stands between that hash
+	// and the row.
+	t.Run("zeroed AuthVersion", func(t *testing.T) {
+		user, key := seedLedgerOnlyDebit(t)
+		require.NoError(t, common.RDB.HSet(t.Context(), key, "AuthVersion", 0).Err())
+		assertRefused(t, user, key, "with AuthVersion zeroed")
+	})
+}
+
 // The two row-first callers write the row themselves and then hand the same
 // delta to the cache. Measured before the fix under batch accumulation, that
 // sequence left cache=60 against row=100 (the debit was applied twice): the
