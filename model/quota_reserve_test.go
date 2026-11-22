@@ -3325,3 +3325,51 @@ func TestBatchQueuedTokenCreditFundsTheReserve(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, reserved, "the token holds 10")
 }
+
+// GetTokenByKey's mirror fallback answers a hash the repair could not sign. That
+// hash has not passed cacheGetTokenByKey's cacheMAC check, so it must not supply
+// the metadata the caller acts on: Status, ExpiredTime, ModelLimits, AllowIps,
+// UnlimitedQuota and Group are what authorization and channel routing read, and a
+// writer holding only Redis access can rewrite them. Measured before the fix, a
+// hash carrying Status=disabled and ModelLimits=hash-model behind a freshly signed
+// metadata MAC came back as exactly that; the row said enabled and row-model.
+func TestTokenMirrorFallbackKeepsTheRowMetadata(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	token := createReserveTestToken(t, 100)
+	token.ModelLimits = "row-model"
+	token.ModelLimitsEnabled = true
+	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).
+		Updates(map[string]any{"model_limits": "row-model", "model_limits_enabled": true}).Error)
+
+	_, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	key := getTokenCacheKey(token.Key)
+
+	_, err = cacheApplyTokenQuotaDelta(token.Id, token.Key, -60)
+	require.NoError(t, err)
+	require.Equal(t, "60", cacheQuotaField(t, key, "UsedQuota"))
+
+	// The metadata is rewritten with a matching signature, so the hash passes the
+	// check this call makes and only the ledger is damaged. A repair is therefore
+	// the branch that answers, and it declines because UsedQuota is gone.
+	var live Token
+	require.NoError(t, common.RedisHGetObj(key, &live))
+	live.Key = token.Key
+	live.Status = common.TokenStatusDisabled
+	live.ModelLimits = "hash-model"
+	mac, err := live.cacheMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), key,
+		"Status", live.Status, "ModelLimits", live.ModelLimits, "CacheMAC", mac).Err())
+	require.NoError(t, common.RDB.HDel(t.Context(), key, "QuotaLedgerMAC", "UsedQuota").Err())
+
+	read, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusEnabled, read.Status, "the status is the row's")
+	assert.Equal(t, "row-model", read.ModelLimits, "the model limits are the row's")
+	assert.Equal(t, 40, read.RemainQuota, "the counters are the mirror's, which still carries the debit")
+}
