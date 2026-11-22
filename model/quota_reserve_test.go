@@ -1338,14 +1338,57 @@ func TestLiveSchema2HashIsRebuiltFromTheFlushedRow(t *testing.T) {
 	assert.False(t, reserved)
 }
 
+// The shape the upgrade actually meets: the debit lives in the previous pod's
+// memory, so this process's accumulator is empty and the fold in
+// quotaBalanceHeldByAccumulator cannot see it. The rebuild then signs the row,
+// which still reads the pre-debit balance, and the read hands back quota the old
+// pod already spent. That residue is documented in new-api/AGENTS.md and
+// mitigated by the drained restart, not fixed here, so this test pins it: it
+// keeps a change to seedUserQuotaLedger or the read path from silently moving
+// the window. Measured 100 with no error, and a 60-unit reservation accepted.
+func TestLiveSchema2HashWithNoLocalAccumulatorReadsTheRow(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	key := seedLiveSchema2UserHash(t, user, 40)
+	// Deliberately no setUnflushedQuotaDelta: the spend was queued in the pod that
+	// this process replaced, so the accumulator here holds nothing for this user.
+	assert.Equal(t, 0, batchUpdateStores[BatchUpdateTypeUserQuota][user.Id],
+		"the accumulator is empty, which is what makes this the cross-process shape")
+
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 100, balance,
+		"with an empty accumulator the rebuild signs the row, so the read returns the pre-debit balance")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the row still holds the pre-debit balance")
+
+	assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+	assert.Equal(t, "100", cacheQuotaField(t, key, "QuotaCredited"),
+		"the rebuilt ledger signs the row, because this process cannot see the old pod's debit")
+
+	// The residue is spendable: 60 on top of a wallet that really holds 40.
+	reserved, err := TryReserveUserQuota(user.Id, 60)
+	require.NoError(t, err)
+	assert.True(t, reserved,
+		"the cross-process debit is invisible here, so the reservation is accepted")
+	reserved, err = TryReserveUserQuota(user.Id, 41)
+	require.NoError(t, err)
+	assert.False(t, reserved, "what the ledger now carries is the 100 it was signed from")
+}
+
 // An unsigned schema raise must not inflate the balance a read reports. CacheSchema
 // sits inside the metadata MAC, so one HSET invalidates the metadata signature and
-// the read discards the hash; the balance must still be 90 of 100, not the row's
-// 100. Two things keep it there, and this pins the pair: the ledger fields survive
-// the rebuild because seedUserQuotaLedger refuses to sign over an existing
-// QuotaLedgerMAC, and the read path folds the accumulator's owed delta in when it
-// has to answer from the row instead. Measured before the fold existed, the same
-// HSET reported 100 and put 100 into the request context.
+// the read rejects the hash and republishes it from the database. Rejects, not
+// deletes: the reserve path is what discards an unverifiable hash (see
+// new-api/AGENTS.md), and this read leaves the key alive. The balance must still be
+// 90 of 100, not the row's 100. Two things keep it there, and this pins the pair:
+// the ledger fields survive the rebuild because seedUserQuotaLedger refuses to sign
+// over an existing QuotaLedgerMAC, and the read path folds the accumulator's owed
+// delta in when it has to answer from the row instead. Measured before the fold
+// existed, the same HSET reported 100 and put 100 into the request context.
 func TestAnUnsignedSchemaRaiseKeepsTheSignedBalance(t *testing.T) {
 	for _, raised := range []int{ledgerV2SchemaVersion, userCacheSchemaVersion + 1} {
 		t.Run(fmt.Sprintf("CacheSchema set to %d", raised), func(t *testing.T) {
