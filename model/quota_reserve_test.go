@@ -1403,6 +1403,55 @@ func TestLiveSchema2HashIsRebuiltFromTheFlushedRow(t *testing.T) {
 	assert.False(t, reserved)
 }
 
+// The seed signs a spend counter that is always zero, so the mirror it derives
+// must not be written as an increment by a concatenated sign: `'-' .. '0'` is
+// "-0", which real Redis rejects with "ERR value is not an integer or out of
+// range" on @user_script:64 of the seed script. The HSET above it has already
+// landed by then, so the ledger is written and the caller still returns an error,
+// which is the startup line `failed to synchronously populate user cache` the
+// admin pod printed. miniredis accepts "-0", so the return value alone cannot
+// tell the two scripts apart; the script's own shape is what this case holds.
+func TestUserLedgerSeedDoesNotSubtractAZeroString(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+
+	user := createReserveTestUser(t, 100)
+	key := getUserCacheKey(user.Id)
+	require.NoError(t, writeUserCache(user.ToBaseUser(), true))
+	assert.Equal(t, "", cacheQuotaField(t, key, "QuotaLedgerMAC"),
+		"the metadata write leaves the hash with no ledger for the seed to publish")
+
+	expiresAt := nextLedgerExpiry(0, userCacheTTLSeconds())
+	mac, err := (UserBase{Id: user.Id, QuotaCredited: 100, QuotaLedgerExp: expiresAt}).quotaLedgerMAC()
+	require.NoError(t, err)
+	raw, err := evalLedgerScript(userQuotaLedgerSeedScript, key, userQuotaLedgerArgs{
+		Id: user.Id, Schema: userCacheSchemaVersion, AuthVersion: user.AuthVersion,
+		Credited: ledgerDecimal(100), Spent: ledgerDecimal(0),
+		NextExpiry: ledgerDecimal(expiresAt), NextMAC: mac,
+	})
+	require.NoError(t, err, "real Redis refuses the seed here, so the script has to run clean under any engine")
+	assert.Equal(t, 1, raw, "the seed publishes the ledger, it does not refuse it")
+	assert.Equal(t, "100", cacheQuotaField(t, key, "Quota"),
+		"the mirror is derived from credited minus spent")
+
+	// A zero spend is skipped instead of subtracted: the tail derives the mirror
+	// through subtractSigned and never concatenates a sign onto a counter.
+	assert.Contains(t, userQuotaLedgerSeedTail, "mirrorFrom(KEYS[1], 'Quota', 'QuotaCredited', 'QuotaSpent')",
+		"the seed derives the mirror the way every other ledger write does")
+	assert.NotContains(t, userQuotaLedgerSeedTail, "'-' ..",
+		"a sign concatenated onto a counter can spell \"-0\", which real Redis rejects")
+
+	// The production entry point returns nil on the same state, which is the
+	// assertion the startup log failed on.
+	require.NoError(t, common.RDB.HDel(t.Context(), key,
+		"QuotaCredited", "QuotaSpent", "QuotaLedgerMAC", "QuotaLedgerExp").Err())
+	require.NoError(t, populateUserCache(user), "populating the cache must not report a seed failure")
+	assert.Equal(t, "100", cacheQuotaField(t, key, "QuotaCredited"))
+	assert.Equal(t, "0", cacheQuotaField(t, key, "QuotaSpent"))
+	assert.Equal(t, "100", cacheQuotaField(t, key, "Quota"))
+}
+
 // The shape the upgrade actually meets: the debit lives in the previous pod's
 // memory, so this process's accumulator is empty and the fold in
 // quotaBalanceHeldByAccumulator cannot see it. The rebuild then signs the row,

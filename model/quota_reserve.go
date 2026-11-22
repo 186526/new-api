@@ -326,7 +326,12 @@ return 1`
 // and the script refuses to run when the hash is already signed. The total is
 // written as the exact decimal Go formatted, because Lua would round it to a
 // double.
-const userQuotaLedgerSeedScript = quotaLedgerLuaHelpers + `
+const userQuotaLedgerSeedScript = quotaLedgerLuaHelpers + userQuotaLedgerSeedTail
+
+// userQuotaLedgerSeedTail is the seed's own statements, kept apart from the
+// helpers every ledger script shares so a test can hold the shape this build
+// writes to what real Redis accepts.
+const userQuotaLedgerSeedTail = `
 if redis.call('HEXISTS', KEYS[1], 'QuotaLedgerMAC') == 1 then
   return 0
 end
@@ -343,11 +348,14 @@ end
 -- credited and spent reproduce the balance the wallet holds, which is the row
 -- once the debit the accumulator still owes it is taken into account. The
 -- mirror Quota is derived from them rather than written from the row, because
--- the row lags under batch accumulation.
+-- the row lags under batch accumulation. It runs through mirrorFrom, so a zero
+-- spent counter is skipped instead of subtracted: HINCRBY has no "-0", and a
+-- real Redis answers "ERR value is not an integer or out of range" for it after
+-- the HSET above has already landed. miniredis accepts "-0", so only a runtime
+-- that checks the increment rejects the concatenated form.
 redis.call('HSET', KEYS[1], 'QuotaCredited', args.credited, 'QuotaSpent', args.spent,
-  'QuotaLedgerExp', args.nextExpiry, 'QuotaLedgerMAC', args.nextMAC, 'Quota', 0)
-redis.call('HINCRBY', KEYS[1], 'Quota', args.credited)
-redis.call('HINCRBY', KEYS[1], 'Quota', '-' .. args.spent)
+  'QuotaLedgerExp', args.nextExpiry, 'QuotaLedgerMAC', args.nextMAC)
+mirrorFrom(KEYS[1], 'Quota', 'QuotaCredited', 'QuotaSpent')
 return 1`
 
 // The token ledger mirrors the user one on the token hash: QuotaGranted and the
