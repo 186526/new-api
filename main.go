@@ -139,20 +139,14 @@ func main() {
 		go controller.StartAntigravityQuotaRefresh(controller.AntigravityQuotaRefreshInterval)
 	}
 
-	// Mistral exposes its monthly allowances only to the signed-in admin
-	// console, so they are refreshed from the configured session cookies.
-	if common.RunsAdmin() && (os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS") != "" ||
-		os.Getenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE") != "" ||
-		os.Getenv("MISTRAL_VIBE_QUOTA_COOKIE") != "") {
-		frequency := controller.MistralQuotaRefreshInterval
-		if raw := os.Getenv("MISTRAL_VIBE_QUOTA_FREQUENCY"); raw != "" {
-			minutes, err := strconv.Atoi(raw)
-			if err != nil || minutes <= 0 {
-				common.FatalLog(common.LogText("failed to parse MISTRAL_VIBE_QUOTA_FREQUENCY: %s", raw))
-			}
-			frequency = time.Duration(minutes) * time.Minute
-		}
-		go controller.StartMistralQuotaRefresh(frequency)
+	// Mistral reports its monthly allowances to the key or the console session an
+	// account entry carries, so the refresh is started by the entries the loader
+	// accepts rather than by one credential's environment variable. The context is
+	// cancelled at shutdown so the loop stops with the listener.
+	mistralQuotaCtx, stopMistralQuotaRefresh := context.WithCancel(context.Background())
+	defer stopMistralQuotaRefresh()
+	if common.RunsAdmin() {
+		startMistralQuotaRefreshIfConfigured(mistralQuotaCtx)
 	}
 
 	// Codex credential auto-refresh check every 10 minutes, refresh when expires within 1 day
@@ -306,6 +300,43 @@ func main() {
 		model.SaveQuotaDataCache()
 	}
 	common.SysLog(common.LogText("server exited"))
+}
+
+// startMistralQuotaRefreshIfConfigured starts the background allowance refresh
+// and reports whether it did. The entries decide, not the environment variable
+// that feeds one of them: an account reads its allowance with a key or with a
+// console session, so an entry that carries a key alone is as configured as one
+// that carries a cookie. A configuration that does not load is reported and
+// leaves the refresh off, because an unreadable file is a mistake to surface
+// rather than a reason to poll.
+func startMistralQuotaRefreshIfConfigured(ctx context.Context) bool {
+	accounts, err := service.LoadMistralQuotaAccounts()
+	if err != nil {
+		common.SysError(common.LogText(
+			"failed to load the Mistral quota accounts, so their allowance is not refreshed: %s", err.Error()))
+		return false
+	}
+	if len(accounts) == 0 {
+		return false
+	}
+	go controller.StartMistralQuotaRefresh(ctx, mistralQuotaRefreshFrequency())
+	return true
+}
+
+// mistralQuotaRefreshFrequency reads the configured refresh period. The variable
+// is optional; a value that is not a positive number stops the process, because
+// a typo would otherwise silently poll at the default period instead.
+func mistralQuotaRefreshFrequency() time.Duration {
+	frequency := controller.MistralQuotaRefreshInterval
+	raw := os.Getenv("MISTRAL_VIBE_QUOTA_FREQUENCY")
+	if raw == "" {
+		return frequency
+	}
+	minutes, err := strconv.Atoi(raw)
+	if err != nil || minutes <= 0 {
+		common.FatalLog(common.LogText("failed to parse MISTRAL_VIBE_QUOTA_FREQUENCY: %s", raw))
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 func InjectUmamiAnalytics() {

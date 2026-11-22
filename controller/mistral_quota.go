@@ -33,6 +33,14 @@ type mistralQuotaRefreshResult struct {
 }
 
 func refreshMistralQuotas() mistralQuotaRefreshResult {
+	return refreshMistralQuotasContext(context.Background())
+}
+
+// refreshMistralQuotasContext is the tick the loop runs. It takes the context so
+// a cancellation aborts the request in flight instead of letting the loop outlive
+// the process it serves, and so it stops between the accounts of one tick rather
+// than after the whole tick.
+func refreshMistralQuotasContext(ctx context.Context) mistralQuotaRefreshResult {
 	accounts, err := service.LoadMistralQuotaAccounts()
 	if err != nil {
 		common.SysError(common.LogText("failed to load Mistral quota accounts: %s", err.Error()))
@@ -51,6 +59,11 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 	missing := newMistralMissingChannels(accounts)
 	missing.recordChannels(channels)
 	for _, account := range accounts {
+		if err := ctx.Err(); err != nil {
+			// The loop is stopping, so the accounts not read yet are not a failed
+			// refresh: reporting one would put the next tick on the backoff.
+			return result
+		}
 		// The channel is resolved before the allowance is read, so the allowance
 		// is read with the key the channel actually calls the upstream with
 		// instead of the key recorded in the accounts file, and so the series of an
@@ -58,8 +71,11 @@ func refreshMistralQuotas() mistralQuotaRefreshResult {
 		// instead of reading as a live channel.
 		channel, orphaned := channels.resolve(account.Channel)
 		account.ChannelKey = mistralChannelKey(channel)
-		quota, err := client.Fetch(context.Background(), account)
+		quota, err := client.Fetch(ctx, account)
 		if err != nil {
+			if ctx.Err() != nil {
+				return result
+			}
 			result.failed = true
 			var authErr *service.MistralQuotaAuthError
 			if errors.As(err, &authErr) {
@@ -179,20 +195,33 @@ func mistralQuotaWindows(quota *service.MistralQuota) []appmetrics.QuotaWindow {
 	}}
 }
 
-// StartMistralQuotaRefresh polls the monthly allowances in the background. The
-// first lookup runs at startup so a restarted process does not report an empty
-// quota until the first tick. A rejected session backs off for up to an hour
-// instead of retrying a dead cookie at the normal cadence.
-func StartMistralQuotaRefresh(interval time.Duration) {
+// StartMistralQuotaRefresh polls the monthly allowances in the background until
+// ctx is cancelled. The first lookup runs at startup so a restarted process does
+// not report an empty quota until the first tick. A rejected credential backs off
+// for up to an hour instead of retrying a dead cookie or a refused key at the
+// normal cadence.
+func StartMistralQuotaRefresh(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		return
 	}
 	wait := time.Duration(0)
 	for {
-		if wait > 0 {
-			time.Sleep(wait)
+		if err := ctx.Err(); err != nil {
+			return
 		}
-		result := refreshMistralQuotas()
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		result := refreshMistralQuotasContext(ctx)
+		if ctx.Err() != nil {
+			return
+		}
 		switch {
 		case result.authFailed:
 			wait = min(6*interval, mistralQuotaMaxBackoff)
