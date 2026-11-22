@@ -62,7 +62,8 @@ func mistralQuotaGateAccounts(channel string) string {
 // shape the old gate refused: its disjunction listed the two accounts sources and
 // the cookie, so a channel and a key with no cookie started nothing. The accounts
 // file is not that case — the old gate started on the path alone — so it covers the
-// loader, which accepts a key-only entry, rather than the gate.
+// loader, which accepts a key-only entry, rather than the gate. The file source's
+// gate case is TestMistralQuotaRefreshStaysOffForAnAccountsFileWithoutEntries.
 func TestMistralQuotaRefreshStartsForAKeyOnlyEntry(t *testing.T) {
 	sources := []struct {
 		name  string
@@ -161,6 +162,23 @@ func TestMistralQuotaRefreshStaysOffForAnUnloadableConfiguration(t *testing.T) {
 	assert.False(t, started)
 	assert.Contains(t, captured.String(), "failed to load the Mistral quota accounts")
 	assert.Zero(t, asked.Load(), "a file that does not load must not reach Mistral")
+}
+
+// TestMistralQuotaRefreshStaysOffForAnAccountsFileWithoutEntries is the file
+// source's gate case. The old gate started on a non-empty path alone, so it
+// started the loop for this file and polled with a loader that returned no entry.
+// The gate now reads what the loader returned, so it starts nothing.
+func TestMistralQuotaRefreshStaysOffForAnAccountsFileWithoutEntries(t *testing.T) {
+	mistralQuotaGateTestEnv(t)
+	asked := newMistralBillingServer(t, 25, 150)
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	require.NoError(t, os.WriteFile(path, []byte(`[]`), 0o600))
+	t.Setenv("MISTRAL_VIBE_QUOTA_ACCOUNTS_FILE", path)
+
+	started, stop := startMistralQuotaRefreshIfConfigured(t.Context())
+	t.Cleanup(stop)
+	assert.False(t, started, "a file that holds no entry must not start the refresh")
+	assert.Zero(t, asked.Load(), "a file that holds no entry must not reach Mistral")
 }
 
 // mistralQuotaGateTestEnv points every Mistral source at a server the caller
