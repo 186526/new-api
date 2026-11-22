@@ -1,6 +1,7 @@
 package model
 
 import (
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"strconv"
@@ -43,11 +44,11 @@ const ledgerV2SchemaVersion = 2
 //	QuotaSpent     every quota reserved out of it
 //
 // and Quota = QuotaCredited - QuotaSpent. Both counters are signed, together
-// with the identity, the authentication version and the expiry, so a writer can
-// move neither counter without the secret. Signing the live counter rather than
-// a baseline is what makes a rollback fail: every write signs the exact value it
-// leaves behind, so no earlier value of QuotaSpent carries a signature that
-// still matches, whether the writer rolls back part of the spend or all of it.
+// with the identity and the expiry, so a writer can move neither counter without
+// the secret. Signing the live counter rather than a baseline is what makes a
+// rollback fail: every write signs the exact value it leaves behind, so no
+// earlier value of QuotaSpent carries a signature that still matches, whether
+// the writer rolls back part of the spend or all of it.
 type UserBase struct {
 	Id             int    `json:"id"`
 	Group          string `json:"group"`
@@ -67,19 +68,45 @@ type UserBase struct {
 	CacheMAC       string `json:"-"`
 }
 
-// quotaLedgerMAC signs the fields a reservation must trust: the identity, the
-// authentication version, both counters and the expiry. Every write advances
-// the expiry, so a copy taken earlier always presents one the live hash has
-// moved past.
+// quotaLedgerMAC signs the fields a reservation must trust: the identity, both
+// counters and the expiry. Every write advances the expiry, so a copy taken
+// earlier always presents one the live hash has moved past. The token ledger is
+// signed the same way (see tokenQuotaLedgerMAC).
+//
+// The authentication version and the schema number stay outside the signature,
+// because both move on writes that never touch the ledger:
+// IncrementUserAuthVersionWithTx raises the version for a password, 2FA or
+// passkey change and only PublishUserAuthCache re-signs the metadata afterwards,
+// while writeUserCache stamps its own schema on every metadata write. Signing
+// either one would break a live ledger on the first such write, and a broken
+// ledger is a hash this build cannot spend from. Nothing is weakened: the
+// metadata MAC still covers the version, and every ledger script compares both
+// fields against the state the caller read.
 func (user UserBase) quotaLedgerMAC() (string, error) {
 	return authCacheMAC(getUserCacheKey(user.Id), struct {
 		Id            int
-		AuthVersion   int64
-		CacheSchema   int
 		QuotaCredited int64
 		QuotaSpent    int64
 		ExpiresAt     int64
-	}{user.Id, user.AuthVersion, user.CacheSchema, user.QuotaCredited, user.QuotaSpent, user.QuotaLedgerExp})
+	}{user.Id, user.QuotaCredited, user.QuotaSpent, user.QuotaLedgerExp})
+}
+
+// carriesSignedLedger reports whether the hash carries a ledger signature this
+// build produced, regardless of the window it was signed for. It separates the
+// layout from a hash that only looks like it: the signature covers the counters
+// and the expiry, so a writer holding Redis access but not the secret cannot
+// produce one. The expiry is deliberately not compared to the clock here — an
+// expired ledger is still this layout, and answering it as a pre-ledger hash
+// would send the caller to the database row.
+func (user UserBase) carriesSignedLedger() bool {
+	if user.QuotaLedgerMAC == "" {
+		return false
+	}
+	mac, err := user.quotaLedgerMAC()
+	if err != nil {
+		return false
+	}
+	return hmac.Equal([]byte(mac), []byte(user.QuotaLedgerMAC))
 }
 
 // verifiedQuotaLedger checks the ledger this hash carries and returns the
@@ -246,11 +273,22 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if userCache.Id != userId || userCache.AuthVersion <= 0 {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
-	// A version 3 hash was published by this branch before the live counter was
-	// signed, on commits no deployed image contains (see userCacheSchemaVersion).
-	// Nothing migrates it: it is reported stale and rebuilt from the database, and
-	// the rebuild signs the balance the accumulator holds rather than the raw row.
-	if userCache.CacheSchema != userCacheSchemaVersion {
+	// A hash whose ledger signature holds is this build's layout, and it reports
+	// the balance the ledger implies whatever number sits in CacheSchema. The
+	// number does not identify the layout: writeUserCache stamps its own schema on
+	// every metadata write while adding no ledger, and a writer holding only Redis
+	// access can raise it. A hash without that signature is pre-ledger; no deployed
+	// image ever wrote a ledger, so nothing migrates it. It is reported stale and
+	// rebuilt from the database, and the rebuild signs the balance the accumulator
+	// holds rather than the raw row.
+	//
+	// A newer schema carries a layout this build does not know, so it is reported
+	// stale before the signature is consulted: a rollback rebuilds it from the
+	// database instead of reading fields this build may not understand.
+	if userCache.CacheSchema > userCacheSchemaVersion {
+		return nil, fmt.Errorf("user cache schema is newer than this build")
+	}
+	if !userCache.carriesSignedLedger() {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
 	mac, err := userCache.cacheMAC()
@@ -258,13 +296,13 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 		return nil, fmt.Errorf("user cache integrity check failed")
 	}
 	// Quota is outside the metadata MAC, so the stored value is only a mirror.
-	// A hash carrying a valid ledger reports the balance the ledger implies. One
-	// whose ledger is missing, forged or past its signed window must not report
-	// the row either, because under batch accumulation the row lags the spend the
-	// accumulator still owes it: a ledger one second past its window would hand
-	// back the whole pre-debit balance. The balance reported instead is the row
-	// plus that owed delta, read as one instant, and the caller that finds the
-	// ledger unusable republishes it rather than trusting either half.
+	// A hash whose signed window is still open reports the balance the ledger
+	// implies. One past its window must not report the row either, because under
+	// batch accumulation the row lags the spend the accumulator still owes it: a
+	// ledger one second past its window would hand back the whole pre-debit
+	// balance. The balance reported instead is the row plus that owed delta, read
+	// as one instant, and the caller that finds the window closed republishes it
+	// rather than trusting either half.
 	balance, ledgerErr := userCache.verifiedQuotaLedger()
 	if ledgerErr != nil {
 		balance, err = quotaBalanceHeldByAccumulator(userId, BatchUpdateTypeUserQuota, func() (int, error) {

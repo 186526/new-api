@@ -28,6 +28,18 @@ const (
 // but the balance derived from that state must not authorize a spend.
 var ErrQuotaLedgerUnverified = errors.New("cached quota ledger failed verification")
 
+// ErrPreLedgerHashCarriesNoSignature reports a user hash that carries no ledger
+// signature this build produced. Every deployed image wrote userCacheSchemaVersion
+// 2 with no ledger at all, and no metadata write signs the ledger fields, so such
+// a hash can appear at any schema number: a settings save stamps the current one,
+// and a writer holding only Redis access can raise it. Its balance lives in the
+// unsigned Quota mirror alone, and neither the mirror nor the database row is
+// safe to spend from — under batch accumulation the row predates the spend the
+// accumulator still owes it. A reservation therefore refuses it outright instead
+// of discarding it and answering from the row; only the read path rebuilds it,
+// and the rebuild signs the balance the accumulator holds.
+var ErrPreLedgerHashCarriesNoSignature = errors.New("cached user hash carries no signed quota ledger")
+
 // errQuotaLedgerBoundsRefused reports a committed delta the signed ledger cannot
 // hold. The counter is left alone so the cached balance stays below the
 // committed one until the hash is reloaded from the database.
@@ -74,8 +86,14 @@ func quotaLedgerStripe(subject int) *sync.Mutex {
 //	QuotaSpent     every quota reserved out of it
 //
 // The spendable balance is QuotaCredited - QuotaSpent, and Quota only mirrors
-// it. The ledger MAC binds the user, the authentication version, the schema,
-// both counters and the expiry.
+// it. The ledger MAC binds the user, both counters and the expiry. The
+// authentication version and the schema number sit outside it: both move on
+// writes that never touch the ledger (a password, 2FA or passkey change raises
+// the version, and every metadata write stamps its own schema), so signing them
+// would break a live ledger on the first such write, and the reservation would
+// then have no signed ledger to spend from. The metadata MAC still covers the
+// version, and the scripts below still compare both fields against the state the
+// caller read.
 //
 // Signing the live counter is what makes a rollback impossible: every write
 // signs the exact value it leaves behind, so no earlier value of QuotaSpent
@@ -603,8 +621,24 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 	if err != nil {
 		return nil, cacheQuotaUnverified, err
 	}
-	if int(schema) != userCacheSchemaVersion || authVersion <= 0 {
-		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash predates the quota ledger", ErrQuotaLedgerUnverified)
+	if authVersion <= 0 {
+		return nil, cacheQuotaUnverified, fmt.Errorf("%w: the hash carries no authentication version", ErrQuotaLedgerUnverified)
+	}
+	// The layout is decided by the ledger signature, not by the schema number and
+	// not by the presence of the ledger fields. Every metadata write stamps
+	// writeUserCache's schema on the hash while adding no ledger, so a live
+	// pre-ledger hash reaches the current number the first time the user saves
+	// anything; and cacheMAC zeroes the ledger fields before signing while the
+	// decoder fills every field by name, so a writer holding only Redis access can
+	// add a marker that no signature covers. Either test would let one unsigned
+	// write spend from a hash whose balance was never signed.
+	if !userLedgerFieldsCarryASignature(fields, userID) {
+		// Typed apart from ErrQuotaLedgerUnverified on purpose: the reservation
+		// below answers an unverified *ledger* from the database row, and that
+		// answer is the pre-debit balance this check exists to keep unspendable.
+		// A hash with no signed ledger is refused instead, and left in place so its
+		// own TTL rebuilds it from the database.
+		return nil, cacheQuotaUnverified, ErrPreLedgerHashCarriesNoSignature
 	}
 	credited, err := requireLedgerInt(fields, "QuotaCredited")
 	if err != nil {
@@ -619,8 +653,7 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 		return nil, cacheQuotaUnverified, err
 	}
 	signed := UserBase{
-		Id: userID, AuthVersion: authVersion, CacheSchema: int(schema),
-		QuotaCredited: credited, QuotaSpent: spent,
+		Id: userID, QuotaCredited: credited, QuotaSpent: spent,
 		QuotaLedgerMAC: fields["QuotaLedgerMAC"], QuotaLedgerExp: expiresAt,
 	}
 	if _, err := signed.verifiedQuotaLedger(); err != nil {
@@ -631,6 +664,26 @@ func verifiedUserQuotaLedger(userID int) (*userQuotaLedger, cacheQuotaResult, er
 		credited: credited, spent: spent,
 		expiresAt: expiresAt, mac: signed.QuotaLedgerMAC,
 	}, cacheQuotaOK, nil
+}
+
+// userLedgerFieldsCarryASignature reports whether the raw hash fields hold a
+// ledger this build signed, without regarding the window. It answers the one
+// question the reservation guard asks — is this the signed layout — so a field
+// that does not parse counts as no signature rather than as an unverified
+// ledger. The read path makes the same decision through carriesSignedLedger,
+// and the window is left to verifiedQuotaLedger, which answers with the balance
+// when it holds and reports the expiry when it does not.
+func userLedgerFieldsCarryASignature(fields map[string]string, userID int) bool {
+	credited, creditedErr := requireLedgerInt(fields, "QuotaCredited")
+	spent, spentErr := requireLedgerInt(fields, "QuotaSpent")
+	expiresAt, expiresErr := requireLedgerInt(fields, "QuotaLedgerExp")
+	if creditedErr != nil || spentErr != nil || expiresErr != nil {
+		return false
+	}
+	return UserBase{
+		Id: userID, QuotaCredited: credited, QuotaSpent: spent,
+		QuotaLedgerMAC: fields["QuotaLedgerMAC"], QuotaLedgerExp: expiresAt,
+	}.carriesSignedLedger()
 }
 
 func verifiedTokenQuotaLedger(id int, key string) (*tokenQuotaLedger, cacheQuotaResult, error) {
@@ -691,8 +744,8 @@ func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
 		nextSpent := ledger.spent + amount
 		nextMAC, err := (UserBase{
-			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
-			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+			Id: userID, QuotaCredited: ledger.credited, QuotaSpent: nextSpent,
+			QuotaLedgerExp: expiresAt,
 		}).quotaLedgerMAC()
 		if err != nil {
 			return cacheQuotaMiss, err
@@ -862,8 +915,8 @@ func applyUserQuotaDebit(userID int, amount int64, hydrateOnMiss bool) (cacheQuo
 		nextSpent := ledger.spent + amount
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
 		nextMAC, err := (UserBase{
-			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
-			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+			Id: userID, QuotaCredited: ledger.credited, QuotaSpent: nextSpent,
+			QuotaLedgerExp: expiresAt,
 		}).quotaLedgerMAC()
 		if err != nil {
 			return cacheQuotaMiss, err
@@ -905,8 +958,8 @@ func cacheReleaseUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 		nextSpent := ledger.spent - amount
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
 		nextMAC, err := (UserBase{
-			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
-			QuotaCredited: ledger.credited, QuotaSpent: nextSpent, QuotaLedgerExp: expiresAt,
+			Id: userID, QuotaCredited: ledger.credited, QuotaSpent: nextSpent,
+			QuotaLedgerExp: expiresAt,
 		}).quotaLedgerMAC()
 		if err != nil {
 			return cacheQuotaMiss, err
@@ -1063,8 +1116,7 @@ func creditUserQuotaLocked(userID int, delta int64) (cacheQuotaResult, error) {
 		}
 		expiresAt := nextLedgerExpiry(ledger.expiresAt, userCacheTTLSeconds())
 		nextMAC, err := (UserBase{
-			Id: userID, AuthVersion: ledger.authVersion, CacheSchema: ledger.schema,
-			QuotaCredited: ledger.credited + delta, QuotaSpent: ledger.spent,
+			Id: userID, QuotaCredited: ledger.credited + delta, QuotaSpent: ledger.spent,
 			QuotaLedgerExp: expiresAt,
 		}).quotaLedgerMAC()
 		if err != nil {
@@ -1118,8 +1170,7 @@ func seedUserQuotaLedger(userID int, quota int, authVersion int64) error {
 	}
 	expiresAt := nextLedgerExpiry(0, userCacheTTLSeconds())
 	mac, err := (UserBase{
-		Id: userID, AuthVersion: authVersion, CacheSchema: userCacheSchemaVersion,
-		QuotaCredited: int64(live), QuotaLedgerExp: expiresAt,
+		Id: userID, QuotaCredited: int64(live), QuotaLedgerExp: expiresAt,
 	}).quotaLedgerMAC()
 	if err != nil {
 		return err
@@ -1330,9 +1381,10 @@ func discardUnverifiedTokenQuotaCache(id int, key string, reason string) {
 }
 
 // reserveUserQuotaCached reports whether the reservation succeeded and whether
-// the answer came from the database. A hash that cannot be verified is
-// discarded and answered from the database, never from zero: a zero balance
-// would refuse a spend the account can pay for.
+// the answer came from the database. A hash whose ledger a writer contradicted is
+// discarded and answered from the database, never from zero: a zero balance would
+// refuse a spend the account can pay for. A hash that carries no signed ledger at
+// all is refused instead, because the row is not an answer for it.
 func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err error) {
 	// One writer per subject in this process. Without it, two goroutines holding
 	// the same verified state race for the same CAS and the loser is answered as
@@ -1347,6 +1399,12 @@ func reserveUserQuotaCached(id int, quota int) (reserved bool, fromDB bool, err 
 	for range quotaLedgerRetryAttempts {
 		result, reserveErr := cacheTryReserveUserQuota(id, int64(quota))
 		switch {
+		case errors.Is(reserveErr, ErrPreLedgerHashCarriesNoSignature):
+			// A hash with no signed ledger cannot be spent from and must not be
+			// answered from the row: under batch accumulation that row predates the
+			// debit the accumulator still owes it. The hash is left in place for its
+			// own TTL to rebuild, and the reservation is refused.
+			return false, false, reserveErr
 		case errors.Is(reserveErr, ErrQuotaLedgerUnverified) || result == cacheQuotaUnverified:
 			discardUnverifiedUserQuotaCache(id, ledgerRefusalReason(reserveErr))
 			reserved, err = reserveUserQuotaFromRow(id, quota)
@@ -1427,7 +1485,9 @@ func reserveTokenQuotaCached(id int, key string, quota int) (reserved bool, from
 
 // TryReserveUserQuota atomically checks and deducts a user's wallet quota.
 // 缓存命中时以签名账本为准（避免批量模式下过期的数据库余额放大并发超扣）；
-// Redis 异常、水合失败或账本与签名不符时降级为数据库条件更新。
+// Redis 异常或水合失败时降级为数据库条件更新。哈希里根本没有本版本签出的账本时
+// 直接拒绝并返回 ErrPreLedgerHashCarriesNoSignature：它的余额只在未签名的 Quota
+// 镜像里，批量模式下数据库行还是扣款前的值，回退到行会把已花的额度再花一次。
 func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if quota < 0 {
 		return false, errors.New("quota cannot be negative")
@@ -1449,6 +1509,12 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 	if errors.Is(err, errQuotaLedgerContended) {
 		// Falling back here is the over-spend the ledger exists to stop: the
 		// wallet was never consulted, so the caller is told to try again.
+		return false, err
+	}
+	if errors.Is(err, ErrPreLedgerHashCarriesNoSignature) {
+		// The fallback would answer from a row the accumulator has not reached yet.
+		// The hash recorded the spend and its signature is gone, so the row is a
+		// pre-spend balance; refusing is the only answer that cannot hand quota back.
 		return false, err
 	}
 	if err != nil {

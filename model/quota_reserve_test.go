@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -282,28 +283,42 @@ func TestReserveIgnoresAForgedQuotaMirror(t *testing.T) {
 }
 
 // Property 2: the fields a reservation trusts are signed. Raising either of
-// them breaks the signature, and a hash that fails verification never
-// authorizes a spend: it is discarded and answered from the database.
+// them breaks the signature, and a hash whose ledger signature does not hold is
+// refused outright. It is indistinguishable from a hash that never carried a
+// ledger, and answering either from the database row would hand the row's
+// pre-debit balance back. The refusal lasts until the hash expires: the seed that
+// republishes a ledger refuses to sign over an existing QuotaLedgerMAC, so a
+// forged marker cannot be healed by a read.
 func TestReserveRefusesAForgedSignedTotal(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 
 	user := createReserveTestUser(t, 5)
 	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
+	require.NoError(t, common.RDB.HSet(t.Context(), key, "QuotaCredited", 1_000_000).Err())
 
 	reserved, err := TryReserveUserQuota(user.Id, 100)
-	require.NoError(t, err)
-	assert.False(t, reserved, "a raised signed total breaks its MAC and is answered from the database")
-	assert.Equal(t, 5, getUserQuotaFromDB(t, user.Id))
-	assert.Zero(t, common.RDB.Exists(t.Context(), getUserCacheKey(user.Id)).Val(), "the unverified hash is discarded")
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+		"a raised signed total breaks its MAC, and an unsigned ledger is refused rather than answered from the row")
+	assert.False(t, reserved)
+	assert.Equal(t, 5, getUserQuotaFromDB(t, user.Id), "no database spend either")
 
-	// The next reservation republishes the ledger from the database balance.
+	// Reads keep working: the read path answers from the row with the owed delta
+	// folded in, so the account stays usable while its spends are refused.
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 5, balance)
+
+	// The refusal lasts until the hash's own TTL takes it away, and the rebuild
+	// then signs the row's balance.
+	expireUserHash(t, server, user.Id)
+
 	reserved, err = TryReserveUserQuota(user.Id, 4)
 	require.NoError(t, err)
-	assert.True(t, reserved)
+	assert.True(t, reserved, "a rebuilt hash signs the row's balance and the wallet works again")
 	assert.Equal(t, 1, getUserQuotaFromDB(t, user.Id))
 	assert.Equal(t, "4", cacheQuotaField(t, getUserCacheKey(user.Id), "QuotaSpent"))
 }
@@ -322,23 +337,26 @@ func TestReserveRefusesAForgedSpentBaseline(t *testing.T) {
 	}())
 
 	// The spent counter is signed: moving it re-opens the signed total unless
-	// the writer also re-signs, which they cannot do.
+	// the writer also re-signs, which they cannot do. The broken signature leaves
+	// the hash indistinguishable from one that never carried a ledger, so the
+	// reservation refuses instead of answering from the row.
 	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaSpent", 0).Err())
 
 	reserved, err := TryReserveUserQuota(user.Id, 5)
-	require.NoError(t, err)
-	assert.False(t, reserved, "a rolled-back counter breaks its MAC and cannot re-open the total")
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+		"a rolled-back counter breaks its MAC, so the hash is refused instead of answered from the row")
+	assert.False(t, reserved)
 	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the wallet records one spend, not two")
-	assert.Zero(t, common.RDB.Exists(t.Context(), getUserCacheKey(user.Id)).Val(), "the unverified hash is discarded")
 }
 
 // Property 3: a writer cannot put the unsigned counter back on its signed
 // baseline and spend the same quota twice. Spending the signed total raises the
-// baseline to the live counter, so the reset lands below the signature.
+// baseline to the live counter, so the reset lands below the signature, which
+// leaves the hash unsigned and therefore unusable.
 func TestReserveRefusesACounterRolledBackToItsBaseline(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 
 	user := createReserveTestUser(t, 10)
 	require.NoError(t, populateUserCache(user))
@@ -354,11 +372,23 @@ func TestReserveRefusesACounterRolledBackToItsBaseline(t *testing.T) {
 	require.NoError(t, common.RDB.HSet(t.Context(), key,
 		"QuotaSpent", 0, "Quota", 10).Err())
 	reserved, err = TryReserveUserQuota(user.Id, 10)
-	require.NoError(t, err)
-	assert.False(t, reserved, "a counter rolled back from its signed value cannot be spent again")
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+		"a counter rolled back from its signed value breaks the ledger, so the hash cannot be spent from")
+	assert.False(t, reserved)
 	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id), "the database records the one spend, not two")
-	assert.Zero(t, common.RDB.Exists(t.Context(), key).Val(),
-		"the contradicted ledger is discarded, so the reset cannot leave a spendable hash behind")
+
+	// The forged hash stays refused across a read: the seed will not sign over an
+	// existing QuotaLedgerMAC, so nothing hands the pre-spend balance back.
+	reserved, err = TryReserveUserQuota(user.Id, 10)
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature, "the forged hash is still refused after a read")
+
+	// Only the TTL takes it away, and the rebuild then signs the row, which holds
+	// the spend.
+	expireUserHash(t, server, user.Id)
+	reserved, err = TryReserveUserQuota(user.Id, 10)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the rebuilt ledger holds the spend, so the rollback leaves nothing to spend")
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
 }
 
 // Property 4: a copy of the hash ages out of its own signature. Every write
@@ -770,11 +800,13 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 
 // Property 3 for a partial spend: the attack does not have to exhaust the
 // wallet first. Spending part of the balance and then writing the counter back
-// must not re-open the quota that was already spent.
+// must not re-open the quota that was already spent. The rollback leaves the
+// ledger unsigned, so the reservation refuses rather than answering from a row
+// whose balance the accumulator has already spent for real.
 func TestReserveRefusesAPartialSpendRolledBack(t *testing.T) {
 	truncateTables(t)
 	resetBatchUpdateTestState(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 
 	user := createReserveTestUser(t, 10)
 	require.NoError(t, populateUserCache(user))
@@ -792,9 +824,29 @@ func TestReserveRefusesAPartialSpendRolledBack(t *testing.T) {
 		"QuotaSpent", 0, "Quota", 10).Err())
 
 	reserved, err = TryReserveUserQuota(user.Id, 10)
-	require.NoError(t, err)
-	assert.False(t, reserved, "a counter rolled back from %s cannot authorize a second spend", spent)
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+		"a counter rolled back from %s breaks the ledger, so the hash cannot be spent from", spent)
+	assert.False(t, reserved)
 	assert.Equal(t, 6, getUserQuotaFromDB(t, user.Id), "the database records the one spend, not two")
+
+	// The read still answers from the row, so the account stays usable while its
+	// spends are refused, and the forged hash stays refused across it.
+	balance, err := GetUserQuota(user.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 6, balance)
+	reserved, err = TryReserveUserQuota(user.Id, 10)
+	require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature, "the forged hash is still refused after a read")
+
+	// Only the TTL takes the forged hash away; the rebuild then signs the row,
+	// which holds the spend, so the remaining six is all the wallet offers.
+	expireUserHash(t, server, user.Id)
+	reserved, err = TryReserveUserQuota(user.Id, 7)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the rebuilt ledger offers only the remaining six")
+	reserved, err = TryReserveUserQuota(user.Id, 6)
+	require.NoError(t, err)
+	assert.True(t, reserved)
+	assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
 }
 
 // An exhausting reservation that cannot be persisted has to be refunded in the
@@ -1381,14 +1433,13 @@ func TestLiveSchema2HashWithNoLocalAccumulatorReadsTheRow(t *testing.T) {
 
 // An unsigned schema raise must not inflate the balance a read reports. CacheSchema
 // sits inside the metadata MAC, so one HSET invalidates the metadata signature and
-// the read rejects the hash and republishes it from the database. Rejects, not
-// deletes: the reserve path is what discards an unverifiable hash (see
-// new-api/AGENTS.md), and this read leaves the key alive. The balance must still be
-// 90 of 100, not the row's 100. Two things keep it there, and this pins the pair:
-// the ledger fields survive the rebuild because seedUserQuotaLedger refuses to sign
-// over an existing QuotaLedgerMAC, and the read path folds the accumulator's owed
-// delta in when it has to answer from the row instead. Measured before the fold
-// existed, the same HSET reported 100 and put 100 into the request context.
+// the read rejects the hash and republishes it from the database without deleting
+// the key. The balance must still be 90 of 100, not the row's 100. Two things keep
+// it there, and this pins the pair: the ledger fields survive the rebuild because
+// seedUserQuotaLedger refuses to sign over an existing QuotaLedgerMAC, and the read
+// path folds the accumulator's owed delta in when it has to answer from the row
+// instead. Measured before the fold existed, the same HSET reported 100 and put 100
+// into the request context.
 func TestAnUnsignedSchemaRaiseKeepsTheSignedBalance(t *testing.T) {
 	for _, raised := range []int{ledgerV2SchemaVersion, userCacheSchemaVersion + 1} {
 		t.Run(fmt.Sprintf("CacheSchema set to %d", raised), func(t *testing.T) {
@@ -1473,8 +1524,8 @@ func TestSchema3HashIsRebuiltNotMigrated(t *testing.T) {
 
 	// The forged shape: the ledger signature verifies nothing, and the counters
 	// claim ten times what the row holds, so any path that read them would answer
-	// 1000. The schema comparison already diverts this hash, but that judgement is
-	// not one this test exercises for the MAC, so pin the answer here.
+	// 1000 and any path that fell back to the row would answer 100. A hash with no
+	// valid signature is refused rather than answered from either.
 	t.Run("forged ledger", func(t *testing.T) {
 		truncateTables(t)
 		resetBatchUpdateTestState(t)
@@ -1491,16 +1542,16 @@ func TestSchema3HashIsRebuiltNotMigrated(t *testing.T) {
 
 		balance, err := GetUserQuota(user.Id, false)
 		require.NoError(t, err)
-		assert.Equal(t, 100, balance, "a ledger that verifies nothing is answered from the row")
+		assert.Equal(t, 100, balance, "the read rebuilds from the row, so the forged counters never answer")
 		assert.Equal(t, strconv.Itoa(userCacheSchemaVersion), cacheQuotaField(t, key, "CacheSchema"))
+		assert.Equal(t, "not-a-signature", cacheQuotaField(t, key, "QuotaLedgerMAC"),
+			"the rebuild refuses to sign over an existing marker, so the forged hash stays refused")
 
 		reserved, err := TryReserveUserQuota(user.Id, 101)
-		require.NoError(t, err)
-		assert.False(t, reserved, "the forged 1000 is not spendable")
-		reserved, err = TryReserveUserQuota(user.Id, 100)
-		require.NoError(t, err)
-		assert.True(t, reserved, "the wallet holds the row's 100")
-		assert.Equal(t, 0, getUserQuotaFromDB(t, user.Id))
+		require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+			"a ledger that verifies nothing is refused, not spent from the row")
+		assert.False(t, reserved)
+		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no database spend either")
 	})
 }
 
@@ -1577,9 +1628,11 @@ func TestBatchExpiredLedgerDoesNotAuthorizeFromTheLaggingRow(t *testing.T) {
 	require.Equal(t, 40, cached, "the ledger holds the live balance")
 	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the row has not been flushed yet")
 
-	// The signature lapses while the hash itself is still there.
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
-		"QuotaLedgerExp", int64(1)).Err())
+	// The signed window closes while the hash itself is still there. The expiry is
+	// part of the ledger MAC, so it is re-signed with a past value: the signature
+	// matches and only the window has gone, which is what makes this the expiry
+	// case rather than a forged one.
+	expireSignedUserLedger(t, user.Id)
 
 	reserved, err = TryReserveUserQuota(user.Id, 100)
 	require.NoError(t, err, "the row answers, with the owed debit folded in")
@@ -1684,6 +1737,155 @@ func TestUserHashNeverOutlivesItsSignedLedger(t *testing.T) {
 	assert.Positive(t, ttl, "the refresh kept the hash alive")
 	assert.LessOrEqual(t, ttl, remaining+time.Second,
 		"the hash TTL is capped at the signed expiry, so it cannot outlive its ledger")
+}
+
+// A normal security-factor change must leave a live ledger verifiable. The
+// authentication version moves on its own: IncrementUserAuthVersionWithTx raises
+// the column for a password, 2FA or passkey change, and BumpUserAuthVersion's
+// PublishUserAuthCache then re-signs the metadata under the new version without
+// touching the ledger. While the ledger MAC signed the version, that write broke
+// a perfectly good ledger, and the broken ledger sent every reservation to the
+// database row — the pre-debit balance this file exists to stop it spending.
+//
+// Batch accumulation is what makes it observable: the ten units already spent are
+// still queued, so the row reads its pre-debit 100 while the wallet holds 90. A
+// 95-unit reservation must be refused for lack of funds. Measured on the parent
+// commit, it was accepted and took the row to 5.
+func TestLedgerSurvivesAnAuthenticationVersionBump(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	common.BatchUpdateEnabled = true
+
+	user := createReserveTestUser(t, 100)
+	require.NoError(t, populateUserCache(user))
+	key := getUserCacheKey(user.Id)
+
+	reserved, err := TryReserveUserQuota(user.Id, 10)
+	require.NoError(t, err)
+	require.True(t, reserved)
+	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the spend is queued, not flushed")
+
+	version, err := BumpUserAuthVersion(user.Id)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, version, "the version really moved")
+
+	var bumped UserBase
+	require.NoError(t, common.RedisHGetObj(key, &bumped))
+	require.Equal(t, int64(2), bumped.AuthVersion, "and the hash carries the new version")
+	require.NotEmpty(t, bumped.QuotaLedgerMAC, "with its ledger still on it")
+	balance, ledgerErr := bumped.verifiedQuotaLedger()
+	require.NoError(t, ledgerErr, "the ledger still verifies after the bump")
+	assert.Equal(t, 90, balance, "and still reports the ten already spent")
+
+	reserved, err = TryReserveUserQuota(user.Id, 95)
+	require.NoError(t, err)
+	assert.False(t, reserved, "95 must not fit in a wallet holding 90")
+	assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "no row was written for a refused reservation")
+
+	reserved, err = TryReserveUserQuota(user.Id, 90)
+	require.NoError(t, err)
+	assert.True(t, reserved, "the wallet keeps working after a security-factor change")
+
+	// A metadata write that only stamps this build's schema is the same kind of
+	// write, and it must leave the ledger alone too.
+	refreshed, err := GetUserById(user.Id, false)
+	require.NoError(t, err)
+	refreshed.Group = "vip"
+	require.NoError(t, updateUserCache(*refreshed))
+	reserved, err = TryReserveUserQuota(user.Id, 1)
+	require.NoError(t, err)
+	assert.False(t, reserved, "the wallet is still the ledger's zero, so it cannot spend one more")
+}
+
+// No unsigned field may move a pre-ledger hash into the permitting branch. A
+// writer holding Redis access and no secret can add a QuotaLedgerMAC marker or
+// raise CacheSchema, because cacheMAC zeroes the ledger fields before signing and
+// stamps the schema number on every metadata write. Neither field is covered by a
+// signature the writer can produce, so neither may decide whether the hash is
+// spendable: both shapes stay refused, and the forged hash stays refused until its
+// own TTL rebuilds it from the database.
+//
+// The starting shape is the one the upgrade meets: a live schema-2 hash holding a
+// debit the accumulator still owes the row (wallet 100, mirror 40, row 100). If a
+// forged field could reach the permitting branch, the reservation would answer
+// from the row and spend the already-spent 60 a second time.
+func TestNoUnsignedFieldMovesAPreLedgerHashIntoThePermissiveBranch(t *testing.T) {
+	t.Run("added ledger marker", func(t *testing.T) {
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		server := useUserCacheMiniRedis(t)
+		common.BatchUpdateEnabled = true
+
+		user := createReserveTestUser(t, 100)
+		key := seedLiveSchema2UserHash(t, user, 40)
+		require.NoError(t, setUnflushedQuotaDelta(user.Id, -60))
+		// A marker is not a signature: the ledger MAC commits to both counters and
+		// the expiry, so a value nobody computed cannot make them verify.
+		require.NoError(t, common.RDB.HSet(t.Context(), key, "QuotaLedgerMAC", "x").Err())
+
+		_, err := cacheGetUserBase(user.Id)
+		require.Error(t, err, "the read must not answer from the pre-debit row")
+
+		reserved, err := TryReserveUserQuota(user.Id, 60)
+		require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+			"a marker on an unsigned ledger is still an unsigned ledger")
+		assert.False(t, reserved)
+		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id),
+			"the already-spent 60 must not reach the pre-debit row")
+
+		// The refusal outlives a read, because the seed will not sign over the
+		// marker the writer left behind.
+		_, err = GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		reserved, err = TryReserveUserQuota(user.Id, 60)
+		require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature,
+			"a read cannot heal a forged marker into a signature")
+		assert.False(t, reserved)
+		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id))
+
+		// Only the hash's own TTL rebuilds it, and the rebuild signs the balance the
+		// accumulator holds, so the spend is still counted.
+		expireUserHash(t, server, user.Id)
+		balance, err := GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 40, balance, "the rebuilt ledger carries the unflushed 60")
+		reserved, err = TryReserveUserQuota(user.Id, 41)
+		require.NoError(t, err)
+		assert.False(t, reserved, "41 is past the wallet's 40")
+	})
+
+	t.Run("added ledger fields with the schema number raised", func(t *testing.T) {
+		truncateTables(t)
+		resetBatchUpdateTestState(t)
+		server := useUserCacheMiniRedis(t)
+		common.BatchUpdateEnabled = true
+
+		user := createReserveTestUser(t, 100)
+		key := seedLiveSchema2UserHash(t, user, 40)
+		require.NoError(t, setUnflushedQuotaDelta(user.Id, -60))
+		// Every unsigned field raised at once, in the layout this build writes: a
+		// current schema, a signed-looking total and a marker. The signature is what
+		// fails, not the shape.
+		require.NoError(t, common.RDB.HSet(t.Context(), key,
+			"CacheSchema", userCacheSchemaVersion,
+			"QuotaCredited", 100, "QuotaSpent", 0,
+			"QuotaLedgerMAC", "x").Err())
+
+		_, err := cacheGetUserBase(user.Id)
+		require.Error(t, err, "a raised schema and counters do not replace a signature")
+
+		reserved, err := TryReserveUserQuota(user.Id, 60)
+		require.ErrorIs(t, err, ErrPreLedgerHashCarriesNoSignature)
+		assert.False(t, reserved)
+		assert.Equal(t, 100, getUserQuotaFromDB(t, user.Id),
+			"the raised fields cannot authorize a spend from the pre-debit row")
+
+		expireUserHash(t, server, user.Id)
+		balance, err := GetUserQuota(user.Id, false)
+		require.NoError(t, err)
+		assert.Equal(t, 40, balance, "the rebuild signs the balance the accumulator holds")
+	})
 }
 
 // The two row-first callers write the row themselves and then hand the same
@@ -1853,8 +2055,7 @@ func TestBatchExpiredLedgerRefusesEveryRepeatOfTheSameReserve(t *testing.T) {
 	}
 	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the accumulator holds both spends")
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
-		"QuotaLedgerExp", int64(1)).Err())
+	expireSignedUserLedger(t, user.Id)
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		reserved, err := TryReserveUserQuota(user.Id, 100)
@@ -2134,8 +2335,7 @@ func TestReadAfterLedgerExpiryHoldsTheLiveBalance(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 40, live, "the ledger holds the live balance")
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
-		"QuotaLedgerExp", int64(1)).Err())
+	expireSignedUserLedger(t, user.Id)
 
 	balance, err := GetUserQuota(user.Id, false)
 	require.NoError(t, err)
@@ -2189,6 +2389,45 @@ func tryQueueWithin(kind int, subject int, delta int, window time.Duration) bool
 
 func unflushedTestDelta(subject int, kind int) int {
 	return batchUpdateStores[kind][subject] + batchUpdateInFlight[kind][subject]
+}
+
+// expireUserHash advances a miniredis clock past the hash's own TTL, so the next
+// read finds no hash and rebuilds it from the database. A ledger write ties the
+// key's life to the signed expiry (PEXPIREAT nextExpiry), and that window is at
+// least quotaLedgerMinWindowSeconds even when the cache TTL is test-sized, so the
+// wait cannot be derived from userCacheTTLSeconds alone.
+func expireUserHash(t *testing.T, server *miniredis.Miniredis, userID int) {
+	t.Helper()
+	ttl := common.RDB.PTTL(t.Context(), getUserCacheKey(userID)).Val()
+	require.Positive(t, ttl, "the hash must be alive for its TTL to be waited out")
+	server.FastForward(ttl + time.Second)
+	require.Zero(t, common.RDB.Exists(t.Context(), getUserCacheKey(userID)).Val(),
+		"the hash is gone, which is what makes the next read a rebuild")
+}
+
+// expireSignedUserLedger closes the signed window of a live user ledger without
+// breaking its signature. The expiry is inside the ledger MAC, so writing a past
+// expiry alone leaves a hash whose signature matches nothing; this re-signs the
+// counters the hash already carries with an expiry in the past, which is the
+// shape a genuine ledger reaches when its window runs out.
+func expireSignedUserLedger(t *testing.T, userID int) {
+	t.Helper()
+	var cached UserBase
+	require.NoError(t, common.RedisHGetObj(getUserCacheKey(userID), &cached))
+	require.True(t, cached.carriesSignedLedger(), "the hash must carry a live ledger to expire it")
+
+	cached.QuotaLedgerExp = time.Now().Add(-time.Second).UnixMilli()
+	mac, err := cached.quotaLedgerMAC()
+	require.NoError(t, err)
+	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(userID),
+		"QuotaLedgerExp", cached.QuotaLedgerExp, "QuotaLedgerMAC", mac).Err())
+
+	var reread UserBase
+	require.NoError(t, common.RedisHGetObj(getUserCacheKey(userID), &reread))
+	require.True(t, reread.carriesSignedLedger(),
+		"the re-signed ledger still carries this build's signature, so only its window has closed")
+	require.LessOrEqual(t, reread.QuotaLedgerExp, time.Now().UnixMilli(),
+		"and that window is in the past")
 }
 
 // queueCommittedUserQuotaDebit and queueCommittedTokenQuotaDebit queue a delta
@@ -2247,8 +2486,10 @@ func TestBatchReserveHoldsTheAccumulatorStillAcrossItsUpdate(t *testing.T) {
 
 	user := createReserveTestUser(t, 100)
 	require.NoError(t, populateUserCache(user))
-	// The hash cannot be verified, so the reserve has to answer from the row.
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
+	// The ledger's window has closed, so the reserve has to answer from the row.
+	// The expiry is re-signed: only the window may be gone, or the hash would be
+	// refused as pre-ledger instead of reaching the row.
+	expireSignedUserLedger(t, user.Id)
 
 	entered, release := pauseNextQuotaUpdate(t, "m79:pause-user-reserve")
 	defer release()
@@ -2401,7 +2642,10 @@ func TestBatchReserveHoldsTheFlushWindowStillAcrossItsUpdate(t *testing.T) {
 
 	user := createReserveTestUser(t, 100)
 	require.NoError(t, populateUserCache(user))
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id), "QuotaCredited", 1_000_000).Err())
+	// Only the window is closed, and the expiry is re-signed so it is: a bare
+	// expiry write would make the hash pre-ledger and the reserve would refuse
+	// before the row read this test exists to observe.
+	expireSignedUserLedger(t, user.Id)
 
 	release := holdMidFlush(t, BatchUpdateTypeUserQuota, user.Id, 50, func() {
 		require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).
@@ -2544,8 +2788,11 @@ func TestBatchQueuedCreditFundsTheReserve(t *testing.T) {
 	require.Equal(t, 100, getUserQuotaFromDB(t, user.Id), "the credit is queued, not written")
 	require.Equal(t, 50, unflushedTestDelta(user.Id, BatchUpdateTypeUserQuota))
 
-	require.NoError(t, common.RDB.HSet(t.Context(), getUserCacheKey(user.Id),
-		"QuotaCredited", 1_000_000).Err())
+	// The ledger's window has closed, so the reserve answers from the row with the
+	// accumulator's owed credit folded in. The expiry is re-signed: a bare expiry
+	// write would leave the hash pre-ledger, and that shape is refused outright
+	// rather than answered from the row.
+	expireSignedUserLedger(t, user.Id)
 
 	reserved, err := TryReserveUserQuota(user.Id, 140)
 	require.NoError(t, err, "a queued credit funds the reserve; it is not a reason to fail the request")
