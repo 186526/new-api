@@ -70,6 +70,18 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
+// channelTestRequestBody is the body the channel test sends upstream. An adaptor
+// that already produced the upstream bytes hands them back directly; marshalling
+// them again would encode the slice as base64 and send that string as the
+// request body, which the upstream rejects with "Input should be a valid
+// dictionary or object". Every other converted value is marshalled as before.
+func channelTestRequestBody(convertedRequest any) ([]byte, error) {
+	if raw, ok := convertedRequest.([]byte); ok {
+		return raw, nil
+	}
+	return common.Marshal(convertedRequest)
+}
+
 func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -396,7 +408,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
 		}
 	}
-	jsonData, err := common.Marshal(convertedRequest)
+	jsonData, err := channelTestRequestBody(convertedRequest)
 	if err != nil {
 		return testResult{
 			context:     c,
