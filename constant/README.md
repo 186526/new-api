@@ -14,6 +14,7 @@
 | `finish_reason.go`   | OpenAI/GPT 请求返回的 `finish_reason` 字符串常量集合。                           |
 | `midjourney.go`      | Midjourney 相关错误码及动作(Action)常量与模型到动作的映射表。                            |
 | `setup.go`           | 标识项目是否已完成初始化安装 (`Setup` 布尔值)。                                       |
+| `systemone.go`       | TypeSafe System One 契约服务的模型家族前缀 (`SystemOneModelPrefix`)。                    |
 | `task.go`            | 各种任务(Task)平台、动作常量及模型与动作映射表，如 Suno、Midjourney 等。                     |
 | `user_setting.go`    | 用户设置相关键常量以及通知类型(Email/Webhook)等。                                    |
 
