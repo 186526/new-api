@@ -359,15 +359,22 @@ func RetrieveModel(c *gin.Context, modelType int) {
 		default:
 			c.JSON(200, aiModel)
 		}
-	} else {
-		openAIError := types.OpenAIError{
-			Message: fmt.Sprintf("The model '%s' does not exist", modelId),
-			Type:    "invalid_request_error",
-			Param:   "model",
-			Code:    "model_not_found",
-		}
-		c.JSON(200, gin.H{
-			"error": openAIError,
-		})
+		return
 	}
+	// A model this gateway does not serve is a client mistake, not an answer:
+	// 404 tells a retrying client to stop, where 200 with an error document
+	// looks like a successful read of a model with no fields.
+	if common.AnswersInTypeSafeShape(c) {
+		common.WriteTypeSafeError(c, http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", modelId))
+		return
+	}
+	openAIError := types.OpenAIError{
+		Message: fmt.Sprintf("The model '%s' does not exist", modelId),
+		Type:    "invalid_request_error",
+		Param:   "model",
+		Code:    "model_not_found",
+	}
+	c.JSON(http.StatusNotFound, gin.H{
+		"error": openAIError,
+	})
 }

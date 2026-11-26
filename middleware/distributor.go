@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -40,9 +41,12 @@ func Distribute() func(c *gin.Context) {
 			}
 		}()
 		constraints := service.GetChannelConstraints(c)
+		// A System One request arrived under the contract prefix but is sent to
+		// the upstream under its own path, so channel route declarations are
+		// matched against the path the request will use.
 		constraints.AddFilter(taskdto.ChannelFilter{
 			Kind:        taskdto.FilterRequestPath,
-			RequestPath: c.Request.URL.Path,
+			RequestPath: relaycommon.SystemOneUpstreamRequestPath(c.Request.URL.Path),
 		})
 		service.AppendTaskPluginIdentityFilter(c, c.GetString("expected_task_plugin_key"))
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
@@ -244,7 +248,7 @@ func getModelFromRequest(c *gin.Context) (*ModelRequest, error) {
 			return &cachedRequest, nil
 		}
 	}
-	if strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json") {
+	if common.RequestIsJSON(c.Request) {
 		return getModelFromJSONBody(c)
 	}
 
@@ -446,7 +450,7 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			modelRequest.Model = modelName
 		}
 		c.Set("relay_mode", relayMode)
-	} else if !strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") && !strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+	} else if !strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") && !common.IsMultipartFormContentType(c.Request.Header.Get("Content-Type")) {
 		req, err := getModelFromRequest(c)
 		if err != nil {
 			return nil, false, err

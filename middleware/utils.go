@@ -23,13 +23,17 @@ func abortWithOpenAiMessage(c *gin.Context, statusCode int, message string, code
 		Message:    message,
 		StatusCode: statusCode,
 	}) {
-		c.JSON(statusCode, gin.H{
-			"error": gin.H{
-				"message": common.MessageWithRequestId(message, c.GetString(common.RequestIdKey)),
-				"type":    "new_api_error",
-				"code":    codeStr,
-			},
-		})
+		if common.AnswersInTypeSafeShape(c) {
+			common.WriteTypeSafeError(c, statusCode, message)
+		} else {
+			c.JSON(statusCode, gin.H{
+				"error": gin.H{
+					"message": common.MessageWithRequestId(message, c.GetString(common.RequestIdKey)),
+					"type":    "new_api_error",
+					"code":    codeStr,
+				},
+			})
+		}
 	}
 	c.Abort()
 	logger.LogError(c.Request.Context(), common.LogText("user %d | %s", userId, message))

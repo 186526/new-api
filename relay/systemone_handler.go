@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -12,6 +13,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/systemone"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 
@@ -21,8 +23,16 @@ import (
 // SystemOneHelper relays a TypeSafe decision request. The upstream answers with
 // probabilities, labels or scores instead of chat text, and reports its own
 // input/output token counts, so billing settles on those numbers.
+//
+// The request is checked against the schema the upstream publishes before it is
+// forwarded, and an upstream refusal reaches the client with the status and the
+// document the upstream wrote. A request the schema rejects answers 422 with the
+// field locations, which is what a generated client reads to fix the call.
 func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
+	// The contract prefix is this gateway's own namespace; the upstream answers
+	// only its own path, so the request is forwarded under that one.
+	info.RequestURLPath = relaycommon.SystemOneUpstreamRequestPath(info.RequestURLPath)
 
 	switch info.ChannelType {
 	case constant.ChannelTypeOpenAI,
@@ -31,8 +41,10 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	default:
 		// Allow retry onto another channel that may support this endpoint.
 		return types.NewError(
-			errors.New("channel does not support /v1/systemone"),
+			errors.New("this channel does not serve /v1/systemone"),
 			types.ErrorCodeInvalidRequest,
+			types.ErrOptionWithStatusCode(http.StatusBadRequest),
+			types.ErrOptionWithSkipRetry(),
 		)
 	}
 
@@ -50,7 +62,18 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
-	jsonData, err := buildSystemOneRequestBody(request.RawBody, info.OriginModelName, info.UpstreamModelName)
+	rawBody, bodyError := systemOneForwardableBody(c, request.RawBody)
+	if bodyError != nil {
+		return bodyError
+	}
+
+	longContext := HeadersEnabled(c.GetHeader(SystemOneLongContextHeader))
+	imagesEnabled := HeadersEnabled(c.GetHeader(SystemOneImagesHeader))
+	if problems := ValidateSystemOneBody(rawBody, longContext, imagesEnabled); len(problems) > 0 {
+		return systemOneValidationRefusal(problems)
+	}
+
+	jsonData, err := buildSystemOneRequestBody(rawBody, info.OriginModelName, info.UpstreamModelName)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -88,9 +111,7 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	defer httpResp.Body.Close()
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
-		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-		return newAPIError
+		return systemOneFailure(c, info, httpResp, statusCodeMappingStr)
 	}
 
 	responseBody, err := io.ReadAll(httpResp.Body)
@@ -101,11 +122,15 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	usage := systemOneUsage(responseBody)
 	responseBody = rewriteSystemOneResponse(responseBody, info.OriginModelName)
 
-	contentType := httpResp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/json; charset=utf-8"
+	if contentType := httpResp.Header.Get("Content-Type"); contentType != "" {
+		c.Writer.Header().Set("Content-Type", contentType)
+	} else {
+		c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	}
-	c.Writer.Header().Set("Content-Type", contentType)
+	// The upstream may answer compressed. The body was read and rewritten here,
+	// so the encoding it arrived in no longer describes what is written.
+	c.Writer.Header().Del("Content-Encoding")
+	c.Writer.Header().Del("Transfer-Encoding")
 	c.Writer.WriteHeader(httpResp.StatusCode)
 	if _, err := c.Writer.Write(responseBody); err != nil {
 		return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
@@ -115,10 +140,93 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	return nil
 }
 
-// rewriteSystemOneResponse reports the model name the client asked for and
-// drops the upstream account block, which names the provider's own billing
-// source rather than anything the caller can use. Bodies that are not a JSON
-// object pass through unchanged.
+// systemOneFailure answers a non-2xx upstream. A status the caller can act on
+// keeps its own value and document; anything else leaves the retry loop to
+// decide, so a transient upstream fault still retries.
+func systemOneFailure(c *gin.Context, info *relaycommon.RelayInfo, httpResp *http.Response, statusCodeMappingStr string) *types.NewAPIError {
+	body, readErr := readSystemOneUpstreamBody(httpResp)
+	if readErr != nil {
+		return service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+	}
+
+	if apiError := systemOneUpstreamError(httpResp.StatusCode, body, httpResp.Header.Get("Retry-After")); apiError != nil {
+		if retryAfter := httpResp.Header.Get("Retry-After"); retryAfter != "" {
+			c.Writer.Header().Set("Retry-After", retryAfter)
+		}
+		service.ResetStatusCode(apiError, statusCodeMappingStr)
+		// The channel answered; whether it is at fault is the disable check's
+		// business. An upstream that rejects this body is not, so the retry loop
+		// must not count it against the channel.
+		return apiError
+	}
+
+	apiError := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+	service.ResetStatusCode(apiError, statusCodeMappingStr)
+	return apiError
+}
+
+// systemOneValidationRefusal is the error a rejected body answers with. It is
+// never sent to another channel, because every channel answers the same way, and
+// the document it carries is the one the client reads: the array of rejected
+// fields, written verbatim by the error writer.
+func systemOneValidationRefusal(problems []systemone.ValidationError) *types.NewAPIError {
+	document, err := common.Marshal(systemone.ValidationDocument(problems))
+	if err != nil {
+		return types.NewErrorWithStatusCode(
+			errors.New(systemOneValidationSummary(problems)),
+			types.ErrorCodeInvalidRequest,
+			http.StatusUnprocessableEntity,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	apiError := types.NewErrorWithStatusCode(
+		errors.New(systemOneValidationSummary(problems)),
+		types.ErrorCodeInvalidRequest,
+		http.StatusUnprocessableEntity,
+		types.ErrOptionWithSkipRetry(),
+	)
+	apiError.Metadata = document
+	return apiError
+}
+
+// systemOneForwardableBody answers the JSON to validate and forward. A multipart
+// request is folded into the JSON shape first, because that is the only shape the
+// rest of the path reads.
+func systemOneForwardableBody(c *gin.Context, rawBody []byte) ([]byte, *types.NewAPIError) {
+	if !common.IsMultipartFormContentType(c.GetHeader("Content-Type")) {
+		return rawBody, nil
+	}
+	joined, problems := systemone.MultipartBody(c.GetHeader("Content-Type"), rawBody)
+	if len(problems) > 0 {
+		return nil, systemOneValidationRefusal(problems)
+	}
+	return joined, nil
+}
+
+// systemOneValidationSummary is the one-line message the error log records for a
+// rejected body. The client reads the array, so this is only for the log.
+func systemOneValidationSummary(problems []systemone.ValidationError) string {
+	if len(problems) == 0 {
+		return "request rejected"
+	}
+	var fields []string
+	for _, problem := range problems {
+		fields = append(fields, systemOneFieldPath(problem.Loc))
+	}
+	return "request rejected: " + strings.Join(fields, ", ")
+}
+
+func systemOneFieldPath(loc []any) string {
+	parts := make([]string, 0, len(loc))
+	for _, item := range loc {
+		parts = append(parts, fmt.Sprint(item))
+	}
+	return strings.Join(parts, ".")
+}
+
+// rewriteSystemOneResponse reports the model name the client asked for, drops
+// the upstream account block, and leaves only the two usage counters the
+// contract declares. Bodies that are not a JSON object pass through unchanged.
 func rewriteSystemOneResponse(responseBody []byte, modelName string) []byte {
 	var response map[string]any
 	if err := common.Unmarshal(responseBody, &response); err != nil {
@@ -130,6 +238,13 @@ func rewriteSystemOneResponse(responseBody []byte, modelName string) []byte {
 	delete(response, "opencode")
 	if usage, ok := response["usage"].(map[string]any); ok {
 		delete(usage, "opencode")
+		// The Usage schema declares input_tokens and output_tokens and nothing
+		// else; a strict client rejects the document when another key is there.
+		for key := range usage {
+			if key != "input_tokens" && key != "output_tokens" {
+				delete(usage, key)
+			}
+		}
 	}
 	rewritten, err := common.Marshal(response)
 	if err != nil {

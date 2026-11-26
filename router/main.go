@@ -18,6 +18,7 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 	SetDashboardRouter(router)
 	if common.RunsRelay() {
 		SetRelayRouter(router)
+		SetSystemOneRouter(router)
 		// The playground relays model requests too, so it lives with the relay
 		// routes instead of on the admin.
 		SetPlaygroundRouter(router)

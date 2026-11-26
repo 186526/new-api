@@ -653,7 +653,7 @@ func isJSONRequest(c *gin.Context) bool {
 	if c == nil || c.Request == nil {
 		return false
 	}
-	return strings.HasPrefix(c.Request.Header.Get("Content-Type"), "application/json")
+	return common.RequestIsJSON(c.Request)
 }
 
 // detectImageMimeType determines the MIME type based on the file extension

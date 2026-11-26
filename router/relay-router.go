@@ -64,6 +64,10 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
+	// The legacy /v1/systemone alias answers the System One contract too, so its
+	// errors are shaped before authentication can refuse the request. Every
+	// other path on this group keeps the OpenAI family.
+	relayV1Router.Use(middleware.SystemOneErrorShape())
 	relayV1Router.Use(middleware.TokenAuth())
 	{
 		// Responses WebSocket route. Channel selection happens after the first
@@ -82,6 +86,12 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		//http router
 		httpRouter := relayV1Router.Group("")
+		// The System One checks act on the contract paths only and pass every
+		// other request through; they run before channel selection because a
+		// model the contract does not serve would otherwise be reported as a
+		// capacity failure.
+		httpRouter.Use(middleware.SystemOneBodyLimit())
+		httpRouter.Use(middleware.SystemOneModelGuard())
 		httpRouter.Use(middleware.Distribute())
 
 		// claude related routes
@@ -109,7 +119,9 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatOpenAIAlphaSearch)
 		})
 
-		// TypeSafe decision model
+		// TypeSafe decision model. The legacy alias answers the same contract as
+		// /systemone/v1/systemone, error family included, so a client that moved
+		// to the new prefix reads one shape on both.
 		httpRouter.POST("/systemone", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatSystemOne)
 		})

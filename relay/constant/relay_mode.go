@@ -80,7 +80,7 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeResponses
 	} else if strings.HasPrefix(path, "/v1/alpha/search") {
 		relayMode = RelayModeAlphaSearch
-	} else if strings.HasPrefix(path, "/v1/systemone") {
+	} else if strings.HasPrefix(path, SystemOneContractPathPrefix) || strings.HasPrefix(path, "/v1/systemone") {
 		relayMode = RelayModeSystemOne
 	} else if strings.HasPrefix(path, "/v1/tools/search") {
 		relayMode = RelayModeToolsSearch

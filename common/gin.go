@@ -138,11 +138,13 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 		return err
 	}
 	contentType := c.Request.Header.Get("Content-Type")
+	mediaType := MediaTypeOf(contentType)
+	isJSONBody := IsJSONMediaType(mediaType)
 
 	// disk-backed JSON: stream-decode directly from the file to avoid
 	// materializing the entire payload back into a transient []byte
 	// (diskStorage.Bytes() would ReadFull the whole file into the heap).
-	if storage.IsDisk() && strings.HasPrefix(contentType, "application/json") {
+	if storage.IsDisk() && isJSONBody {
 		if _, seekErr := storage.Seek(0, io.SeekStart); seekErr != nil {
 			return seekErr
 		}
@@ -160,11 +162,11 @@ func UnmarshalBodyReusable(c *gin.Context, v any) error {
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(contentType, "application/json") {
+	if isJSONBody {
 		err = Unmarshal(requestBody, v)
-	} else if strings.Contains(contentType, gin.MIMEPOSTForm) {
+	} else if mediaType == gin.MIMEPOSTForm {
 		err = parseFormData(requestBody, v)
-	} else if strings.Contains(contentType, gin.MIMEMultipartPOSTForm) {
+	} else if mediaType == gin.MIMEMultipartPOSTForm {
 		err = parseMultipartFormData(c, requestBody, v)
 	} else {
 		// skip for now
@@ -288,6 +290,10 @@ func ApiError(c *gin.Context, err error) {
 // ApiErrorStatus is ApiError with another HTTP status. fields adds response
 // fields such as a stable error code or data.
 func ApiErrorStatus(c *gin.Context, status int, err error, fields ...gin.H) {
+	if AnswersInTypeSafeShape(c) {
+		WriteTypeSafeError(c, status, TypeSafeMessage(status, err))
+		return
+	}
 	body := gin.H{
 		"success": false,
 		"message": err.Error(),

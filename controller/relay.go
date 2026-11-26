@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -295,6 +296,19 @@ func writeRelayErrorFrame(c *gin.Context, ws *websocket.Conn, format types.Relay
 			"error": apiError.ToClaudeError(upstreamURLs...),
 		})
 	default:
+		if common.AnswersInTypeSafeShape(c) {
+			// A refusal the upstream wrote carries its own document, including
+			// the field locations of a validation array, so the client reads
+			// what the upstream said rather than a sentence about the status.
+			if len(apiError.Metadata) > 0 && json.Valid(apiError.Metadata) {
+				c.Data(apiError.StatusCode, "application/json; charset=utf-8", apiError.Metadata)
+				return
+			}
+			openAIError := apiError.ToOpenAIError(upstreamURLs...)
+			status := common.TypeSafeStatusForErrorCode(apiError.StatusCode, string(apiError.GetErrorCode()))
+			common.WriteTypeSafeError(c, status, openAIError.Message)
+			return
+		}
 		c.JSON(apiError.StatusCode, gin.H{
 			"error": apiError.ToOpenAIError(upstreamURLs...),
 		})
