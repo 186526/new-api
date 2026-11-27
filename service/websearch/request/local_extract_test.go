@@ -315,3 +315,100 @@ func TestLocalFetchSeparatesTheBlocksOfAContainer(t *testing.T) {
 		t.Errorf("the space HTML puts between two inline nodes was dropped:\n%s", got)
 	}
 }
+
+// A page whose body sits past the old 200 KB read limit still extracts. On
+// github.com and kubernetes.io the download stopped before the article, so both
+// answered 200 with 15 bytes and nothing at all.
+func TestLocalFetchReadsPastTheOldBodyLimit(t *testing.T) {
+	// Comments carry the length without adding a container the density scan
+	// could pick over the article.
+	padding := strings.Repeat("<!--"+strings.Repeat("x", 40)+"-->\n", 6000)
+	page := `<html><body>` + padding + `
+<main><article><h1>A page behind a wall of markup</h1>
+<p>` + strings.Repeat("The body of the article. ", 20) + `</p></article></main></body></html>`
+	if len(page) <= 200<<10 {
+		t.Fatalf("the fixture must exceed the old 200 KB limit, got %d bytes", len(page))
+	}
+
+	got := fetchLocalPage(t, page)
+	if !strings.Contains(got, "A page behind a wall of markup") {
+		t.Errorf("the body did not survive the download limit:\n%s", got)
+	}
+}
+
+// A code block keeps its own line breaks. localNodeText folded every newline into
+// one space, which put a REPL transcript's every line on one line.
+func TestLocalFetchKeepsTheLinesOfACodeBlock(t *testing.T) {
+	page := `<html><body><main><article><h1>REPL</h1>
+<p>Run it:</p>
+<pre>$ python -m asyncio
+&gt;&gt;&gt; import asyncio
+&gt;&gt;&gt; await asyncio.sleep(10, result='hello')
+'hello'</pre>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	block := got[strings.Index(got, "```"):]
+	for _, line := range []string{"$ python -m asyncio", ">>> import asyncio", "'hello'"} {
+		if !strings.Contains(block, line) {
+			t.Errorf("%q is not a line of its own inside the fence:\n%s", line, got)
+		}
+	}
+}
+
+// A list item whose text sits in a paragraph keeps its bullet on the same line.
+// Writing "- " before the children let the paragraph's blank line start the text
+// on the next line, which markdown reads as an empty bullet.
+func TestLocalFetchKeepsABulletBesideItsText(t *testing.T) {
+	page := `<html><body><main><article><h1>APIs</h1>
+<p>asyncio provides:</p>
+<ul><li><p>run coroutines concurrently;</p></li>
+<li><p>perform network IO;</p></li></ul>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	for _, line := range []string{"- run coroutines concurrently;", "- perform network IO;"} {
+		if !strings.Contains(got, line) {
+			t.Errorf("%q missing: the bullet and its text were split\n%s", line, got)
+		}
+	}
+}
+
+// A table used to place the page rather than to hold data is walked as blocks.
+// news.ycombinator.com nests a three-column table per story, and rendering every
+// one as a row turned its front page into a single `| --- |` line.
+func TestLocalFetchWalksALayoutTableAsBlocks(t *testing.T) {
+	page := `<html><body><main><article><h1>Stories</h1>
+<table><tr><td>1.</td><td></td><td><a href="/a">A story title</a></td></tr>
+<tr><td colspan="2"></td><td>187 points by someone</td></tr>
+<tr><td>2.</td><td></td><td><a href="/b">Another story</a></td></tr>
+<tr><td colspan="2"></td><td>655 points by another</td></tr></table>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	if strings.Contains(got, "| --- |") {
+		t.Errorf("a layout table was rendered as a grid:\n%s", got)
+	}
+	for _, wanted := range []string{"A story title", "187 points by someone", "Another story"} {
+		if !strings.Contains(got, wanted) {
+			t.Errorf("%q missing:\n%s", wanted, got)
+		}
+	}
+}
+
+// A real grid still renders as a table, columns intact.
+func TestLocalFetchKeepsADataTable(t *testing.T) {
+	page := `<html><body><main><article><h1>Protocols</h1>
+<table><tr><th>Protocol</th><th>Location</th></tr>
+<tr><td>HTTP</td><td>https://www.kernel.org/pub/</td></tr>
+<tr><td>GIT</td><td>https://git.kernel.org/</td></tr></table>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	if !strings.Contains(got, "| Protocol | Location |") || !strings.Contains(got, "| --- | --- |") {
+		t.Errorf("a data table lost its grid:\n%s", got)
+	}
+	if !strings.Contains(got, "| HTTP | https://www.kernel.org/pub/ |") {
+		t.Errorf("a data row lost its columns:\n%s", got)
+	}
+}

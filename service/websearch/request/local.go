@@ -21,8 +21,12 @@ import (
 )
 
 const (
-	localFetchTimeout    = 20 * time.Second
-	localFetchBodyLimit  = 200 << 10 // 200 KB
+	localFetchTimeout = 20 * time.Second
+	// localFetchBodyLimit bounds one download. At 200 KB the limit cut the page
+	// before its body: github.com/186526/new-api is 443 KB and
+	// kubernetes.io/docs/concepts/overview 508 KB, so both extracted to nothing,
+	// while the same bytes parsed locally yielded 15.7 KB and 10.8 KB.
+	localFetchBodyLimit  = 2 << 20 // 2 MB
 	localExtractMaxChars = 400_000
 	// localExtractMinChars is the least text a chosen container must hold. Below
 	// it the container is a headline or a teaser rather than the page, and the
@@ -665,8 +669,7 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL, lin
 		out.WriteString("---")
 		ensureLocalBlankLine(out)
 	case "li":
-		out.WriteString("\n- ")
-		writeChildNodes()
+		writeLocalListItem(out, node, base, link)
 	case "ul", "ol", "menu":
 		ensureLocalBlankLine(out)
 		writeChildNodes()
@@ -682,7 +685,10 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL, lin
 	case "pre":
 		ensureLocalBlankLine(out)
 		out.WriteString("```\n")
-		out.WriteString(strings.TrimRight(localNodeText(node), "\n"))
+		// The text is taken verbatim: localNodeText folds whitespace, which put a
+		// REPL transcript's every line on one line. The indentation and the line
+		// breaks are the code.
+		out.WriteString(strings.Trim(localRawText(node), "\n"))
 		out.WriteString("\n```")
 		ensureLocalBlankLine(out)
 	case "a":
@@ -716,13 +722,27 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL, lin
 		out.WriteString("]")
 	case "table":
 		ensureLocalBlankLine(out)
-		writeLocalTable(out, node)
+		// A table is a layout device on many pages, not a data grid. Rendering the
+		// whole of news.ycombinator.com as one turned its front page into a single
+		// `| --- |` row holding every story, so a layout table is walked as blocks.
+		if localIsLayoutTable(node) {
+			writeChildNodes()
+		} else {
+			writeLocalTable(out, node)
+		}
 		ensureLocalBlankLine(out)
 	case "thead", "tbody", "tfoot", "caption", "colgroup", "col":
-		// Rows are written by the table itself; these elements only group them.
-	case "tr", "td", "th":
-		// A row outside a table still reads better as text than as bare cells.
+		// A data table writes its own rows and never walks into these; reaching
+		// this branch means the table is a layout table, where they are only
+		// groupings to descend through. Swallowing them emptied news.ycombinator.com,
+		// whose whole page sits inside one tbody.
 		writeChildNodes()
+	case "tr", "td", "th":
+		// A row or cell reaches this branch only inside a layout table, where each
+		// one is a block of the page rather than a column of a grid.
+		ensureLocalBlankLine(out)
+		writeChildNodes()
+		ensureLocalBlankLine(out)
 	case "div", "section", "article", "main", "header", "footer", "aside",
 		"figure", "figcaption", "dl", "dt", "dd", "details", "summary", "address",
 		"fieldset", "legend", "nav":
@@ -767,6 +787,136 @@ func localLinkText(text, target string) string {
 		trailing = " "
 	}
 	return leading + "[" + label + "](" + target + ")" + trailing
+}
+
+// writeLocalListItem writes one list item as a bullet. The content is rendered
+// into a scratch buffer first: a list item commonly wraps its text in a
+// paragraph, and writing "- " before the children let the paragraph's own blank
+// line push the text onto the next one, which markdown reads as an empty bullet
+// followed by a paragraph.
+func writeLocalListItem(out *strings.Builder, node *html.Node, base *url.URL, link string) {
+	var inner strings.Builder
+	writeLocalChildren(&inner, node, base, link)
+	text := strings.TrimSpace(inner.String())
+	if text == "" {
+		return
+	}
+	ensureLocalBlankLine(out)
+	for index, line := range strings.Split(text, "\n") {
+		if index == 0 {
+			out.WriteString("- " + strings.TrimSpace(line) + "\n")
+			continue
+		}
+		out.WriteString(strings.TrimRight(line, " \t") + "\n")
+	}
+}
+
+// localIsLayoutTable reports whether a table lays the page out rather than
+// holding data.
+//
+// A grid balances its columns, so no single cell of a row holds most of the
+// row's text. news.ycombinator.com nests a three-column table per story whose
+// cells are a rank digit, an empty vote arrow and the title: judging by column
+// count alone made every story a `| --- |` row. A table nesting another table is
+// a layout wrapper too, since the outer one exists to place the inner one.
+func localIsLayoutTable(node *html.Node) bool {
+	// A table nested in a table is a wrapper placing the inner one, and a heading
+	// row marks a real grid whatever its cells hold.
+	if localHoldsElement(node, "th") {
+		return false
+	}
+	rows := localTableRows(node)
+	if len(rows) == 0 {
+		return true
+	}
+	width := 0
+	for _, row := range rows {
+		if len(row) > width {
+			width = len(row)
+		}
+	}
+	// One column is never a grid: the table exists to stack blocks, which is how
+	// news.ycombinator.com wraps its whole page.
+	if width <= 1 {
+		return true
+	}
+	for _, row := range rows {
+		if localRowIsLayout(row) {
+			return true
+		}
+	}
+	return false
+}
+
+// localRowIsLayout reports a row whose text sits in one cell while the rest stay
+// near-empty, which is a column of the page rather than one line of a grid.
+func localRowIsLayout(row []string) bool {
+	if len(row) <= 1 {
+		return false
+	}
+	total, largest := 0, 0
+	for _, cell := range row {
+		size := len(strings.TrimSpace(cell))
+		total += size
+		if size > largest {
+			largest = size
+		}
+	}
+	// A row holding one short cell and one long one is a label and a value, which
+	// is still a grid; only a row that empties every cell but one is a layout.
+	nonEmpty := 0
+	for _, cell := range row {
+		if len(strings.TrimSpace(cell)) > 0 {
+			nonEmpty++
+		}
+	}
+	return nonEmpty <= 1 || largest*10 >= total*8
+}
+
+// localHoldsElement reports whether a subtree contains an element of the tag.
+func localHoldsElement(node *html.Node, tag string) bool {
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type == html.ElementNode {
+			if child.Data == tag {
+				return true
+			}
+			if localHoldsElement(child, tag) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// localRawText joins the text of a subtree unchanged, which is what a code block
+// needs: localNodeText folds every newline and run of spaces into one space.
+func localRawText(node *html.Node) string {
+	var out strings.Builder
+	var walk func(*html.Node)
+	walk = func(current *html.Node) {
+		if current.Type == html.ElementNode && localDroppedElement(current) {
+			return
+		}
+		if localNodeHidden(current) {
+			return
+		}
+		switch current.Type {
+		case html.TextNode:
+			out.WriteString(current.Data)
+		case html.ElementNode:
+			switch current.Data {
+			case "br":
+				out.WriteString("\n")
+			case "p", "div", "li", "tr":
+				out.WriteString("\n")
+			}
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(node)
+	return out.String()
 }
 
 // writeLocalTable renders a table as markdown rows. www.kernel.org puts its
