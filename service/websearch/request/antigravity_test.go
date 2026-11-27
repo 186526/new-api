@@ -198,6 +198,9 @@ func TestAntigravityResolveSearchRedirectsKeepsTheShortLinkOnFailure(t *testing.
 		if got := search.Results[0].URL; got != citation {
 			t.Fatalf("round %d Result.URL = %q, want the unresolved short link %q", round, got, citation)
 		}
+		if got := search.Results[0].SiteName; got != "" {
+			t.Fatalf("round %d Result.SiteName = %q, want empty: an unresolved link names only the redirect service", round, got)
+		}
 	}
 
 	// A failure must not be cached: the second round asks again, so a transient

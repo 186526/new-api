@@ -252,13 +252,24 @@ func ResolveSearchRedirects(ctx context.Context, channel abstract.ChannelContext
 	}
 	wait.Wait()
 
-	for index, location := range resolved {
+	for _, index := range targets {
+		location, found := resolved[index]
+		if !found {
+			// The link could not be followed, so the only host known is the
+			// redirect service's. Naming it as the site of the page would tell
+			// the caller the result lives on vertexaisearch, so the field is
+			// cleared instead: an unknown site reads as unknown.
+			search.Results[index].SiteName = ""
+			search.Results[index].Known.SiteName = false
+			continue
+		}
 		search.Results[index].URL = location
 		// The site name was read off the redirect service before the link was
 		// followed. Replacing the URL without it would leave the caller with the
 		// page's address but the redirect service's name.
 		if host := hostOfURL(location); host != "" {
 			search.Results[index].SiteName = host
+			search.Results[index].Known.SiteName = true
 		}
 	}
 }
