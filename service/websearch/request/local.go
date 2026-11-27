@@ -28,6 +28,9 @@ const (
 	// it the container is a headline or a teaser rather than the page, and the
 	// whole body is rendered instead.
 	localExtractMinChars = 400
+	// localHeadingMinChars is the least text a heading must hold to count as one.
+	// A page ships empty headings in nav wrappers for its own layout.
+	localHeadingMinChars = 2
 )
 
 // droppedElements carry navigation, scripting or chrome rather than the body the
@@ -48,6 +51,89 @@ var droppedElements = map[string]bool{
 	"iframe":   true,
 	"svg":      true,
 	"template": true,
+	"dialog":   true,
+	"menu":     true,
+	"button":   true,
+}
+
+// localChromeNameParts are the words a class or id uses to name a block that
+// holds something other than the article. The list is Readability.js's negative
+// class list, which readeck's go-readability carries as
+// internal/re2go/class-weight.re; keeping the same words means a page that
+// library drops is dropped here too.
+//
+// A part matches only between separators (-, _, space, or the ends of the
+// token), so "ad" matches "ad-slot" and "sidebar-ad" but not "author" or "load".
+var localChromeNameParts = []string{
+	"ad", "banner", "combx", "comment", "com", "contact", "footer", "gdpr",
+	"masthead", "meta", "outbrain", "promo", "related", "share", "shoutbox",
+	"sidebar", "skyscraper", "sponsor", "shopping", "tags", "widget",
+	"nav", "menu", "breadcrumb", "pagination", "cookie", "consent", "newsletter",
+	"subscribe", "popup", "modal", "toolbar", "skip", "search", "social",
+	"copyright", "recommend",
+}
+
+// localChromeExactNames are names that must match the whole token. They are too
+// short or too common to match as a part without hitting content: "hid" is
+// inside "hidden" but also inside nothing useful, and "com" would match
+// "comment" twice.
+var localChromeExactNames = map[string]bool{
+	"hid": true, "hidden": true, "d-none": true,
+}
+
+// localPositiveNameParts are the words that name an article body. Readability.js
+// scores them +25 against the negative list's -25, which is what keeps a page
+// that wraps its article in a div named "content" from being pruned.
+var localPositiveNameParts = []string{
+	"article", "body", "content", "entry", "hentry", "main", "page", "post",
+	"text", "blog", "story",
+}
+
+// localNameTokens splits a class or id into the tokens a name check reads. An
+// attribute value holds several classes separated by spaces, and a class itself
+// uses - and _ between words.
+func localNameTokens(value string) []string {
+	var tokens []string
+	for _, field := range strings.Fields(strings.ToLower(value)) {
+		for _, token := range strings.FieldsFunc(field, func(r rune) bool {
+			return r == '-' || r == '_'
+		}) {
+			if token != "" {
+				tokens = append(tokens, token)
+			}
+		}
+	}
+	return tokens
+}
+
+// localChromeWeight scores a node's class and id the way Readability.js does:
+// -25 for a negative name, +25 for a positive one, summed over both attributes.
+func localChromeWeight(node *html.Node) int {
+	weight := 0
+	for _, attr := range node.Attr {
+		if attr.Key != "class" && attr.Key != "id" {
+			continue
+		}
+		for _, token := range localNameTokens(attr.Val) {
+			if localChromeExactNames[token] {
+				weight -= 25
+				continue
+			}
+			for _, part := range localChromeNameParts {
+				if token == part {
+					weight -= 25
+					break
+				}
+			}
+			for _, part := range localPositiveNameParts {
+				if token == part || strings.HasPrefix(token, part) {
+					weight += 25
+					break
+				}
+			}
+		}
+	}
+	return weight
 }
 
 // localDroppedElement reports whether a node is chrome rather than body text.
@@ -61,6 +147,153 @@ func localDroppedElement(node *html.Node) bool {
 		return !localInsideArticle(node)
 	}
 	return true
+}
+
+// localChromeNamed reports whether a node's class or id names a block that holds
+// something other than the article. The name is read as whole words: the parts
+// are compared to tokens, so "author" and "load" do not match "ad".
+func localChromeNamed(node *html.Node) bool {
+	return localChromeWeight(node) < 0
+}
+
+// pruneLocalChrome removes the blocks Readability.js removes in
+// cleanConditionally: a container whose text is mostly links is a navigation
+// list, and a container that names itself chrome without one positive name is
+// chrome. A block holding most of the page is kept regardless, because a page
+// may wrap its whole article in a div whose name says otherwise.
+func pruneLocalChrome(root *html.Node) {
+	total := localContentDensity(root)
+	if total <= 0 {
+		return
+	}
+	var drop []*html.Node
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			if child.Type == html.ElementNode && localPrunableChrome(child, total) {
+				drop = append(drop, child)
+				continue
+			}
+			walk(child)
+		}
+	}
+	walk(root)
+	// The nodes are collected before any is detached: removing during the walk
+	// would clear the sibling pointer the loop is about to read.
+	for _, node := range drop {
+		if node.Parent != nil {
+			node.Parent.RemoveChild(node)
+		}
+	}
+}
+
+// localPrunableChrome reports whether a node is a chrome block to remove.
+//
+// Readability.js decides this while it already holds the article candidate, so a
+// rule as broad as "mostly links" is safe there. Pruning the whole page instead
+// hits a listing page, whose every entry is a title link with no prose around it,
+// and every bare <a>. Three conditions keep those: the node must be a container,
+// it must hold no heading (a listing entry has its title as one), and it must be
+// small next to the page. What is left is navigation, breadcrumbs, a link footer
+// and a sticky sub-nav, which is what a reader-facing extractor should drop.
+func localPrunableChrome(node *html.Node, pageDensity int) bool {
+	if !localChromeContainer(node) {
+		return false
+	}
+	// The page's data lives in its tables: a table of releases or of prices is
+	// named by the page as a widget and is still the content. A block inside a
+	// code sample is part of the listing, not chrome.
+	if localInsideDataTable(node) || localInsideCode(node) {
+		return false
+	}
+	// A block that holds most of the page is the page: a wrapper named "widget"
+	// around the whole article must not empty the answer.
+	if localContentDensity(node)*10 >= pageDensity {
+		return false
+	}
+	if localHoldsHeading(node) {
+		return false
+	}
+	linkDensity := localLinkDensity(node)
+	// A block the page names as chrome and that is mostly links is dropped.
+	if localChromeWeight(node) < 0 && linkDensity > 0.5 {
+		return true
+	}
+	// A block that is almost nothing but links is a navigation strip even when
+	// the page gave it no telling name: linux.org's secondary section links are
+	// div.p-sectionLinks-inner, which scores zero against both word lists.
+	return linkDensity > 0.85
+}
+
+// localChromeContainer reports whether a node is a block that can hold a
+// navigation list, a share bar or a comment section. An inline element is never
+// one, so a bare <a> is not pruned for being all link text.
+func localChromeContainer(node *html.Node) bool {
+	switch node.Data {
+	case "div", "section", "aside", "ul", "ol", "menu", "header", "footer",
+		"form", "widget", "table":
+		return true
+	}
+	return false
+}
+
+// localLinkDensity is the share of a block's text that sits inside links.
+func localLinkDensity(node *html.Node) float64 {
+	total, linked := localTextAndLinkDensity(node, false)
+	if total == 0 {
+		return 0
+	}
+	return float64(linked) / float64(total)
+}
+
+func localTextAndLinkDensity(node *html.Node, inLink bool) (int, int) {
+	total, linked := 0, 0
+	var walk func(*html.Node, bool)
+	walk = func(current *html.Node, linkedNow bool) {
+		if current.Type == html.ElementNode && localDroppedElement(current) {
+			return
+		}
+		if localNodeHidden(current) {
+			return
+		}
+		link := linkedNow || current.Data == "a"
+		if current.Type == html.TextNode {
+			length := len(strings.TrimSpace(current.Data))
+			total += length
+			if link {
+				linked += length
+			}
+		}
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			walk(child, link)
+		}
+	}
+	walk(node, inLink)
+	return total, linked
+}
+
+// localInsideDataTable reports whether a node sits within a table that holds data
+// rather than layout.
+func localInsideDataTable(node *html.Node) bool {
+	for parent := node.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type == html.ElementNode && parent.Data == "table" {
+			return true
+		}
+	}
+	return false
+}
+
+// localInsideCode reports whether a node sits within a code sample, which is
+// three levels up at most: a fenced listing nests a div or two.
+func localInsideCode(node *html.Node) bool {
+	depth := 0
+	for parent := node.Parent; parent != nil && depth < 3; parent = parent.Parent {
+		if parent.Type == html.ElementNode && (parent.Data == "code" || parent.Data == "pre") {
+			return true
+		}
+		depth++
+	}
+	return false
 }
 
 // localInsideArticle reports whether a node sits within an <article>. A listing
@@ -124,7 +357,9 @@ func localNodeHidden(node *html.Node) bool {
 			// A style attribute holds declarations, so the value is compared with
 			// its spaces and case removed rather than matched as written.
 			normalized := strings.ToLower(strings.NewReplacer(" ", "", "\t", "", "\n", "").Replace(attr.Val))
-			if strings.Contains(normalized, "display:none") {
+			// visibility:hidden reads the same way to a visitor as display:none:
+			// the subtree keeps its space on the page but nothing in it is shown.
+			if strings.Contains(normalized, "display:none") || strings.Contains(normalized, "visibility:hidden") {
 				return true
 			}
 		}
@@ -269,7 +504,8 @@ func (r localRequester) extract(ctx context.Context, target string) (string, err
 
 // extractLocalHTML turns a page into markdown. The extractor is deliberately
 // small: it drops the elements that never hold an article body, picks the
-// densest container the page marks as one, and renders the text of what remains.
+// densest container the page marks as one, removes the named chrome blocks
+// inside it, and renders the text of what remains.
 func extractLocalHTML(body []byte, pageURL *url.URL) (string, error) {
 	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
@@ -280,10 +516,16 @@ func extractLocalHTML(body []byte, pageURL *url.URL) (string, error) {
 	if root == nil {
 		return "", abstract.ErrEmptyContent
 	}
+	// Chrome is pruned only inside a container the page marked as its article.
+	// The fallback is the whole body, where a listing page's own entries look
+	// like navigation and pruning them would drop the answer.
+	if root.Data != "body" && root.Data != "html" {
+		pruneLocalChrome(root)
+	}
 
 	var out strings.Builder
 	renderLocalNode(&out, root, pageURL)
-	content := capLocalText(normalizeLocalMarkdown(out.String()))
+	content := capLocalText(renderLocalMarkdown(out.String()))
 	if content == "" {
 		return "", abstract.ErrEmptyContent
 	}
@@ -626,14 +868,47 @@ func collapseLocalSpace(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
-func normalizeLocalMarkdown(text string) string {
+// renderLocalMarkdown turns the renderer's raw output into markdown a reader
+// shows as structure rather than as text. Three things made the raw output read
+// badly: a line kept the indentation it had in the source, which markdown turns
+// into a code block at four columns; runs of spaces between two nodes stayed in
+// the line; and an empty block left three or more newlines. Fenced code blocks
+// are passed through untouched, since their indentation is the code.
+func renderLocalMarkdown(text string) string {
 	lines := strings.Split(text, "\n")
-	for index, line := range lines {
-		lines[index] = strings.TrimRight(line, " ")
+	out := make([]string, 0, len(lines))
+	inFence := false
+	blanks := 0
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+			out = append(out, strings.TrimRight(line, " \t"))
+			blanks = 0
+			continue
+		}
+		if inFence {
+			out = append(out, strings.TrimRight(line, " \t"))
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			blanks++
+			if blanks > 1 {
+				continue
+			}
+			out = append(out, "")
+			continue
+		}
+		blanks = 0
+		out = append(out, whitespaceRun.ReplaceAllString(trimmed, " "))
 	}
-	joined := strings.Join(lines, "\n")
-	joined = blankLineRun.ReplaceAllString(joined, "\n\n")
-	return strings.TrimSpace(joined)
+	for len(out) > 0 && out[0] == "" {
+		out = out[1:]
+	}
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	return strings.Join(out, "\n")
 }
 
 // capLocalText bounds one page so a huge document cannot fill the caller's
@@ -643,4 +918,22 @@ func capLocalText(text string) string {
 		return text
 	}
 	return text[:localExtractMaxChars]
+}
+
+// localHoldsHeading reports whether a node holds a heading of its own that says
+// something. A heading is what a listing entry is: its title. Navigation, a
+// share bar and a comment list have none — a page may ship an empty heading in a
+// nav wrapper for its own layout, and that must not save the nav from being
+// pruned.
+func localHoldsHeading(node *html.Node) bool {
+	if node.Type == html.ElementNode && len(node.Data) == 2 && node.Data[0] == 'h' &&
+		node.Data[1] >= '1' && node.Data[1] <= '6' {
+		return len(strings.TrimSpace(localNodeText(node))) >= localHeadingMinChars
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if localHoldsHeading(child) {
+			return true
+		}
+	}
+	return false
 }

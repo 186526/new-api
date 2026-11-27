@@ -189,3 +189,81 @@ func TestLocalFetchKeepsAnArticlesOwnHeader(t *testing.T) {
 		t.Errorf("the page banner or footer reached the text:\n%s", got)
 	}
 }
+
+// A sidebar is chrome the page names: its class says so and its text is all
+// links. Keep it, and every answer about the page opens with the site menu.
+func TestLocalFetchDropsANamedSidebar(t *testing.T) {
+	long := strings.Repeat("This is the body of the page. ", 40)
+	page := `<html><body><main><article>
+<h1>The article</h1>
+<p>` + long + `</p>
+<aside><div class="sidebar"><ul>
+<li><a href="/a">Archive</a></li>
+<li><a href="/b">Categories</a></li>
+<li><a href="/c">Subscribe</a></li>
+<li><a href="/d">About</a></li>
+</ul></div></aside>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	if strings.Contains(got, "Archive") || strings.Contains(got, "Subscribe") {
+		t.Errorf("the named sidebar reached the text:\n%s", got)
+	}
+	if !strings.Contains(got, "This is the body of the page.") {
+		t.Errorf("the article body was dropped with the sidebar:\n%s", got)
+	}
+}
+
+// A listing page's entries are title links with no prose. Readability prunes such
+// blocks only inside the candidate it already chose, and so does this extractor:
+// pruning the whole body would empty the page.
+func TestLocalFetchKeepsAListingPagesEntries(t *testing.T) {
+	var entries strings.Builder
+	for _, title := range []string{"First post", "Second post", "Third post", "Fourth post"} {
+		entries.WriteString(`<article><header class="article-header"><h2>` + title + `</h2></header></article>`)
+	}
+	page := `<html><body><div class="container"><main>` + entries.String() + `</main></div></body></html>`
+
+	got := fetchLocalPage(t, page)
+	for _, title := range []string{"First post", "Second post", "Third post", "Fourth post"} {
+		if !strings.Contains(got, title) {
+			t.Errorf("a listing entry was pruned as navigation: %q missing\n%s", title, got)
+		}
+	}
+}
+
+// The renderer used to keep the indentation a line had in the source, which
+// markdown reads as a code block: www.linux.org's first entry came out as
+// "             [PocketBeagle ..." and rendered as preformatted text.
+func TestLocalFetchDoesNotIndentALineIntoACodeBlock(t *testing.T) {
+	long := strings.Repeat("This is the body of the page. ", 40)
+	page := "<html><body><article><h1>The article</h1>\n" +
+		"<p>        " + long + "</p>\n" +
+		"<p>\t\tA tab-indented paragraph.</p>\n" +
+		"</article></body></html>"
+
+	got := fetchLocalPage(t, page)
+	for _, line := range strings.Split(got, "\n") {
+		if line == "" || strings.HasPrefix(line, "```") {
+			continue
+		}
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			t.Errorf("a line kept its indentation, which markdown reads as a code block: %q", line)
+		}
+	}
+}
+
+// A heading is what makes a block a listing entry rather than navigation, so a
+// block holding one is never pruned for being link-heavy.
+func TestLocalFetchKeepsALinkHeavyBlockThatHoldsAHeading(t *testing.T) {
+	long := strings.Repeat("This is the body of the page. ", 40)
+	page := `<html><body><main><article><h1>The article</h1><p>` + long + `</p>
+<div class="related-posts"><h2><a href="/x">A related post with a long title</a></h2>
+<h2><a href="/y">Another related post with a long title</a></h2></div>
+</article></main></body></html>`
+
+	got := fetchLocalPage(t, page)
+	if !strings.Contains(got, "A related post with a long title") {
+		t.Errorf("a block holding headings was pruned as navigation:\n%s", got)
+	}
+}
