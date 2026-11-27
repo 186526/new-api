@@ -185,6 +185,18 @@ var localPageChromeMarkers = []string{
 	"enable javascript",
 	"this site uses cookies",
 	"javascript is disabled",
+	// A page says this to a visitor whose browser it does not recognise. The
+	// notice lives in the markup behind display:none on pages that ship it, so
+	// the extractor normally never reads it; this keeps a page that leaves it
+	// visible from putting it in an answer about that page.
+	"out of date browser",
+	"using an outdated browser",
+	"browser is not supported",
+	// A login box. www.linux.com renders one that is not hidden, and its opening
+	// words read as a description of the page otherwise.
+	"welcome! log into your account",
+	"forgot your password",
+	"sign in to continue",
 }
 
 // localIsPageChrome reports whether a paragraph is the page's interface rather

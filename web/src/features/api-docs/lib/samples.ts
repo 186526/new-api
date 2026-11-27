@@ -334,7 +334,9 @@ function moonshotSearchSamples(
   lang: ApiSampleLanguage,
   ctx: SampleContext
 ): string {
-  const body = { text_query: 'BIRD routing daemon configuration' }
+  // num_results is shown because the endpoint returns nine results by default
+  // and a caller that wants fewer has to ask for it.
+  const body = { text_query: 'BIRD routing daemon configuration', num_results: 5 }
   const url = `${ctx.baseUrl}${ctx.path}`
 
   if (lang === 'curl') {
@@ -347,7 +349,7 @@ function moonshotSearchSamples(
     'response = requests.post(',
     `    "${url}",`,
     `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"text_query": "${body.text_query}"},`,
+    `    json={"text_query": "${body.text_query}", "num_results": ${body.num_results}},`,
     '    timeout=60,',
     ')',
     'for result in response.json()["search_results"]:',

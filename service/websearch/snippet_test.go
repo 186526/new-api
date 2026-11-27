@@ -143,3 +143,36 @@ func TestFillSnippetsReturnsWhenTheCallerGivesUp(t *testing.T) {
 		t.Fatalf("fillSnippets took %v after the caller cancelled, want it to return at once", elapsed)
 	}
 }
+
+// www.linux.com renders a login box that is not hidden, so its opening words are
+// what the page's first prose paragraph looks like after extraction.
+func TestLocalLeadSnippetRejectsALoginBox(t *testing.T) {
+	page := `## What is Linux?
+
+ Sign in Welcome! Log into your account   Forgot your password? Get help   Password recovery Recover your password. A password will be e-mailed to you.
+
+ Linux is a family of open-source Unix-like operating systems based on the Linux kernel.`
+
+	got := localLeadSnippet(page)
+	if strings.Contains(got, "Forgot your password") || strings.Contains(got, "Log into your account") {
+		t.Errorf("snippet = %q, want the login box rejected", got)
+	}
+	if !strings.HasPrefix(got, "Linux is a family of open-source") {
+		t.Errorf("snippet = %q, want the page's own first paragraph", got)
+	}
+}
+
+// A page that leaves its browser notice visible says nothing about itself in it.
+func TestLocalLeadSnippetRejectsABrowserNotice(t *testing.T) {
+	page := `You are using an out of date browser. It may not display this or other websites correctly.
+
+ Linux.org is a community site where Linux users share guides, forum threads and distribution news.`
+
+	got := localLeadSnippet(page)
+	if strings.Contains(got, "out of date browser") {
+		t.Errorf("snippet = %q, want the browser notice rejected: it describes the visitor, not the page", got)
+	}
+	if !strings.HasPrefix(got, "Linux.org is a community site where Linux users") {
+		t.Errorf("snippet = %q, want the page's own first paragraph", got)
+	}
+}

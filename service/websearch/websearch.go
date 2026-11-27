@@ -3,6 +3,8 @@ package websearch
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
@@ -10,6 +12,43 @@ import (
 	"github.com/QuantumNous/new-api/service/websearch/response"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 )
+
+// dropRepeatedSiteResults removes a result that repeats another one's site and
+// snippet. A page the model listed under two of its own URLs yields one hit
+// carrying the same description twice.
+//
+// A site's separate pages stay listed: the snippet has to match as well, so a
+// site's homepage and its documentation are both kept.
+func dropRepeatedSiteResults(results []abstract.Result) []abstract.Result {
+	if len(results) < 2 {
+		return results
+	}
+	kept := results[:0]
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		// An empty snippet identifies nothing, so a result without one is kept
+		// rather than compared: two such results would otherwise collapse.
+		if snippet := strings.TrimSpace(result.Snippet); snippet != "" {
+			key := searchResultHost(result.URL) + "\x00" + snippet
+			if _, duplicated := seen[key]; duplicated {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		kept = append(kept, result)
+	}
+	return kept
+}
+
+// searchResultHost names the site a result belongs to. A URL the parser could not
+// read keeps its whole text, which then matches only an identical entry.
+func searchResultHost(target string) string {
+	parsed, err := url.Parse(strings.TrimSpace(target))
+	if err != nil || parsed.Host == "" {
+		return strings.TrimSpace(target)
+	}
+	return strings.ToLower(parsed.Host)
+}
 
 // Answer is what a relay handler writes back: the client's own contract built
 // from whichever provider answered it.
@@ -161,6 +200,10 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 		// Every result gets a snippet: the page's own lead paragraph when it can
 		// be read inside the budget, the model's own sentence otherwise.
 		fillSnippets(ctx, channel, parsed.Results)
+		// A page the model listed twice under two of its own URLs still reads as
+		// one hit: the second copy is dropped only when it also repeats the
+		// first one's snippet, so a site's separate pages stay listed.
+		parsed.Results = dropRepeatedSiteResults(parsed.Results)
 		// A caller that named a count gets that many results. The cap is applied
 		// here rather than at the upstream because the upstream decides its own
 		// count, and because a native pass-through is never reread.

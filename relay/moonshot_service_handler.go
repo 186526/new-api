@@ -79,7 +79,7 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 		Text: strings.TrimSpace(request_.TextQuery),
 		// The upstream decides how many results it returns, so a cap is applied
 		// to the rendered answer rather than sent to it.
-		Count: request_.NumResults,
+		Count: request_.ResultCount(),
 	}
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
@@ -146,10 +146,21 @@ func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel a
 			writeMoonshotServicePage(c, "")
 			return nil
 		}
+		logger.LogWarn(c.Request.Context(), "moonshot service fetch failed for %q: %v", request_.URL, err)
+		// A target that answered with its own status keeps it: the caller then
+		// tells a mistyped URL from a host that could not be reached, which both
+		// used to read as the same gateway error.
+		if status, answered := request.FetchAnswerStatus(err); answered {
+			return types.NewErrorWithStatusCode(
+				err,
+				types.ErrorCodeBadResponseStatusCode,
+				status,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
 		// The page could not be read at all. Answering 200 with an empty body
 		// would tell the client the page is empty, which is a different fact, so
 		// the failure is reported the way every other upstream failure is.
-		logger.LogWarn(c.Request.Context(), "moonshot service fetch failed for %q: %v", request_.URL, err)
 		return types.NewErrorWithStatusCode(
 			err,
 			types.ErrorCodeBadResponseStatusCode,

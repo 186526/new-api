@@ -96,3 +96,71 @@ func TestLocalFetchRendersATableAsRows(t *testing.T) {
 		t.Errorf("the rows were flattened onto one line:\n%s", got)
 	}
 }
+
+// A page ships text for readers who cannot see the rendered result: a browser
+// upgrade notice, a login dialog, a cookie bar. They sit behind display:none
+// until a script shows them, so reading the markup as written puts a warning
+// about the visitor's own browser into an answer about the page.
+func TestLocalFetchSkipsHiddenSubtrees(t *testing.T) {
+	long := strings.Repeat("This is the body of the page. ", 40)
+	page := `<html><body><article><h1>A page</h1><p>` + long + `</p>
+	<div style="display: none">You are using an out of date browser.</div>
+	<div style="display:none">Compressed hidden notice.</div>
+	<div hidden>Hidden by attribute.</div>
+	<div aria-hidden="true">Hidden from assistive tools.</div>
+	<div style="border: 1px solid red; display:  NONE ">Spaced and cased hidden notice.</div>
+	<p>Visible closing paragraph.</p>
+	</article></body></html>`
+
+	got := fetchLocalPage(t, page)
+	for _, unwanted := range []string{
+		"out of date browser",
+		"Compressed hidden notice",
+		"Hidden by attribute",
+		"Hidden from assistive tools",
+		"Spaced and cased hidden notice",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("a hidden subtree reached the extracted text: %q\n%s", unwanted, got)
+		}
+	}
+	if !strings.Contains(got, "Visible closing paragraph.") {
+		t.Errorf("visible text was dropped along with the hidden subtrees:\n%s", got)
+	}
+}
+
+// A target that answered with its own status keeps it, so a caller tells a
+// mistyped URL from a host that could not be reached.
+func TestLocalFetchReportsTheStatusTheTargetAnswered(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	_, err := localRequesterFor(server).Fetch(context.Background(), abstract.ChannelContext{}, Query{URL: server.URL})
+	if err == nil {
+		t.Fatal("a 404 answered the fetch instead of failing it")
+	}
+	status, answered := FetchAnswerStatus(err)
+	if !answered {
+		t.Fatalf("the status was not carried by the error: %v", err)
+	}
+	if status != http.StatusNotFound {
+		t.Errorf("status = %d, want the target's own %d", status, http.StatusNotFound)
+	}
+}
+
+// A host that cannot be reached answers no status of its own, so the failure
+// stays a gateway error rather than borrowing one.
+func TestLocalFetchReportsNoStatusForAnUnreachableHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	server.Close()
+
+	_, err := localRequesterFor(server).Fetch(context.Background(), abstract.ChannelContext{}, Query{URL: server.URL})
+	if err == nil {
+		t.Fatal("an unreachable host answered the fetch")
+	}
+	if status, answered := FetchAnswerStatus(err); answered {
+		t.Errorf("status = %d was reported for a host that never answered", status)
+	}
+}

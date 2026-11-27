@@ -3,6 +3,7 @@ package request
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -48,6 +49,59 @@ var droppedElements = map[string]bool{
 var whitespaceRun = regexp.MustCompile(`[ \t\f\v]+`)
 
 var blankLineRun = regexp.MustCompile(`\n{3,}`)
+
+// localFetchStatusError reports a target that answered with a non-2xx status.
+// It is a typed value so the relay layer can answer with that status instead of
+// folding a bad URL and an unreachable host into the same gateway error.
+type localFetchStatusError struct {
+	URL        string
+	StatusCode int
+}
+
+func (e localFetchStatusError) Error() string {
+	return fmt.Sprintf("websearch: fetch %s answered %d", e.URL, e.StatusCode)
+}
+
+// FetchAnswerStatus reports the status a fetched target answered with, which a
+// caller relays to its own client so a missing page is not reported as a gateway
+// fault. It reports false for every other failure, including a host that could
+// not be reached.
+func FetchAnswerStatus(err error) (int, bool) {
+	var answered localFetchStatusError
+	if errors.As(err, &answered) {
+		return answered.StatusCode, true
+	}
+	return 0, false
+}
+
+// localNodeHidden reports whether a page keeps this subtree out of sight. A page
+// ships its own text for readers who cannot see the rendered result: a browser
+// upgrade notice, a login dialog and a cookie bar all sit in the markup with
+// display:none until a script shows them. Reading them as content puts a
+// warning about the visitor's browser into an answer about the page.
+func localNodeHidden(node *html.Node) bool {
+	if node.Type != html.ElementNode {
+		return false
+	}
+	for _, attr := range node.Attr {
+		switch attr.Key {
+		case "hidden":
+			return true
+		case "aria-hidden":
+			if strings.EqualFold(strings.TrimSpace(attr.Val), "true") {
+				return true
+			}
+		case "style":
+			// A style attribute holds declarations, so the value is compared with
+			// its spaces and case removed rather than matched as written.
+			normalized := strings.ToLower(strings.NewReplacer(" ", "", "\t", "", "\n", "").Replace(attr.Val))
+			if strings.Contains(normalized, "display:none") {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // localRequester reads a page in-process. It serves fetches only: it has no
 // upstream to ask for a search, so Search refuses instead of faking one.
@@ -158,7 +212,11 @@ func (r localRequester) extract(ctx context.Context, target string) (string, err
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("websearch: fetch %s answered %d", parsed.String(), resp.StatusCode)
+		// The status is carried as a typed value rather than folded into the
+		// message: a caller tells "this page does not exist" from "this host
+		// cannot be reached" only by the status, and both used to read as one
+		// gateway error.
+		return "", localFetchStatusError{URL: parsed.String(), StatusCode: resp.StatusCode}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, localFetchBodyLimit))
@@ -262,6 +320,9 @@ func localContentDensity(node *html.Node) int {
 		if current.Type == html.ElementNode && droppedElements[current.Data] {
 			return
 		}
+		if localNodeHidden(current) {
+			return
+		}
 		link := inLink || current.Data == "a"
 		if current.Type == html.TextNode {
 			length := len(strings.TrimSpace(current.Data))
@@ -286,6 +347,9 @@ func renderLocalNode(out *strings.Builder, node *html.Node, base *url.URL) {
 // end with a blank line so the next block starts on its own paragraph.
 func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 	if node.Type == html.ElementNode && droppedElements[node.Data] {
+		return
+	}
+	if localNodeHidden(node) {
 		return
 	}
 
@@ -487,6 +551,9 @@ func localNodeText(node *html.Node) string {
 	var walk func(*html.Node)
 	walk = func(current *html.Node) {
 		if current.Type == html.ElementNode && droppedElements[current.Data] {
+			return
+		}
+		if localNodeHidden(current) {
 			return
 		}
 		if current.Type == html.TextNode {

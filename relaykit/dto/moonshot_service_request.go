@@ -19,8 +19,21 @@ type MoonshotServiceRequest struct {
 	// NumResults caps how many results a rendered search answer carries. The
 	// upstream decides how many it returns, so this is applied after the answer
 	// arrives; zero leaves it uncapped.
-	NumResults int             `json:"num_results,omitempty"`
+	NumResults int `json:"num_results,omitempty"`
+	// MaxResults is the same cap under the name an earlier revision of the
+	// client documentation used. It is read as a fallback so a caller that
+	// followed that name is capped rather than silently ignored.
+	MaxResults int             `json:"max_results,omitempty"`
 	RawBody    json.RawMessage `json:"-"`
+}
+
+// ResultCount is the cap the caller asked for, under either name. NumResults
+// wins when both are present, because it is the name the client writes today.
+func (r *MoonshotServiceRequest) ResultCount() int {
+	if r.NumResults > 0 {
+		return r.NumResults
+	}
+	return r.MaxResults
 }
 
 func (r *MoonshotServiceRequest) GetTokenCountMeta() *types.TokenCountMeta {

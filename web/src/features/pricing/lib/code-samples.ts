@@ -485,7 +485,9 @@ function buildSystemOneSample(lang: Lang, ctx: SampleContext): string {
 function buildMoonshotSearchSample(lang: Lang, ctx: SampleContext): string {
   const url = `${ctx.baseUrl}${ctx.endpointPath}`
   const textQuery = 'bird routing daemon configuration'
-  const bodyJson = JSON.stringify({ text_query: textQuery }, null, 2)
+  // The endpoint answers nine results unless the request caps it.
+  const numResults = 5
+  const bodyJson = JSON.stringify({ text_query: textQuery, num_results: numResults }, null, 2)
 
   if (lang === 'curl') {
     return [
@@ -502,7 +504,7 @@ function buildMoonshotSearchSample(lang: Lang, ctx: SampleContext): string {
       'response = requests.post(',
       `    "${url}",`,
       `    headers={"Authorization": "Bearer <YOUR_API_KEY>"},`,
-      `    json={"text_query": "${textQuery}"},`,
+      `    json={"text_query": "${textQuery}", "num_results": ${numResults}},`,
       ')',
       '',
       'for result in response.json()["search_results"]:',
@@ -517,7 +519,7 @@ function buildMoonshotSearchSample(lang: Lang, ctx: SampleContext): string {
       `    Authorization: \`Bearer \${process.env.${ctx.apiKeyEnv}}\`,`,
       `    'Content-Type': 'application/json',`,
       `  },`,
-      `  body: JSON.stringify({ text_query: '${textQuery}' }),`,
+      `  body: JSON.stringify({ text_query: '${textQuery}', num_results: ${numResults} }),`,
       `})`,
       '',
       `const data = await response.json()`,
@@ -531,7 +533,7 @@ function buildMoonshotSearchSample(lang: Lang, ctx: SampleContext): string {
     `    Authorization: \`Bearer \${process.env.${ctx.apiKeyEnv}}\`,`,
     `    'Content-Type': 'application/json',`,
     `  },`,
-    `  body: JSON.stringify({ text_query: '${textQuery}' }),`,
+    `  body: JSON.stringify({ text_query: '${textQuery}', num_results: ${numResults} }),`,
     `})`,
     '',
     `const data = await response.json()`,

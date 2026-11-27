@@ -269,3 +269,30 @@ func TestMoonshotServiceFetchReportsAnUnreachablePage(t *testing.T) {
 	assert.True(t, settlement.refunded, "a failed fetch must release the reservation")
 	_ = recorder
 }
+
+// The client documentation used max_results before it used num_results. A caller
+// that followed the earlier name is capped rather than silently ignored.
+func TestMoonshotServiceSearchAcceptsTheAliasCount(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	upstreamBody := `{"results":[` +
+		`{"title":"A","url":"https://a.example/","snippet":"sa"},` +
+		`{"title":"B","url":"https://b.example/","snippet":"sb"},` +
+		`{"title":"C","url":"https://c.example/","snippet":"sc"}]}`
+	recorder, _, apiErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotSearchPath,
+		`{"text_query":"deepseek","max_results":2}`,
+		upstreamBody,
+		constant.ChannelTypeDeepSeek,
+	)
+	require.Nil(t, apiErr)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var answer struct {
+		SearchResults []struct {
+			Title string `json:"title"`
+		} `json:"search_results"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &answer))
+	require.Len(t, answer.SearchResults, 2, "max_results must cap the rendered answer")
+}

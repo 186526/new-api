@@ -98,6 +98,15 @@ describe('Moonshot service code samples', () => {
     }
   })
 
+  it('caps the search result count in the sample', () => {
+    // The endpoint answers nine results unless the request asks for fewer, so a
+    // sample without the cap teaches a caller to read more than it wanted.
+    for (const lang of ['curl', 'python', 'typescript'] as const) {
+      const sample = buildSample(lang, search.endpointType, search)
+      expect(sample).toContain('num_results')
+    }
+  })
+
   it('posts url to the fetch path and says the answer is markdown', () => {
     for (const lang of ['curl', 'python'] as const) {
       const sample = buildSample(lang, fetch.endpointType, fetch)
