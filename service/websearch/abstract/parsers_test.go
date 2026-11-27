@@ -310,12 +310,12 @@ func TestAntigravityParseSearchReadsTheFourthColumn(t *testing.T) {
 	// The current shape: the model adds a sentence of its own words, which is
 	// what a hit falls back to when its page cannot be read. The separator is a
 	// double pipe because a page title may contain a single one.
-	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI1 || November 23 2026 || nginx || Enterprise server and commercial distribution\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI2 || None || Nginx | Wikipedia || Encyclopedia entry about the web server"}]}}]}`)
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI1 || November 23 2026 || nginx || Enterprise server and commercial distribution\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI2 || None || Nginx | Wikipedia || Encyclopedia entry about the web server\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI3 || November 10, 2009 || Go || A language announcement"}]}}]}`)
 	results, err := parserFor(t, "antigravity").ParseSearch(body)
 	if err != nil {
 		t.Fatalf("ParseSearch: %v", err)
 	}
-	if len(results) != 2 {
+	if len(results) != 3 {
 		t.Fatalf("got %d results, want one per line", len(results))
 	}
 	if results[0].Title != "nginx" {
@@ -339,6 +339,11 @@ func TestAntigravityParseSearchReadsTheFourthColumn(t *testing.T) {
 	}
 	if results[1].Summary != "Encyclopedia entry about the web server" {
 		t.Errorf("summary = %q, want the model's own sentence", results[1].Summary)
+	}
+	// The model writes a comma after the day on some pages; the date still reads
+	// as ISO rather than passing through in English month names.
+	if results[2].Date != "2009-11-10" {
+		t.Errorf("date = %q, want ISO 8601 for a date written with a comma", results[2].Date)
 	}
 }
 

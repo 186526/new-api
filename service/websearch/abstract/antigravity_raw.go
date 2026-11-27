@@ -116,8 +116,12 @@ func splitAntigravityTitleAndSummary(last string) (string, string) {
 var antigravityTimeLayouts = []string{
 	"January 2 2006",
 	"January 02 2006",
+	"January 2, 2006",
+	"January 02, 2006",
 	"2 January 2006",
 	"02 January 2006",
+	"2 January, 2006",
+	"02 January, 2006",
 	"2006-01-02",
 }
 
