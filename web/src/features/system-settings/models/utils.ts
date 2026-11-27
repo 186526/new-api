@@ -70,9 +70,10 @@ function extractErrorPosition(
   if (positionMatch) {
     const position = parseInt(positionMatch[1], 10)
     const lines = jsonString.substring(0, position).split('\n')
+    const lastLine = lines.at(-1) ?? ''
     return {
       line: lines.length,
-      column: lines[lines.length - 1].length + 1,
+      column: lastLine.length + 1,
       position,
     }
   }

@@ -21,15 +21,12 @@ export function normalizeDeploymentStatus(status: unknown) {
 }
 
 export function formatRemainingMinutes(mins: unknown) {
-  const n =
-    typeof mins === 'string'
-      ? Number(mins)
-      : typeof mins === 'number'
-        ? mins
-        : NaN
-  if (!Number.isFinite(n)) return null
+  if (typeof mins !== 'string' && typeof mins !== 'number') return null
 
-  const total = Math.max(0, Math.round(n))
+  const minutesValue = Number(mins)
+  if (!Number.isFinite(minutesValue)) return null
+
+  const total = Math.max(0, Math.round(minutesValue))
   const days = Math.floor(total / 1440)
   const hours = Math.floor((total % 1440) / 60)
   const minutes = total % 60

@@ -43,17 +43,16 @@ const COMPACT_NUMBER = new Intl.NumberFormat(undefined, {
   maximumFractionDigits: 1,
 })
 
+const RANK_BADGE_PALETTES: Partial<Record<number, string>> = {
+  1: 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300',
+  2: 'bg-slate-100 text-slate-700 dark:bg-slate-500/20 dark:text-slate-300',
+  3: 'bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300',
+}
+
 function RankBadge(props: { rank: number }) {
   const rank = props.rank
   const isPodium = rank <= 3
-  const palette =
-    rank === 1
-      ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'
-      : rank === 2
-        ? 'bg-slate-100 text-slate-700 dark:bg-slate-500/20 dark:text-slate-300'
-        : rank === 3
-          ? 'bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-300'
-          : 'bg-muted text-muted-foreground'
+  const palette = RANK_BADGE_PALETTES[rank] ?? 'bg-muted text-muted-foreground'
   return (
     <span
       className={cn(
@@ -70,21 +69,20 @@ function GrowthChip(props: { value: number }) {
   const value = props.value
   const isUp = value > 0
   const isDown = value < 0
-  const palette = isUp
-    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
-    : isDown
-      ? 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300'
-      : 'bg-muted text-muted-foreground'
-  const Icon = isUp ? ArrowUpRight : isDown ? ArrowDownRight : null
-  const formatted = `${value > 0 ? '+' : ''}${value.toFixed(1)}%`
+  const formatted = `${isUp ? '+' : ''}${value.toFixed(1)}%`
   return (
     <span
       className={cn(
         'inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums',
-        palette
+        isUp &&
+          'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300',
+        isDown &&
+          'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300',
+        !isUp && !isDown && 'bg-muted text-muted-foreground'
       )}
     >
-      {Icon && <Icon className='size-3' />}
+      {isUp && <ArrowUpRight className='size-3' />}
+      {isDown && <ArrowDownRight className='size-3' />}
       {formatted}
     </span>
   )

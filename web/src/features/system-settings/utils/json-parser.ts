@@ -74,9 +74,10 @@ function getLineAndColumn(
   position: number
 ): { line: number; column: number } {
   const lines = text.substring(0, position).split('\n')
+  const lastLine = lines.at(-1) ?? ''
   return {
     line: lines.length,
-    column: lines[lines.length - 1].length + 1,
+    column: lastLine.length + 1,
   }
 }
 

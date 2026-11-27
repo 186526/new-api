@@ -30,6 +30,7 @@ interface FooterLink {
 }
 
 interface FooterColumnProps {
+  id?: string
   title: string
   links: FooterLink[]
 }
@@ -166,6 +167,7 @@ export function Footer(props: FooterProps) {
   const fallbackColumns = useMemo<FooterColumnProps[]>(
     () => [
       {
+        id: 'about',
         title: t('footer.columns.about.title'),
         links: [
           {
@@ -183,6 +185,7 @@ export function Footer(props: FooterProps) {
         ],
       },
       {
+        id: 'docs',
         title: t('footer.columns.docs.title'),
         links: [
           {
@@ -200,6 +203,7 @@ export function Footer(props: FooterProps) {
         ],
       },
       {
+        id: 'related',
         title: t('footer.columns.related.title'),
         links: [
           {
@@ -272,14 +276,14 @@ export function Footer(props: FooterProps) {
           {/* Links columns */}
           {isDemoSiteMode && (
             <div className='grid grid-cols-3 gap-8 md:gap-16'>
-              {displayColumns.map((column, index) => (
-                <div key={index}>
+              {displayColumns.map((column) => (
+                <div key={column.id ?? column.title}>
                   <p className='text-muted-foreground/50 mb-3 text-xs font-medium tracking-wider uppercase'>
                     {t(column.title)}
                   </p>
                   <ul className='space-y-2.5'>
-                    {column.links.map((link, linkIndex) => (
-                      <li key={linkIndex}>
+                    {column.links.map((link) => (
+                      <li key={link.href}>
                         <FooterLinkItem link={link} />
                       </li>
                     ))}

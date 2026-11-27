@@ -221,10 +221,11 @@ export function useTableUrlState(
         patch[cfg.searchKey] =
           value.trim() !== '' ? serialize(value) : undefined
       } else {
-        const value = Array.isArray(found?.value)
-          ? (found!.value as unknown[])
-          : []
-        patch[cfg.searchKey] = value.length > 0 ? serialize(value) : undefined
+        const value = found?.value
+        patch[cfg.searchKey] =
+          Array.isArray(value) && value.length > 0
+            ? serialize(value)
+            : undefined
       }
     }
 

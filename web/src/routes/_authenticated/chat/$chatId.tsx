@@ -22,7 +22,7 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import { useActiveChatKey } from '@/features/chat/hooks/use-active-chat-key'
 import { useChatPresets } from '@/features/chat/hooks/use-chat-presets'
 import {
@@ -154,12 +154,26 @@ function ChatRouteComponent() {
   }
 
   return (
-    <iframe
-      src={iframeSrc}
-      key={iframeSrc}
-      className='h-full w-full border-0'
-      allow='camera; microphone'
-      title={`Chat preset: ${preset.name}`}
-    />
+    <div className='flex h-full flex-col'>
+      <a
+        href={iframeSrc}
+        target='_blank'
+        rel='noopener noreferrer'
+        className={buttonVariants({
+          variant: 'link',
+          size: 'sm',
+          className: 'self-end',
+        })}
+      >
+        {t('Open in new tab')}
+      </a>
+      <iframe
+        src={iframeSrc}
+        key={iframeSrc}
+        className='min-h-0 w-full flex-1 border-0'
+        sandbox='allow-forms allow-scripts'
+        title={`Chat preset: ${preset.name}`}
+      />
+    </div>
   )
 }
