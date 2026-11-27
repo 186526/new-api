@@ -164,3 +164,28 @@ func TestLocalFetchReportsNoStatusForAnUnreachableHost(t *testing.T) {
 		t.Errorf("status = %d was reported for a host that never answered", status)
 	}
 }
+
+// A listing page puts each entry's title and date in that entry's own header. A
+// header used to be dropped wherever it appeared, so blog.186526.xyz's index
+// page came out empty and a fetch answered 200 with no text at all.
+func TestLocalFetchKeepsAnArticlesOwnHeader(t *testing.T) {
+	page := `<html><body>
+<header class="site-banner"><a href="/">Site name</a></header>
+<main><article>
+<header class="article-header"><h2>First post title</h2><time>10月 27, 2026</time></header>
+</article><article>
+<header class="article-header"><h2>Second post title</h2><time>1月 10, 2026</time></header>
+</article></main>
+<footer class="site-footer">Copyright notice</footer>
+</body></html>`
+
+	got := fetchLocalPage(t, page)
+	for _, wanted := range []string{"First post title", "Second post title", "10月 27, 2026"} {
+		if !strings.Contains(got, wanted) {
+			t.Errorf("an article's own header was dropped with the site banner: %q missing\n%s", wanted, got)
+		}
+	}
+	if strings.Contains(got, "Site name") || strings.Contains(got, "Copyright notice") {
+		t.Errorf("the page banner or footer reached the text:\n%s", got)
+	}
+}

@@ -32,6 +32,10 @@ const (
 
 // droppedElements carry navigation, scripting or chrome rather than the body the
 // caller asked for, so they never reach the extracted text.
+//
+// header and footer are the page's own banner only when they sit outside an
+// article: an article's header carries its title and byline, and dropping it
+// left a listing page with no text at all.
 var droppedElements = map[string]bool{
 	"script":   true,
 	"style":    true,
@@ -44,6 +48,31 @@ var droppedElements = map[string]bool{
 	"iframe":   true,
 	"svg":      true,
 	"template": true,
+}
+
+// localDroppedElement reports whether a node is chrome rather than body text.
+// A header or footer inside an article is the article's own, so it is kept: the
+// page-level one is the banner that localInsideArticle rejects.
+func localDroppedElement(node *html.Node) bool {
+	if !droppedElements[node.Data] {
+		return false
+	}
+	if node.Data == "header" || node.Data == "footer" {
+		return !localInsideArticle(node)
+	}
+	return true
+}
+
+// localInsideArticle reports whether a node sits within an <article>. A listing
+// page puts each entry's title and date in that entry's header, so the element
+// is content there rather than the site banner.
+func localInsideArticle(node *html.Node) bool {
+	for parent := node.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type == html.ElementNode && parent.Data == "article" {
+			return true
+		}
+	}
+	return false
 }
 
 var whitespaceRun = regexp.MustCompile(`[ \t\f\v]+`)
@@ -317,7 +346,7 @@ func localContentDensity(node *html.Node) int {
 	density := 0
 	var walk func(*html.Node, bool)
 	walk = func(current *html.Node, inLink bool) {
-		if current.Type == html.ElementNode && droppedElements[current.Data] {
+		if current.Type == html.ElementNode && localDroppedElement(current) {
 			return
 		}
 		if localNodeHidden(current) {
@@ -346,7 +375,7 @@ func renderLocalNode(out *strings.Builder, node *html.Node, base *url.URL) {
 // walkLocalMarkdown writes one node and its children as markdown. Block elements
 // end with a blank line so the next block starts on its own paragraph.
 func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
-	if node.Type == html.ElementNode && droppedElements[node.Data] {
+	if node.Type == html.ElementNode && localDroppedElement(node) {
 		return
 	}
 	if localNodeHidden(node) {
@@ -550,7 +579,7 @@ func localNodeText(node *html.Node) string {
 	var out strings.Builder
 	var walk func(*html.Node)
 	walk = func(current *html.Node) {
-		if current.Type == html.ElementNode && droppedElements[current.Data] {
+		if current.Type == html.ElementNode && localDroppedElement(current) {
 			return
 		}
 		if localNodeHidden(current) {
