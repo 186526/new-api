@@ -270,10 +270,97 @@ func TestAntigravityParseSearchUsesTheSiteNameWithoutASnippet(t *testing.T) {
 	}
 }
 
-func TestAntigravityParseSearchWithoutGroundingFails(t *testing.T) {
-	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"just an answer"}]}}]}`)
-	if _, err := parserFor(t, "antigravity").ParseSearch(body); err == nil {
-		t.Fatal("expected an error without groundingMetadata")
+func TestAntigravityParseSearchReadsTheURLLines(t *testing.T) {
+	// What the endpoint is asked for: one line per hit, carrying the three facts
+	// a caller cannot recompute. Asking for page prose instead makes the upstream
+	// copyright filter answer RECITATION and drop the body.
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI1 | July 17 2026 | The Go Programming Language\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI2 | None | Linux.org"}]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want one per line", len(results))
+	}
+	first := results[0]
+	if first.Title != "The Go Programming Language" {
+		t.Errorf("title = %q, want the page title", first.Title)
+	}
+	if first.Date != "July 17 2026" {
+		t.Errorf("date = %q, want the publication time", first.Date)
+	}
+	if !first.Known.Date || !first.Known.SiteName {
+		t.Errorf("known = %+v, want date and site name marked", first.Known)
+	}
+	if first.Snippet != "" {
+		t.Errorf("snippet = %q, want empty: the model is not asked to repeat page prose", first.Snippet)
+	}
+	// "None" is how the upstream says a page carries no date.
+	if results[1].Date != "" {
+		t.Errorf("date = %q, want empty for None", results[1].Date)
+	}
+	if !results[1].Known.SiteName || results[1].Known.Date {
+		t.Errorf("known = %+v for a hit without a date", results[1].Known)
+	}
+}
+
+func TestAntigravityParseSearchFallsBackToGroundingWhenTheLinesAreMissing(t *testing.T) {
+	// A model that answers in prose instead of reporting the tool output leaves
+	// the grounding metadata as the only result the upstream produced.
+	body := []byte(`{"candidates":[{
+	  "content":{"parts":[{"text":"Linux is a family of operating systems."}]},
+	  "groundingMetadata":{
+	    "groundingChunks":[{"web":{"uri":"https://a.example","domain":"a.example"}}],
+	    "groundingSupports":[{"segment":{"text":"A cited sentence."},"groundingChunkIndices":[0]}]
+	  }
+	}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if len(results) != 1 || results[0].URL != "https://a.example" {
+		t.Fatalf("results = %+v, want the cited page", results)
+	}
+}
+
+func TestAntigravityParseSearchReportsAProseAnswerWhenNothingWasSearched(t *testing.T) {
+	body := []byte(`{"candidates":[{"content":{"parts":[
+	  {"text":"**Linux** is a free, open-source operating system family. It runs on most servers."}
+	]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want the answer reported as one", len(results))
+	}
+	if results[0].URL != "" || results[0].SiteName != "" {
+		t.Errorf("url = %q site_name = %q, want both empty: nothing was cited", results[0].URL, results[0].SiteName)
+	}
+	if results[0].Title != "Linux is a free, open-source operating system family" {
+		t.Errorf("title = %q, want the first sentence without markdown emphasis", results[0].Title)
+	}
+}
+
+func TestAntigravityParseSearchDropsTheOverlapBetweenSegments(t *testing.T) {
+	// A chunk cited twice in a row arrives as two overlapping segments, which
+	// made the title a copy of the snippet's prefix.
+	body := []byte(`{"candidates":[{"groundingMetadata":{
+	  "groundingChunks":[{"web":{"uri":"https://nginx.org/","domain":"nginx.org"}}],
+	  "groundingSupports":[
+	    {"segment":{"text":"**NGINX** is a web server."},"groundingChunkIndices":[0]},
+	    {"segment":{"text":"**NGINX** is a web server. It also proxies."},"groundingChunkIndices":[0]}
+	  ]
+	}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if got := results[0].Snippet; strings.Count(got, "is a web server") != 1 {
+		t.Errorf("snippet repeats the overlapping sentence: %q", got)
+	}
+	if got := results[0].Title; strings.Contains(got, "*") {
+		t.Errorf("title kept markdown emphasis: %q", got)
 	}
 }
 

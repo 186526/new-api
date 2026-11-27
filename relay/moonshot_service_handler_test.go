@@ -147,3 +147,76 @@ func TestMoonshotServiceFetchSettlesOnlyAPage(t *testing.T) {
 		})
 	}
 }
+
+// An empty answer must read exactly like a full one apart from the array: the
+// handler used to write it through c.JSON, which appends "; charset=utf-8" and
+// so made the two responses disagree on a header the client sees.
+func TestMoonshotServiceEmptySearchCarriesTheSameContentType(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	hit, _, hitErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotSearchPath,
+		`{"text_query":"deepseek"}`,
+		`{"results":[{"title":"A","url":"https://a.example/","snippet":"sa"}]}`,
+		constant.ChannelTypeDeepSeek,
+	)
+	require.Nil(t, hitErr)
+
+	empty, _, emptyErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotSearchPath,
+		`{"text_query":"deepseek"}`,
+		`{"results":[]}`,
+		constant.ChannelTypeDeepSeek,
+	)
+	require.Nil(t, emptyErr)
+
+	assert.Equal(t, "application/json", hit.Header().Get("Content-Type"))
+	assert.Equal(t, hit.Header().Get("Content-Type"), empty.Header().Get("Content-Type"),
+		"an empty answer must not add a charset the full answer does not carry")
+	assert.JSONEq(t, `{"search_results":[]}`, empty.Body.String())
+}
+
+// Surrounding spaces are not part of a query: they must not reach the upstream.
+// Trimming also keeps one query on one cache key, which matters because the key
+// is the text the provider is sent.
+func TestMoonshotServiceSearchTrimsTheQuery(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	seen := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		select {
+		case seen <- string(body):
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[{"title":"A","url":"https://a.example/","snippet":"sa"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, relayconstant.MoonshotSearchPath,
+		strings.NewReader(`{"text_query":"  deepseek  "}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, constant.ToolsSearchModel)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeDeepSeek)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "sk-test")
+
+	request, err := helper.GetAndValidateRequest(c, types.RelayFormatMoonshotService)
+	require.NoError(t, err)
+	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatMoonshotService, request, nil)
+	require.NoError(t, err)
+	info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(`{"text_query":"  deepseek  "}`)}
+	_, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+	require.NoError(t, err)
+	info.Billing = &recordedSettlement{}
+
+	require.Nil(t, MoonshotServiceHelper(c, info))
+	sent := <-seen
+	assert.Contains(t, sent, `"query":"deepseek"`)
+	assert.NotContains(t, sent, `"  deepseek`)
+}

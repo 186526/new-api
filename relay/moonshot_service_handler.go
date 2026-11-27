@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/logger"
 	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/service/websearch"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/service/websearch/request"
+	"github.com/QuantumNous/new-api/service/websearch/response"
 
 	"github.com/gin-gonic/gin"
 )
@@ -71,7 +73,10 @@ func MoonshotServiceHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.N
 func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel abstract.ChannelContext, request_ *dto.MoonshotServiceRequest) *types.NewAPIError {
 	query := request.Query{
 		Contract: abstract.ContractMoonshotSearch,
-		Text:     request_.TextQuery,
+		// Surrounding spaces are not part of the query: they would key a separate
+		// cache entry and reach the upstream as different text. The case is left
+		// alone because the upstream answers differently for "nginx" and "NGINX".
+		Text: strings.TrimSpace(request_.TextQuery),
 	}
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
@@ -183,7 +188,7 @@ func moonshotServiceCacheLabel(cached bool) string {
 // empty results array rather than an error, so the emptiness is read from the
 // rendered document, which is the same document the client reads.
 func emptySearchBody(body []byte) bool {
-	return len(body) <= len(`{"search_results":[]}`)
+	return len(body) <= len(emptyMoonshotSearchBody)
 }
 
 func writeMoonshotServiceBody(c *gin.Context, answer websearch.Answer, fallbackContentType string) {
@@ -199,10 +204,32 @@ func writeMoonshotServiceBody(c *gin.Context, answer websearch.Answer, fallbackC
 }
 
 // writeMoonshotServiceEmptySearch answers a search that produced no hit. The
-// client reads the empty array as "nothing found" rather than as a failure.
+// client reads the empty array as "nothing found" rather than as a failure, and
+// the body is the renderer's own empty document so an empty answer carries the
+// same Content-Type as a full one.
 func writeMoonshotServiceEmptySearch(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"search_results": []any{}})
+	renderer := response.For(abstract.ContractMoonshotSearch)
+	if renderer != nil {
+		if body, err := renderer.RenderSearch(abstract.Search{}); err == nil {
+			c.Header("Content-Type", renderer.ContentType())
+			c.Writer.WriteHeader(http.StatusOK)
+			if _, writeErr := c.Writer.Write(body); writeErr != nil {
+				logger.LogWarn(c.Request.Context(), "moonshot service: writing the empty answer failed: %v", writeErr)
+			}
+			return
+		}
+	}
+	c.Header("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	if _, err := c.Writer.Write([]byte(emptyMoonshotSearchBody)); err != nil {
+		logger.LogWarn(c.Request.Context(), "moonshot service: writing the empty answer failed: %v", err)
+	}
 }
+
+// emptyMoonshotSearchBody is the last resort when the renderer cannot build the
+// empty document, which only happens if the renderer registry lost this
+// contract.
+const emptyMoonshotSearchBody = `{"search_results":[]}`
 
 func writeMoonshotServicePage(c *gin.Context, content string) {
 	c.Header("Content-Type", "text/markdown; charset=utf-8")

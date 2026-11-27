@@ -288,3 +288,47 @@ func TestAntigravitySearchEnvelopeVariesOnlyByQuery(t *testing.T) {
 		t.Fatal("two different queries produced the same envelope")
 	}
 }
+
+// The endpoint has no search action: whether anything is searched is the model's
+// own decision, and a bare keyword such as "linux" is answered from the model's
+// knowledge with no grounding metadata at all. It is asked for the URLs, dates
+// and titles rather than for an answer or for the tool's whole output: the first
+// is a summary a caller cannot use, and the second runs into the upstream
+// copyright filter, which answers RECITATION and drops the body.
+func TestAntigravitySearchInstructionAsksForTheURLs(t *testing.T) {
+	got := antigravitySearchInstruction("golang")
+	if !strings.Contains(got, `query "golang"`) {
+		t.Fatalf("instruction = %q, want the query passed to the tool", got)
+	}
+	if !strings.Contains(got, "URL | publication time | page title") {
+		t.Fatalf("instruction = %q, want the three fields the caller cannot recompute", got)
+	}
+}
+
+// The instruction is what the model actually reads, so it is what the cache key
+// has to cover: keying on the bare query would let an entry stored for a
+// different instruction answer a request that now sends different text.
+func TestAntigravitySearchEnvelopeCarriesTheInstruction(t *testing.T) {
+	payload, err := antigravityEnvelope("gemini-3.5-flash-lite", "proj", antigravitySearchInstruction("linux"))
+	if err != nil {
+		t.Fatalf("antigravityEnvelope: %v", err)
+	}
+	var envelope struct {
+		Request struct {
+			Contents []struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"contents"`
+		} `json:"request"`
+	}
+	if err := common.Unmarshal(payload, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if len(envelope.Request.Contents) == 0 || len(envelope.Request.Contents[0].Parts) == 0 {
+		t.Fatalf("envelope carries no prompt: %s", payload)
+	}
+	if got := envelope.Request.Contents[0].Parts[0].Text; got != antigravitySearchInstruction("linux") {
+		t.Fatalf("prompt = %q, want the instruction", got)
+	}
+}

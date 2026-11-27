@@ -23,6 +23,10 @@ const (
 	localFetchTimeout    = 20 * time.Second
 	localFetchBodyLimit  = 200 << 10 // 200 KB
 	localExtractMaxChars = 400_000
+	// localExtractMinChars is the least text a chosen container must hold. Below
+	// it the container is a headline or a teaser rather than the page, and the
+	// whole body is rendered instead.
+	localExtractMinChars = 400
 )
 
 // droppedElements carry navigation, scripting or chrome rather than the body the
@@ -184,24 +188,19 @@ func extractLocalHTML(body []byte, pageURL *url.URL) (string, error) {
 	return content, nil
 }
 
-// findLocalContentRoot prefers the semantic containers a page marks itself, and
-// falls back to the div holding the most text, which is where most pages that
-// mark nothing put the article.
+// findLocalContentRoot picks the container holding the most text. A page marks
+// several: www.debian.org has six <article> elements, all of them one-line news
+// headings, so taking the first one returns a headline instead of the page.
+//
+// The body is what a page whose containers all come up short falls back to, so
+// it is never a candidate here: its density always exceeds any child's, and
+// choosing it by density would make the fallback unreachable.
 func findLocalContentRoot(doc *html.Node) *html.Node {
-	for _, tag := range []string{"article", "main"} {
-		if node := findFirstLocalNode(doc, tag); node != nil {
-			return node
-		}
-	}
-	if node := findLocalRoleMain(doc); node != nil {
-		return node
-	}
-
 	var best *html.Node
 	bestDensity := 0
 	var walk func(*html.Node)
 	walk = func(node *html.Node) {
-		if node.Type == html.ElementNode && node.Data == "div" {
+		if node.Type == html.ElementNode && localContentContainer(node) {
 			if density := localContentDensity(node); density > bestDensity {
 				best, bestDensity = node, density
 			}
@@ -211,37 +210,31 @@ func findLocalContentRoot(doc *html.Node) *html.Node {
 		}
 	}
 	walk(doc)
-	if best != nil && bestDensity > 0 {
+
+	if best != nil && bestDensity >= localExtractMinChars {
 		return best
 	}
-
 	if node := findFirstLocalNode(doc, "body"); node != nil {
 		return node
 	}
 	return doc
 }
 
-func findLocalRoleMain(doc *html.Node) *html.Node {
-	var found *html.Node
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if found != nil {
-			return
-		}
-		if node.Type == html.ElementNode {
-			for _, attr := range node.Attr {
-				if attr.Key == "role" && strings.EqualFold(strings.TrimSpace(attr.Val), "main") {
-					found = node
-					return
-				}
-			}
-		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
+// localContentContainer reports whether a node is one of the containers a page
+// uses to mark its article. A div is included because most pages that mark
+// nothing still wrap the article in one, and the density threshold below is what
+// rejects a div that only holds navigation.
+func localContentContainer(node *html.Node) bool {
+	switch node.Data {
+	case "article", "main", "div":
+		return true
+	}
+	for _, attr := range node.Attr {
+		if attr.Key == "role" && strings.EqualFold(strings.TrimSpace(attr.Val), "main") {
+			return true
 		}
 	}
-	walk(doc)
-	return found
+	return false
 }
 
 // localContentDensity counts the characters a container contributes, ignoring
@@ -352,6 +345,15 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 		out.WriteString("![")
 		out.WriteString(alt)
 		out.WriteString("]")
+	case "table":
+		ensureLocalBlankLine(out)
+		writeLocalTable(out, node)
+		ensureLocalBlankLine(out)
+	case "thead", "tbody", "tfoot", "caption", "colgroup", "col":
+		// Rows are written by the table itself; these elements only group them.
+	case "tr", "td", "th":
+		// A row outside a table still reads better as text than as bare cells.
+		writeChildNodes()
 	default:
 		writeChildNodes()
 	}
@@ -361,6 +363,75 @@ func writeLocalChildren(out *strings.Builder, node *html.Node, base *url.URL) {
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		walkLocalMarkdown(out, child, base)
 	}
+}
+
+// writeLocalTable renders a table as markdown rows. www.kernel.org puts its
+// whole release list inside one, and the default branch joined every cell into a
+// single line, which lost both the columns and the row boundaries.
+func writeLocalTable(out *strings.Builder, node *html.Node) {
+	rows := localTableRows(node)
+	if len(rows) == 0 {
+		return
+	}
+	width := 0
+	for _, row := range rows {
+		if len(row) > width {
+			width = len(row)
+		}
+	}
+	for index, row := range rows {
+		out.WriteString("|")
+		for column := 0; column < width; column++ {
+			cell := ""
+			if column < len(row) {
+				cell = row[column]
+			}
+			out.WriteString(" " + cell + " |")
+		}
+		out.WriteString("\n")
+		// The separator after the first row is what makes a reader treat the
+		// block as a table rather than as a paragraph of pipes.
+		if index == 0 {
+			out.WriteString("|")
+			for column := 0; column < width; column++ {
+				out.WriteString(" --- |")
+			}
+			out.WriteString("\n")
+		}
+	}
+}
+
+// localTableRows collects the cells of each row in document order, descending
+// through the grouping elements a table may wrap its rows in.
+func localTableRows(node *html.Node) [][]string {
+	var rows [][]string
+	var walk func(*html.Node)
+	walk = func(current *html.Node) {
+		for child := current.FirstChild; child != nil; child = child.NextSibling {
+			if child.Type != html.ElementNode {
+				continue
+			}
+			switch child.Data {
+			case "tr":
+				rows = append(rows, localTableCells(child))
+			case "thead", "tbody", "tfoot":
+				walk(child)
+			}
+		}
+	}
+	walk(node)
+	return rows
+}
+
+func localTableCells(row *html.Node) []string {
+	var cells []string
+	for child := row.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type != html.ElementNode || (child.Data != "td" && child.Data != "th") {
+			continue
+		}
+		cells = append(cells, strings.ReplaceAll(localNodeText(child), "|", "\\|"))
+	}
+	return cells
 }
 
 // ensureLocalBlankLine keeps blocks one blank line apart without stacking
