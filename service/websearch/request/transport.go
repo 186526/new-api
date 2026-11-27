@@ -116,9 +116,25 @@ func Forward(ctx context.Context, channel abstract.ChannelContext, build func(co
 	ttl := forwardCacheTTL(options, settings)
 	key := forwardKey(build, options)
 
+	entry, cached, err := forwardThrough(key, ttl, func() (forwardEntry, error) {
+		return forwardUncached(ctx, channel, build, headerWait, attempts, baseWait)
+	})
+	if err != nil {
+		return Upstream{}, err
+	}
+	return entryUpstream(entry, cached), nil
+}
+
+// forwardThrough answers one request from the shared cache, and otherwise runs
+// fetch once on behalf of every caller that arrived with the same key.
+//
+// It is the path every provider takes, including the one that fetches in
+// process and therefore builds no *http.Request: a page read locally is cached
+// and merged exactly like a page an upstream was asked for.
+func forwardThrough(key string, ttl time.Duration, fetch func() (forwardEntry, error)) (forwardEntry, bool, error) {
 	if ttl > 0 {
 		if entry, found := lookupForward(key); found {
-			return entryUpstream(entry, true), nil
+			return entry, true, nil
 		}
 	}
 
@@ -128,9 +144,9 @@ func Forward(ctx context.Context, channel abstract.ChannelContext, build func(co
 				return entry, nil
 			}
 		}
-		entry, forwardErr := forwardUncached(ctx, channel, build, headerWait, attempts, baseWait)
-		if forwardErr != nil {
-			return nil, forwardErr
+		entry, fetchErr := fetch()
+		if fetchErr != nil {
+			return nil, fetchErr
 		}
 		// A refusal is not cached: the retry budget belongs to this request, and
 		// caching a 429 would hand the same refusal to a caller that would have
@@ -141,10 +157,24 @@ func Forward(ctx context.Context, channel abstract.ChannelContext, build func(co
 		return entry, nil
 	})
 	if err != nil {
-		return Upstream{}, err
+		return forwardEntry{}, false, err
 	}
 	entry, _ := value.(forwardEntry)
-	return entryUpstream(entry, false), nil
+	return entry, false, nil
+}
+
+// CacheKeyFor builds the key a provider that has no request of its own uses,
+// so its answers live in the same cache as the rest without colliding with
+// another provider's entry for the same input.
+func CacheKeyFor(namespace, input string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + input))
+	return hex.EncodeToString(sum[:])
+}
+
+// CacheTTL resolves the lifetime a provider that builds no request of its own
+// uses, from the same two levels Forward reads.
+func CacheTTL(search bool, override int) time.Duration {
+	return forwardCacheTTL(ForwardOptions{Search: search, CacheTTLSeconds: override}, websearch_setting.Get())
 }
 
 func entryUpstream(entry forwardEntry, cached bool) Upstream {

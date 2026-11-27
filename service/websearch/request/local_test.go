@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
@@ -77,5 +78,41 @@ func TestLocalSearchIsUnsupported(t *testing.T) {
 	}
 	if WasSent(err) {
 		t.Fatalf("WasSent = true, want false: %v", err)
+	}
+}
+
+// A repeated local fetch must not read the page again. The local requester
+// builds no request of its own, so this also pins that it reaches the shared
+// cache rather than fetching on every call.
+func TestLocalFetchServesASecondCallFromTheCache(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(localPage))
+	}))
+	t.Cleanup(server.Close)
+
+	requester := localRequesterFor(server)
+	query := Query{URL: server.URL + "/cached"}
+	first, err := requester.Fetch(context.Background(), abstract.ChannelContext{}, query)
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if first.Cached {
+		t.Fatal("the first fetch reported a cache hit")
+	}
+	second, err := requester.Fetch(context.Background(), abstract.ChannelContext{}, query)
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if !second.Cached {
+		t.Fatal("the second fetch reported a cache miss")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("the page was read %d times, want 1", got)
+	}
+	if string(second.Body) != string(first.Body) {
+		t.Fatalf("the cached body differs from the fetched one")
 	}
 }

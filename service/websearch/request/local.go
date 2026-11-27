@@ -48,10 +48,9 @@ var blankLineRun = regexp.MustCompile(`\n{3,}`)
 // localRequester reads a page in-process. It serves fetches only: it has no
 // upstream to ask for a search, so Search refuses instead of faking one.
 //
-// It caches nothing of its own. The cache that every provider shares lives in
-// Forward, which needs an *http.Request to key on, and this requester never
-// builds one; the caller above it (websearch.go) is where a locally fetched page
-// is cached, together with every other provider's answer.
+// It caches nothing of its own: a locally fetched page goes through the same
+// cache and concurrency merge as every other provider's answer, which lives in
+// Forward, keyed on the request this requester builds in Fetch.
 type localRequester struct {
 	// client overrides the SSRF-protected client, which a test needs because the
 	// package-level one is built at startup and is nil before InitHttpClient.
@@ -75,15 +74,32 @@ func (localRequester) Search(context.Context, abstract.ChannelContext, Query) (U
 
 // Fetch reads the target itself and returns the extracted text as its body, so
 // the local parser can hand it to the caller as a Page.Content.
-func (r localRequester) Fetch(ctx context.Context, _ abstract.ChannelContext, query Query) (Upstream, error) {
-	text, err := r.extract(ctx, query.URL)
+//
+// The page goes through the same cache and concurrency merge as an upstream
+// answer. This requester builds no *http.Request that Forward could key on, so
+// it keys on the provider and the URL instead; without this every repeated
+// fetch re-read the page.
+func (r localRequester) Fetch(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
+	key := CacheKeyFor(websearch_setting.ProviderLocal, strings.TrimSpace(query.URL))
+	entry, cached, err := forwardThrough(key, CacheTTL(false, channel.Settings.WebSearchFetchCacheTTLSeconds), func() (forwardEntry, error) {
+		text, err := r.extract(ctx, query.URL)
+		if err != nil {
+			return forwardEntry{}, err
+		}
+		return forwardEntry{
+			StatusCode:  http.StatusOK,
+			ContentType: "text/markdown; charset=utf-8",
+			Body:        []byte(text),
+		}, nil
+	})
 	if err != nil {
 		return Upstream{}, err
 	}
 	return Upstream{
 		Family:     websearch_setting.ProviderLocal,
-		StatusCode: http.StatusOK,
-		Body:       []byte(text),
+		StatusCode: entry.StatusCode,
+		Body:       entry.Body,
+		Cached:     cached,
 	}, nil
 }
 
