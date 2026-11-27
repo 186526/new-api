@@ -254,6 +254,12 @@ func ResolveSearchRedirects(ctx context.Context, channel abstract.ChannelContext
 
 	for index, location := range resolved {
 		search.Results[index].URL = location
+		// The site name was read off the redirect service before the link was
+		// followed. Replacing the URL without it would leave the caller with the
+		// page's address but the redirect service's name.
+		if host := hostOfURL(location); host != "" {
+			search.Results[index].SiteName = host
+		}
 	}
 }
 
@@ -330,6 +336,17 @@ func isGroundingRedirect(target string) bool {
 		return false
 	}
 	return strings.Contains(parsed.Host, "vertexaisearch") || strings.Contains(parsed.Path, "grounding-api-redirect")
+}
+
+// hostOfURL is the site name of a resolved citation. The parser's own site name
+// comes from the same reading and lives in the abstract package, which the
+// request package is not allowed to reach into for an unexported helper.
+func hostOfURL(target string) string {
+	parsed, err := url.Parse(strings.TrimSpace(target))
+	if err != nil {
+		return ""
+	}
+	return parsed.Hostname()
 }
 
 var (

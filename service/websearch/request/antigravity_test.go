@@ -142,6 +142,9 @@ func TestAntigravityResolveSearchRedirectsReplacesTheShortLink(t *testing.T) {
 	if got := search.Results[0].URL; got != "https://a.example/page" {
 		t.Fatalf("Result.URL = %q, want %q", got, "https://a.example/page")
 	}
+	if got := search.Results[0].SiteName; got != "a.example" {
+		t.Fatalf("Result.SiteName = %q, want %q: the site name must follow the resolved page, not the redirect service", got, "a.example")
+	}
 }
 
 func TestAntigravityResolveSearchRedirectsCachesAResolvedLink(t *testing.T) {
