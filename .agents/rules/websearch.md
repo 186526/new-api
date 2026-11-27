@@ -13,7 +13,7 @@ The `service/websearch` pipeline, the five routes into it, the `tools-search` / 
 - A candidate is skipped only when its request provably never left the process (`request.WasSent` false) — retrying a request that may have been billed pays twice.
 - A native candidate's body is forwarded byte for byte, keeping DeepSeek's `/v1/tools/*` and Codex's `/v1/alpha/search` answers exactly what they were.
 
-`Candidates` orders by origin: operator binding, the channel's own native upstream, the channel's own rendered upstream, a provider the global settings hold a key for, then `local`. `websearch_setting.candidate_order` reorders without adding or removing a candidate; availability comes from a credential, never the order. `local` is always last on a fetch, even when named first.
+`Candidates` orders by origin: operator binding, the channel's own native upstream, the channel's own rendered upstream, a provider the global settings hold a key for, then `local`. `websearch_setting.candidate_order` reorders without adding or removing a candidate; availability comes from a credential, never the order. A candidate selected through a global credential uses its configured endpoint and key without inheriting the channel's endpoint or header preparation. `local` is always last on a fetch, even when named first.
 
 ## Antigravity search
 
@@ -67,6 +67,7 @@ Citation short links are resolved before rendering, cached in `websearch:redirec
 - `/fetch` takes `{"url": ...}`, answers the extracted body as `text/markdown`, not JSON, because a client reads a non-200 as a failed fetch and falls back to fetching locally.
 - The distributor names the attempt `tools-search` or `tools-fetch` instead of reading a model from the body — the same pair `/v1/tools/*` assigns: the capability is what the channel serves and what the call costs, so one name covers every route into the pipeline.
 - A channel able to serve a capability serves every route assigning it: a DeepSeek channel answers `/moonshot.service/v1/*` and `/v1/tools/*` alike, because the caller's path chooses the contract and the channel chooses the upstream, the renderer bridging them. That is intended, not a side effect: tying a capability name to one protocol would need one channel entry per client shape for the same upstream.
+- A Codex channel can serve Moonshot search when its `model_mapping` resolves `tools-search` to a different, non-empty upstream model. The relay uses the Codex adaptor to prepare `/backend-api/codex/alpha/search` and signs it with the selected channel credential. The upstream body is `{"model":"<mapped model>","commands":{"search_query":[{"q":"<text_query>"}]}}`. Without a usable mapping, Codex sends nothing and other candidates can still answer. The client still receives the Moonshot result list and count limit; the mapped model is used only upstream, and billing stays on `tools-search`. The native `/v1/alpha/search` path continues forwarding its own request and reply.
 
 ## Route handlers and billing
 

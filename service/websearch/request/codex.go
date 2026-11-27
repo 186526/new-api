@@ -5,25 +5,30 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 )
 
-// codexAlphaSearchPath is the Codex search document. A New API or Sub2API
-// channel serves the same document at /v1/alpha/search, which is why the path
-// only applies to the provider default base URL.
-const codexAlphaSearchPath = "/backend-api/codex/alpha/search"
-
 func init() {
 	Register(&codexRequester{})
 }
 
-// codexRequester forwards the Codex alpha search document. Codex publishes no
-// fetch contract and its credential is an OAuth JSON blob that only the channel
-// adaptor can read, so it can serve nothing outside its own channel.
 type codexRequester struct{}
+
+type codexSearchBody struct {
+	Model    string `json:"model"`
+	Commands struct {
+		SearchQuery [1]codexSearchTerm `json:"search_query"`
+	} `json:"commands"`
+}
+
+type codexSearchTerm struct {
+	Query string `json:"q"`
+}
 
 func (*codexRequester) Name() string { return websearch_setting.ProviderCodex }
 
@@ -32,36 +37,58 @@ func (*codexRequester) Native() []abstract.Contract {
 }
 
 func (r *codexRequester) Search(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
-	if !query.isNative(r, abstract.ContractAlphaSearch) {
-		// Either the caller reached Codex without one of its channels, or it
-		// asked for the search by text. Codex has no standalone endpoint and no
-		// way to sign a rebuilt body here, so the request must not be sent: the
-		// caller may then try another candidate without a double charge.
-		return Upstream{}, notSent(errors.New("websearch: codex has no standalone endpoint"))
+	endpoint := strings.TrimSpace(query.Endpoint)
+	if endpoint == "" {
+		return Upstream{}, notSent(errors.New("websearch: codex has no channel alpha search endpoint"))
 	}
 
+	body, cacheKey, err := codexSearchPayload(channel.ChannelType, query)
+	if err != nil {
+		return Upstream{}, notSent(err)
+	}
 	build := func(ctx context.Context) (*http.Request, error) {
-		endpoint := query.endpointOrDefault(channel, codexAlphaSearchPath, constant.ChannelTypeCodex)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query.Raw))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return nil, notSent(err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		if err := query.applyPrepare(req); err != nil {
-			return nil, err
+			return nil, notSent(err)
 		}
 		return req, nil
 	}
 
 	upstream, err := Forward(ctx, channel, build, ForwardOptions{
-		// The forwarded body is the only input besides the URL, so its digest
-		// alone keeps two different searches apart.
-		CacheKey:        rawBodyCacheHash(query.Raw),
+		CacheKey:        cacheKey,
 		Search:          true,
 		CacheTTLSeconds: channel.Settings.WebSearchCacheTTLSeconds,
 	})
 	upstream.Family = r.Name()
 	return upstream, err
+}
+
+func codexSearchPayload(channelType int, query Query) ([]byte, string, error) {
+	if query.Contract == abstract.ContractAlphaSearch {
+		if len(query.Raw) == 0 {
+			return nil, "", errors.New("websearch: codex alpha search body is empty")
+		}
+		return query.Raw, rawBodyCacheHash(query.Raw), nil
+	}
+	if channelType != constant.ChannelTypeCodex || query.Prepare == nil {
+		return nil, "", errors.New("websearch: codex search rebuild requires a codex channel adaptor")
+	}
+	model := strings.TrimSpace(query.Model)
+	if model == "" || model == constant.ToolsSearchModel {
+		return nil, "", errors.New("websearch: codex search rebuild requires a mapped upstream model")
+	}
+
+	payload := codexSearchBody{Model: model}
+	payload.Commands.SearchQuery[0].Query = query.Text
+	body, err := common.Marshal(payload)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, "rebuilt\x00" + rawBodyCacheHash(body), nil
 }
 
 func (*codexRequester) Fetch(context.Context, abstract.ChannelContext, Query) (Upstream, error) {

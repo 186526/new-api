@@ -154,7 +154,7 @@ func TestCodexNativeSearchForwardsBodyVerbatim(t *testing.T) {
 	answer := "{\"id\":\"s1\",\"results\":[{\"type\":\"text_result\",\"title\":\"A\",\"url\":\"https://a.example\"}]}"
 	server, seen := newStubUpstream(t, http.StatusOK, answer)
 
-	raw := []byte("{\"model\":\"gpt-5\",\"query\":\"birds\"}")
+	raw := []byte(`{ "model":"gpt-5",  "commands":{"search_query":[{"q":"birds"}]}, "future_field":true }`)
 
 	requester, err := For("codex")
 	if err != nil {
@@ -162,6 +162,8 @@ func TestCodexNativeSearchForwardsBodyVerbatim(t *testing.T) {
 	}
 	upstream, err := requester.Search(context.Background(), testChannel(""), Query{
 		Contract: abstract.ContractAlphaSearch,
+		Text:     "ignore this query text",
+		Model:    "ignore this model",
 		Raw:      raw,
 		Endpoint: server.URL + codexAlphaSearchPath,
 	})

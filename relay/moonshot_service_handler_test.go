@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,7 +15,9 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,18 +52,133 @@ func runMoonshotServiceHelper(t *testing.T, path, body string, upstreamBody stri
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "sk-test")
 
+	info, settlement := prepareMoonshotServiceTest(t, c)
+	apiErr := MoonshotServiceHelper(c, info)
+	return recorder, settlement, apiErr
+}
+
+func prepareMoonshotServiceTest(t *testing.T, c *gin.Context) (*relaycommon.RelayInfo, *recordedSettlement) {
+	t.Helper()
 	request, err := helper.GetAndValidateRequest(c, types.RelayFormatMoonshotService)
 	require.NoError(t, err)
 	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatMoonshotService, request, nil)
 	require.NoError(t, err)
-	info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(body)}
+	info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(request.GetTokenCountMeta().CombineText)}
 	_, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
 	require.NoError(t, err, "the routing name is priced out of the box")
 	settlement := &recordedSettlement{}
 	info.Billing = settlement
+	return info, settlement
+}
 
-	apiErr := MoonshotServiceHelper(c, info)
-	return recorder, settlement, apiErr
+func TestMoonshotServiceSearchUsesCodexAlpha(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/backend-api/codex/alpha/search", r.URL.Path)
+		assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+		assert.Equal(t, "test-account", r.Header.Get("ChatGPT-Account-ID"))
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		assert.Equal(t, "application/json", r.Header.Get("Accept"))
+		assert.Equal(t, "channel-value", r.Header.Get("X-Channel-Override"))
+		body, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.JSONEq(t, `{"model":"gpt-5.1","commands":{"search_query":[{"q":"query"}]}}`, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"s_1","results":[
+			{"type":"text_result","title":"A","url":"https://a.example/","snippet":"sa"},
+			{"type":"text_result","title":"B","url":"https://b.example/","snippet":"sb"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, relayconstant.MoonshotSearchPath,
+		strings.NewReader(`{"text_query":"  query  ","num_results":1,"model":"ignored-client-model"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, constant.ToolsSearchModel)
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeCodex)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, `{"access_token":"test-access-token","account_id":"test-account"}`)
+	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, `{"tools-search":"search-alias","search-alias":"gpt-5.1"}`)
+	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, map[string]any{"X-Channel-Override": "channel-value"})
+
+	info, settlement := prepareMoonshotServiceTest(t, c)
+	require.Nil(t, MoonshotServiceHelper(c, info))
+	require.EqualValues(t, 1, calls.Load())
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "application/json", recorder.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"search_results":[{"title":"A","url":"https://a.example/","snippet":"sa","date":null}]}`, recorder.Body.String())
+	assert.Equal(t, relayconstant.RelayModeMoonshotSearch, info.RelayMode)
+	assert.Equal(t, constant.ToolsSearchModel, info.UpstreamModelName)
+	assert.False(t, info.IsModelMapped)
+	assert.Equal(t, []int{5000}, settlement.settled)
+	assert.False(t, settlement.refunded)
+}
+
+func TestMoonshotServiceSearchKeepsExaCandidateIndependentOfCodex(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	var codexCalls atomic.Int32
+	codex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		codexCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(codex.Close)
+
+	exa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/search", r.URL.Path)
+		assert.Equal(t, "test-exa-key", r.Header.Get("x-api-key"))
+		assert.Empty(t, r.Header.Get("ChatGPT-Account-ID"))
+		assert.Empty(t, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[{"title":"Fallback","url":"https://fallback.example/","summary":"fallback snippet","highlights":["fallback snippet"]}]}`)
+	}))
+	t.Cleanup(exa.Close)
+
+	settings := config.GlobalConfig.Get("websearch_setting").(*websearch_setting.WebSearchSetting)
+	previous := *settings
+	t.Cleanup(func() {
+		*settings = previous
+		assert.NoError(t, websearch_setting.UpdateAndSync())
+	})
+	settings.ExaBaseURL = exa.URL
+	settings.ExaAPIKey = "test-exa-key"
+	for _, testCase := range []struct{ name, mapping, order string }{
+		{name: "missing mapping", order: "codex,exa"},
+		{name: "empty mapped model", mapping: `{"tools-search":""}`, order: "codex,exa"},
+		{name: "self mapping", mapping: `{"tools-search":"tools-search"}`, order: "codex,exa"},
+		{name: "Exa preferred to a mapped Codex channel", mapping: `{"tools-search":"gpt-5.1"}`, order: "exa,codex"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			settings.CandidateOrder = testCase.order
+			require.NoError(t, websearch_setting.UpdateAndSync())
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, relayconstant.MoonshotSearchPath,
+				strings.NewReader(`{"text_query":"`+testCase.name+`","model":"ignored-client-model"}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, constant.ToolsSearchModel)
+			common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
+			common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeCodex)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, codex.URL)
+			common.SetContextKey(c, constant.ContextKeyChannelKey, `{"access_token":"test-access-token","account_id":"test-account"}`)
+			common.SetContextKey(c, constant.ContextKeyChannelModelMapping, testCase.mapping)
+
+			info, settlement := prepareMoonshotServiceTest(t, c)
+			require.Nil(t, MoonshotServiceHelper(c, info))
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.Contains(t, recorder.Body.String(), `"title":"Fallback"`)
+			assert.Equal(t, []int{5000}, settlement.settled)
+		})
+	}
+	assert.Zero(t, codexCalls.Load())
 }
 
 // TestMoonshotServiceSearchSettlesOnlyAHit requires the search endpoint to bill

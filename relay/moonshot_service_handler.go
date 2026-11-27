@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -81,6 +83,7 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 		// to the rendered answer rather than sent to it.
 		Count: request_.ResultCount(),
 	}
+	prepareMoonshotCodexSearch(c, info, &query)
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
 	answer, err := websearch.Search(c.Request.Context(), channel, query)
@@ -120,6 +123,32 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 	writeMoonshotServiceBody(c, answer, "application/json")
 	service.PostTextConsumeQuota(c, info, &dto.Usage{}, nil)
 	return nil
+}
+
+func prepareMoonshotCodexSearch(c *gin.Context, info *relaycommon.RelayInfo, query *request.Query) {
+	if info.ChannelType != constant.ChannelTypeCodex {
+		return
+	}
+
+	alphaInfo := *info
+	channelMeta := *info.ChannelMeta
+	alphaInfo.ChannelMeta = &channelMeta
+	alphaInfo.RelayMode = relayconstant.RelayModeAlphaSearch
+	if err := helper.ModelMappedHelper(c, &alphaInfo, nil); err != nil {
+		logger.LogWarn(c.Request.Context(), "moonshot service: resolve Codex model for channel %d: %v", info.ChannelId, err)
+		return
+	}
+	model := strings.TrimSpace(alphaInfo.UpstreamModelName)
+	if !alphaInfo.IsModelMapped || model == "" || model == constant.ToolsSearchModel {
+		return
+	}
+
+	target, prepare, err := channelUpstream(c, &alphaInfo)
+	if err != nil {
+		logger.LogWarn(c.Request.Context(), "moonshot service: prepare Codex Alpha search for channel %d: %v", info.ChannelId, err)
+		return
+	}
+	query.Model, query.Endpoint, query.Prepare = model, target, prepare
 }
 
 func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel abstract.ChannelContext, request_ *dto.MoonshotServiceRequest) *types.NewAPIError {

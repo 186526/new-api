@@ -16,13 +16,14 @@ type Query struct {
 	URL         string
 	Count       int
 	NeedContent bool
+	// Model is the mapped upstream model used only to rebuild a request.
+	Model string
 	// Raw is the client's own body. A provider whose Native() covers Contract
 	// forwards it verbatim; any other provider ignores it.
 	Raw []byte
 	// Endpoint and Prepare are injected by the relay layer: only a channel's
-	// adaptor knows the URL it routes to and the auth it signs with. Both stay
-	// empty when a provider is reached without one of its own channels, and the
-	// provider then sends to its own default endpoint.
+	// adaptor knows the URL it routes to and the auth it signs with. Without
+	// them, only providers with a standalone endpoint can send the request.
 	Endpoint string
 	Prepare  func(*http.Request) error
 }

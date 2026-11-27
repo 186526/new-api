@@ -121,7 +121,14 @@ func answer(ctx context.Context, channel abstract.ChannelContext, query request.
 			continue
 		}
 
-		upstream, err := send(ctx, requester, channel, query, search)
+		candidateChannel, candidateQuery := channel, query
+		if candidate.Origin == abstract.OriginGlobalCredential {
+			candidateChannel.BaseURL = ""
+			candidateChannel.Key = ""
+			candidateQuery.Endpoint = ""
+			candidateQuery.Prepare = nil
+		}
+		upstream, err := send(ctx, requester, candidateChannel, candidateQuery, search)
 		if err != nil {
 			// A candidate is skipped only when its request provably never
 			// reached the upstream. Once a request may have been billed, its
