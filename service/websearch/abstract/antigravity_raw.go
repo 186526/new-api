@@ -27,6 +27,15 @@ import (
 // the rest of the line, because a page title may contain a pipe.
 var antigravityURLLine = regexp.MustCompile(`(?m)^\s*(https?://\S+)\s*\|\s*([^|\n]*)\|\s*(.+?)\s*$`)
 
+// antigravityGluedSeparator repairs the one malformation the model produces
+// regularly: the first separator comes out as the literal text "data:" and is
+// written without spaces, so the URL and the separator form one token
+// ("...D8Adata:None|Title"). Reading that token as a URL yields a link that
+// answers 404, which is why a query could come back with nine unresolvable
+// short links. The colon cannot occur inside a grounding short link, whose
+// payload is base64url, so the match is unambiguous.
+var antigravityGluedSeparator = regexp.MustCompile(`(?m)^(\s*https?://\S*?)data:`)
+
 // antigravityRawResult is one line of the model's answer.
 type antigravityRawResult struct {
 	URL             string
@@ -38,6 +47,7 @@ type antigravityRawResult struct {
 // candidate's text. It reports false when the text carries no such line, which
 // is what a model answering in prose or refusing outright produces.
 func parseAntigravityRawSearch(text string) ([]antigravityRawResult, bool) {
+	text = antigravityGluedSeparator.ReplaceAllString(text, "$1 | ")
 	matches := antigravityURLLine.FindAllStringSubmatch(text, -1)
 	results := make([]antigravityRawResult, 0, len(matches))
 	seen := make(map[string]struct{}, len(matches))

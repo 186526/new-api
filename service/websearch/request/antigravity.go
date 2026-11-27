@@ -205,8 +205,9 @@ func unwrapAntigravityResponse(raw []byte) ([]byte, error) {
 
 // ResolveSearchRedirects replaces the grounding redirect links of one parsed
 // answer with the pages they point at. It runs after the parser because only the
-// parsed results name which links are redirects, and a failure keeps the link:
-// an unresolved citation is still a citation.
+// parsed results name which links are redirects. A link that cannot be followed
+// takes its result out of the answer: the client cannot open a vertexaisearch
+// short link, so returning one would hand it an address that answers 404.
 func ResolveSearchRedirects(ctx context.Context, channel abstract.ChannelContext, search *abstract.Search) {
 	if search == nil || len(search.Results) == 0 {
 		return
@@ -252,26 +253,31 @@ func ResolveSearchRedirects(ctx context.Context, channel abstract.ChannelContext
 	}
 	wait.Wait()
 
-	for _, index := range targets {
-		location, found := resolved[index]
-		if !found {
-			// The link could not be followed, so the only host known is the
-			// redirect service's. Naming it as the site of the page would tell
-			// the caller the result lives on vertexaisearch, so the field is
-			// cleared instead: an unknown site reads as unknown.
-			search.Results[index].SiteName = ""
-			search.Results[index].Known.SiteName = false
+	// A short link that could not be followed is dropped rather than returned:
+	// the client cannot open a vertexaisearch link, so a result carrying one is
+	// worse than an answer that says fewer pages were found. Results that never
+	// needed resolving are untouched.
+	kept := search.Results[:0]
+	for index, result := range search.Results {
+		if !isGroundingRedirect(result.URL) {
+			kept = append(kept, result)
 			continue
 		}
-		search.Results[index].URL = location
+		location, found := resolved[index]
+		if !found {
+			continue
+		}
+		result.URL = location
 		// The site name was read off the redirect service before the link was
 		// followed. Replacing the URL without it would leave the caller with the
 		// page's address but the redirect service's name.
 		if host := hostOfURL(location); host != "" {
-			search.Results[index].SiteName = host
-			search.Results[index].Known.SiteName = true
+			result.SiteName = host
+			result.Known.SiteName = true
 		}
+		kept = append(kept, result)
 	}
+	search.Results = kept
 }
 
 // resolveRedirect answers a short link through the cache first. Only a resolved

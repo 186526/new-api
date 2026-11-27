@@ -187,7 +187,7 @@ func TestAntigravityResolveSearchRedirectsSkipsTheCacheWhenDisabled(t *testing.T
 	}
 }
 
-func TestAntigravityResolveSearchRedirectsKeepsTheShortLinkOnFailure(t *testing.T) {
+func TestAntigravityResolveSearchRedirectsDropsAShortLinkItCannotFollow(t *testing.T) {
 	setRedirectCacheTTL(t, 600)
 	shortLink := newRedirectStub(t, http.StatusNotFound, "")
 	citation := shortLinkCitation(shortLink, "failed")
@@ -195,11 +195,8 @@ func TestAntigravityResolveSearchRedirectsKeepsTheShortLinkOnFailure(t *testing.
 	for round := 0; round < 2; round++ {
 		search := groundingSearch(t, citation)
 		ResolveSearchRedirects(context.Background(), abstract.ChannelContext{}, search)
-		if got := search.Results[0].URL; got != citation {
-			t.Fatalf("round %d Result.URL = %q, want the unresolved short link %q", round, got, citation)
-		}
-		if got := search.Results[0].SiteName; got != "" {
-			t.Fatalf("round %d Result.SiteName = %q, want empty: an unresolved link names only the redirect service", round, got)
+		if len(search.Results) != 0 {
+			t.Fatalf("round %d kept %d results, want none: the client cannot open a short link", round, len(search.Results))
 		}
 	}
 

@@ -304,6 +304,30 @@ func TestAntigravityParseSearchReadsTheURLLines(t *testing.T) {
 	}
 }
 
+func TestAntigravityParseSearchRepairsASeparatorWrittenAsData(t *testing.T) {
+	// Measured on the live upstream: the model sometimes writes the first
+	// separator as the literal "data:" with no spaces around it, which glues it
+	// to the URL ("...D8Adata:None|Title"). Read as one token, that URL answers
+	// 404, so nine results could come back unopenable.
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI9Adata:None|Artificial intelligence - Wikipedia"}]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if results[0].URL != "https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI9A" {
+		t.Errorf("url = %q, want the link with the glued separator removed", results[0].URL)
+	}
+	if results[0].Title != "Artificial intelligence - Wikipedia" {
+		t.Errorf("title = %q, want the page title", results[0].Title)
+	}
+	if results[0].Date != "" {
+		t.Errorf("date = %q, want empty for None", results[0].Date)
+	}
+}
+
 func TestAntigravityParseSearchFallsBackToGroundingWhenTheLinesAreMissing(t *testing.T) {
 	// A model that answers in prose instead of reporting the tool output leaves
 	// the grounding metadata as the only result the upstream produced.
