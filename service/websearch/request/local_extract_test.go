@@ -267,3 +267,51 @@ func TestLocalFetchKeepsALinkHeavyBlockThatHoldsAHeading(t *testing.T) {
 		t.Errorf("a block holding headings was pruned as navigation:\n%s", got)
 	}
 }
+
+// A listing entry often links its whole card, so the anchor wraps the title and
+// the date instead of holding a phrase. Writing the anchor as one label glued
+// them together: "即使过了做梦的年纪10月 27, 2026".
+func TestLocalFetchWritesACardAnchorAsBlocks(t *testing.T) {
+	page := `<html><body><div class="container"><main><section>
+<article><a href="/post/one/"><div class="article-details">
+<h2 class="article-title">First post title</h2>
+<footer class="article-meta"><time>10月 27, 2026</time></footer>
+</div></a></article>
+<article><a href="/post/two/"><div class="article-details">
+<h2 class="article-title">Second post title</h2>
+<footer class="article-meta"><time>1月 10, 2026</time></footer>
+</div></a></article>
+</section></main></div></body></html>`
+
+	got := fetchLocalPage(t, page)
+	if strings.Contains(got, "年纪10月") || strings.Contains(got, "title10月") || strings.Contains(got, "title1月") {
+		t.Errorf("a title and its date were glued together:\n%s", got)
+	}
+	for _, wanted := range []string{"First post title", "Second post title", "10月 27, 2026"} {
+		if !strings.Contains(got, wanted) {
+			t.Errorf("%q missing from the listing:\n%s", wanted, got)
+		}
+	}
+	if !strings.Contains(got, "[First post title](http://") {
+		t.Errorf("the entry's title lost its link:\n%s", got)
+	}
+}
+
+// A block container separates what it holds into its own paragraphs.
+func TestLocalFetchSeparatesTheBlocksOfAContainer(t *testing.T) {
+	page := `<html><body><div class="container"><main><article>
+<div class="title">A title</div>
+<div class="date">Nov <b>11</b></div>
+<div class="body">The body of the entry.</div>
+</article></main></div></body></html>`
+
+	got := fetchLocalPage(t, page)
+	for _, line := range []string{"A title", "Nov 11", "The body of the entry."} {
+		if !strings.Contains(got, line) {
+			t.Errorf("%q missing: the container's children were joined\n%s", line, got)
+		}
+	}
+	if strings.Contains(got, "Nov11") {
+		t.Errorf("the space HTML puts between two inline nodes was dropped:\n%s", got)
+	}
+}

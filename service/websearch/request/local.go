@@ -611,12 +611,16 @@ func localContentDensity(node *html.Node) int {
 }
 
 func renderLocalNode(out *strings.Builder, node *html.Node, base *url.URL) {
-	walkLocalMarkdown(out, node, base)
+	walkLocalMarkdown(out, node, base, "")
 }
 
 // walkLocalMarkdown writes one node and its children as markdown. Block elements
 // end with a blank line so the next block starts on its own paragraph.
-func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
+//
+// link carries the target of an anchor the subtree sits in. A listing entry links
+// its whole card, so the anchor wraps a heading instead of holding a phrase; the
+// blocks then render as blocks and each one keeps the link.
+func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL, link string) {
 	if node.Type == html.ElementNode && localDroppedElement(node) {
 		return
 	}
@@ -626,7 +630,7 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 
 	switch node.Type {
 	case html.TextNode:
-		out.WriteString(collapseLocalText(node.Data))
+		out.WriteString(localLinkText(collapseLocalText(node.Data), link))
 		return
 	case html.CommentNode, html.DoctypeNode:
 		return
@@ -634,7 +638,12 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 
 	writeChildNodes := func() {
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walkLocalMarkdown(out, child, base)
+			walkLocalMarkdown(out, child, base, link)
+		}
+	}
+	writeChildNodesWithLink := func(target string) {
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walkLocalMarkdown(out, child, base, target)
 		}
 	}
 
@@ -643,7 +652,7 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 		level := int(node.Data[1] - '0')
 		ensureLocalBlankLine(out)
 		out.WriteString(strings.Repeat("#", level) + " ")
-		out.WriteString(strings.TrimSpace(localNodeText(node)))
+		out.WriteString(localLinkText(strings.TrimSpace(localNodeText(node)), link))
 		ensureLocalBlankLine(out)
 	case "p":
 		ensureLocalBlankLine(out)
@@ -665,7 +674,7 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 	case "blockquote":
 		ensureLocalBlankLine(out)
 		var inner strings.Builder
-		writeLocalChildren(&inner, node, base)
+		writeLocalChildren(&inner, node, base, link)
 		for _, line := range strings.Split(strings.TrimSpace(inner.String()), "\n") {
 			out.WriteString("> " + line + "\n")
 		}
@@ -678,14 +687,24 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 		ensureLocalBlankLine(out)
 	case "a":
 		href := localAttrValue(node, "href")
+		target := link
+		if resolved := resolveLocalHref(href, base); href != "" && !strings.HasPrefix(href, "#") && !strings.HasPrefix(href, "javascript:") {
+			target = resolved
+		}
 		label := strings.TrimSpace(localNodeText(node))
 		switch {
 		case label == "":
 			return
-		case href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:"):
+		// A listing entry links its whole card, so the anchor holds a heading and
+		// a date rather than a phrase. Writing that as one link label glued the
+		// title and the date together; the blocks are rendered as blocks instead,
+		// and each block keeps the link.
+		case localHoldsBlockElement(node):
+			writeChildNodesWithLink(target)
+		case target == "":
 			out.WriteString(label)
 		default:
-			out.WriteString("[" + label + "](" + resolveLocalHref(href, base) + ")")
+			out.WriteString(localLinkText(label, target))
 		}
 	case "img":
 		alt := strings.TrimSpace(localAttrValue(node, "alt"))
@@ -704,15 +723,50 @@ func walkLocalMarkdown(out *strings.Builder, node *html.Node, base *url.URL) {
 	case "tr", "td", "th":
 		// A row outside a table still reads better as text than as bare cells.
 		writeChildNodes()
+	case "div", "section", "article", "main", "header", "footer", "aside",
+		"figure", "figcaption", "dl", "dt", "dd", "details", "summary", "address",
+		"fieldset", "legend", "nav":
+		// A container separates what it holds into blocks. Without this a listing
+		// entry rendered as one line: "标题 10月 27, 2026 阅读时长: 3 分钟分类".
+		ensureLocalBlankLine(out)
+		writeChildNodes()
+		ensureLocalBlankLine(out)
 	default:
 		writeChildNodes()
 	}
 }
 
-func writeLocalChildren(out *strings.Builder, node *html.Node, base *url.URL) {
+func writeLocalChildren(out *strings.Builder, node *html.Node, base *url.URL, link string) {
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		walkLocalMarkdown(out, child, base)
+		walkLocalMarkdown(out, child, base, link)
 	}
+}
+
+// localLinkText writes text as a markdown link when it has a target. Text that
+// is only whitespace is written as is: an anchor around a card holds the spaces
+// between its children, and linking those produced an empty "[](...)".
+func localLinkText(text, target string) string {
+	label := strings.TrimSpace(text)
+	if label == "" {
+		// A text node holding only whitespace is the separation between two
+		// inline elements; dropping it glued "10月 27, 2026" to "阅读时长".
+		return " "
+	}
+	if target == "" {
+		// Text outside a link keeps the spaces HTML puts between inline nodes.
+		return text
+	}
+	// The spaces around a label are kept: two inline nodes that HTML separates
+	// with whitespace would otherwise be written as "Nov11".
+	leading := ""
+	if strings.HasPrefix(text, " ") {
+		leading = " "
+	}
+	trailing := ""
+	if strings.HasSuffix(text, " ") {
+		trailing = " "
+	}
+	return leading + "[" + label + "](" + target + ")" + trailing
 }
 
 // writeLocalTable renders a table as markdown rows. www.kernel.org puts its
@@ -932,6 +986,23 @@ func localHoldsHeading(node *html.Node) bool {
 	}
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		if localHoldsHeading(child) {
+			return true
+		}
+	}
+	return false
+}
+
+// localHoldsBlockElement reports whether a node holds an element that starts a
+// block. An anchor holding one is a card around an entry rather than a phrase
+// inside a sentence, so its children are rendered as blocks.
+func localHoldsBlockElement(node *html.Node) bool {
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type != html.ElementNode {
+			continue
+		}
+		switch child.Data {
+		case "div", "section", "article", "header", "footer", "p",
+			"h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "pre", "figure":
 			return true
 		}
 	}
