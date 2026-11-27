@@ -209,6 +209,39 @@ func TestTextRequestViaResponsesConvertsClaudeDirectly(t *testing.T) {
 	assert.Equal(t, "ok", response.Content[0].GetText())
 }
 
+func TestTextHelperRoutesCodexChatThroughResponsesByDefault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload dto.OpenAIResponsesRequest
+		if request.URL.Path != "/backend-api/codex/responses" || json.NewDecoder(request.Body).Decode(&payload) != nil ||
+			payload.Stream == nil || !*payload.Stream || payload.TopP != nil {
+			http.Error(writer, "unexpected Codex request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(writer, `{"error":{"message":"Codex route reached","type":"upstream_error"}}`)
+	}))
+	defer upstream.Close()
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	common.SetContextKey(ctx, constant.ContextKeyChannelType, constant.ChannelTypeCodex)
+	common.SetContextKey(ctx, constant.ContextKeyChannelBaseUrl, upstream.URL)
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, `{"access_token":"test-token","account_id":"test-account"}`)
+	info := &relaycommon.RelayInfo{
+		RelayMode: relayconstant.RelayModeChatCompletions, RelayFormat: relaytypes.RelayFormatOpenAI,
+		OriginModelName: "gpt-6.2-sol", RequestURLPath: ctx.Request.URL.Path,
+		Request: &dto.GeneralOpenAIRequest{
+			Model: "gpt-6.2-sol", TopP: common.GetPointer(0.9),
+			Messages: []dto.Message{{Role: "user", Content: "hello"}},
+		},
+	}
+	apiErr := TextHelper(ctx, info)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+	assert.Contains(t, apiErr.Error(), "Codex route reached")
+}
+
 func TestApplySystemPromptIfNeededSkipsToolLoadingMessages(t *testing.T) {
 	tools := json.RawMessage(`[{"type":"function","function":{"name":"get_current_time","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]`)
 	toolLoading := dto.Message{Role: "system", Tools: tools}

@@ -67,6 +67,11 @@ Channel type 64 and its four endpoints, the credential refresh route and the usa
 - The answer comes back as content parts when the request names a reasoning effort: `content` holds a list whose `thinking` parts carry the reasoning and whose `text` parts carry the answer, in both the streaming deltas and the non-streaming message. `relay/channel/mistral/content_parts.go` rewrites both into the OpenAI shape before the OpenAI handlers read them, so `content` is the string of its text parts and the reasoning lands in `reasoning_content`. A frame whose content is already a string is passed through byte for byte, and the non-streaming body is read and replaced whole. Without the rewrite the OpenAI stream parser fails every thinking frame with `cannot unmarshal array into … delta.content of type string`, drops the reasoning, and the client never sees it.
 - The channel setting `mistral_vibe_attribution` turns off the Vibe tag for a plan key and leaves its requests on the API allowance.
 
+## Codex HTTP conversion
+
+- `relay/compatible_handler.go` routes Chat Completions to Responses when the selected channel is Codex and request-body passthrough is off. This does not require the global conversion policy.
+- `relay/channel/codex/adaptor.go` sends regular Responses requests upstream with `stream:true`, even for clients that requested JSON. A successful response without `Content-Type` is treated as an event stream. Non-streaming clients receive JSON built from that stream. Responses Compact and Alpha Search retain their own request and response formats.
+
 ## Usage dialogs
 
 `GET /api/channel/:id/mistral/usage` and `GET /api/channel/:id/commandcode/usage` (`controller/channel_usage_mistral.go`, `controller/channel_usage_commandcode.go`) back the two dialogs.

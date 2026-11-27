@@ -39,7 +39,23 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	info.ObserveResponseModel(responsesResponse.Model)
 	responseBody = rewriteSGLangResponsesCreatedAt(info, responseBody, "created_at", responsesResponse.CreatedAt)
 
-	// 写入新的 response body
+	return writeResponsesJSON(c, info, resp, &responsesResponse, responseBody), nil
+}
+
+func OaiResponsesBufferedStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	response, apiErr := readBufferedResponsesStream(c, info, resp)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	body, err := common.Marshal(response)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
+	}
+	resp.Header.Set("Content-Type", "application/json")
+	return writeResponsesJSON(c, info, resp, response, body), nil
+}
+
+func writeResponsesJSON(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, responsesResponse *dto.OpenAIResponsesResponse, responseBody []byte) *dto.Usage {
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	// compute usage
@@ -64,7 +80,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 	imageCounter.Commit(info)
 
-	return usage, nil
+	return usage
 }
 
 func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
