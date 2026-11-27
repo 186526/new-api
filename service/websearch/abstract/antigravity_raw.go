@@ -132,7 +132,7 @@ var antigravityTimeLayouts = []string{
 func normalizeAntigravityTime(value string) string {
 	trimmed := strings.TrimSpace(value)
 	switch strings.ToLower(trimmed) {
-	case "", "none", "null", "n/a", "unknown", "-":
+	case "", "none", "null", "n/a", "unknown", "-", "no date", "[no date]":
 		return ""
 	}
 	for _, layout := range antigravityTimeLayouts {

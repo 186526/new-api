@@ -360,6 +360,24 @@ func TestAntigravityParseSearchKeepsADateItCannotRead(t *testing.T) {
 	}
 }
 
+func TestAntigravityParseSearchClearsTheNoDatePlaceholder(t *testing.T) {
+	// The model sometimes answers the date column with a bracket marker instead of
+	// "None"; a caller renders that marker as a publication date otherwise.
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://a.example || [no date] || A page || A page about something\nhttps://b.example || No date || Another page || Another description"}]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	for index, result := range results {
+		if result.Date != "" {
+			t.Errorf("date = %q on result %d, want empty", result.Date, index)
+		}
+		if result.Known.Date {
+			t.Errorf("known date on result %d, want not marked", index)
+		}
+	}
+}
+
 func TestAntigravityParseSearchRepairsASeparatorWrittenAsData(t *testing.T) {
 	// Measured on the live upstream: the model sometimes writes the first
 	// separator as the literal "data:" with no spaces around it, which glues it
