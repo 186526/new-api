@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
@@ -221,5 +222,69 @@ func TestAntigravityRequesterPublishesNoNativeContract(t *testing.T) {
 	}
 	if WasSent(fetchErr) {
 		t.Fatalf("WasSent = true, want false for a refused fetch: %v", fetchErr)
+	}
+}
+
+// TestAntigravitySearchEnvelopeVariesOnlyByQuery requires the envelope's random
+// requestId to be the only part that changes between two identical searches.
+//
+// Forward caches by ForwardOptions.CacheKey, not by the request body, precisely
+// because this envelope cannot be reused: requestId is a fresh UUID per build. If
+// the envelope ever carried something else that varies, the cache key would have
+// to grow to cover it, and this test is where that shows up.
+func TestAntigravitySearchEnvelopeVariesOnlyByQuery(t *testing.T) {
+	decode := func(t *testing.T, payload []byte, query string) map[string]any {
+		t.Helper()
+		var envelope map[string]any
+		if err := common.Unmarshal(payload, &envelope); err != nil {
+			t.Fatalf("decode envelope: %v", err)
+		}
+		return envelope
+	}
+
+	first, err := antigravityEnvelope("gemini-3.5-flash-lite", "proj", "bird routing")
+	if err != nil {
+		t.Fatalf("antigravityEnvelope: %v", err)
+	}
+	second, err := antigravityEnvelope("gemini-3.5-flash-lite", "proj", "bird routing")
+	if err != nil {
+		t.Fatalf("antigravityEnvelope: %v", err)
+	}
+
+	firstEnvelope := decode(t, first, "bird routing")
+	secondEnvelope := decode(t, second, "bird routing")
+	firstID, _ := firstEnvelope["requestId"].(string)
+	secondID, _ := secondEnvelope["requestId"].(string)
+	if firstID == "" || secondID == "" {
+		t.Fatalf("requestId must be set: %q and %q", firstID, secondID)
+	}
+	if firstID == secondID {
+		t.Fatalf("requestId did not vary between two envelopes: %q", firstID)
+	}
+
+	// Everything except requestId must match, otherwise the cache key is
+	// incomplete and two identical searches could be answered from one entry.
+	delete(firstEnvelope, "requestId")
+	delete(secondEnvelope, "requestId")
+	firstRest, err := common.Marshal(firstEnvelope)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	secondRest, err := common.Marshal(secondEnvelope)
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+	if string(firstRest) != string(secondRest) {
+		t.Fatalf("envelopes differ beyond requestId:\n%s\n%s", firstRest, secondRest)
+	}
+
+	// A different query must produce a different body, which is what makes the
+	// query part of the cache key meaningful.
+	other, err := antigravityEnvelope("gemini-3.5-flash-lite", "proj", "bgp filtering")
+	if err != nil {
+		t.Fatalf("antigravityEnvelope: %v", err)
+	}
+	if string(other) == string(first) {
+		t.Fatal("two different queries produced the same envelope")
 	}
 }

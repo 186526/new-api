@@ -31,12 +31,10 @@ const (
 	antigravityEnvelopeUserAgent   = "antigravity"
 	antigravityRequestTypeSearch   = "web_search"
 
-	antigravitySearchTimeout = 25 * time.Second
 	// antigravityRedirectLimit bounds how many redirect links are resolved at
 	// once, so one search with many citations cannot open one connection per
 	// citation against the grounding service.
 	antigravityRedirectLimit = 8
-	antigravityResponseLimit = 8 << 20
 
 	redirectCacheNamespace = "websearch:redirect:v1"
 	redirectCacheCapacity  = 5000
@@ -60,20 +58,17 @@ func (*antigravityRequester) Name() string { return websearch_setting.ProviderAn
 func (*antigravityRequester) Native() []abstract.Contract { return nil }
 
 func (r *antigravityRequester) Search(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
-	callCtx, cancel := context.WithTimeout(ctx, antigravitySearchTimeout)
-	defer cancel()
-
+	// The credential is fetched before Forward because only its refresh knows the
+	// project and the access token the request must carry; a failure here never
+	// touched the search endpoint, so another candidate may still be tried.
 	credential, err := service.EnsureAntigravityCredential(
-		callCtx,
+		ctx,
 		channel.ChannelID,
 		channel.Key,
 		channel.BaseURL,
 		channel.Settings,
 	)
 	if err != nil {
-		// A credential failure happens before the search endpoint is touched: the
-		// refresh it performs is not billed as a search, so another candidate may
-		// still be tried.
 		return Upstream{}, notSent(fmt.Errorf("websearch: antigravity credential: %w", err))
 	}
 
@@ -84,45 +79,42 @@ func (r *antigravityRequester) Search(ctx context.Context, channel abstract.Chan
 	}
 
 	endpoint := strings.TrimRight(credential.BaseURL, "/") + antigravityGenerateContentPath
-	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return Upstream{}, notSent(err)
+	build := func(requestCtx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+credential.AccessToken)
+		req.Header.Set("User-Agent", antigravityEnvelopeUserAgent)
+		return req, nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+credential.AccessToken)
-	req.Header.Set("User-Agent", antigravityEnvelopeUserAgent)
 
-	resp, err := channelHTTPClient(channel).Do(req)
+	// Forward is the one place the cache, the concurrent-request merge and the
+	// 408/429/5xx retry live, so a search is cached and deduplicated like every
+	// other provider's. The envelope carries a random requestId, so the cache key
+	// is the model and the query rather than the body.
+	upstream, err := Forward(ctx, channel, build, ForwardOptions{
+		CacheKey:        model + "\x00" + query.Text,
+		Search:          true,
+		CacheTTLSeconds: channel.Settings.WebSearchCacheTTLSeconds,
+	})
 	if err != nil {
-		// A dial failure is reported as sent: the request may have been delivered
-		// before the connection dropped, and a second billed call costs more than
-		// one refused candidate.
 		return Upstream{}, err
 	}
-	defer resp.Body.Close()
+	upstream.Family = r.Name()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, antigravityResponseLimit))
-	if err != nil {
-		return Upstream{}, err
+	// A refusal is the upstream's own document, which the renderer hands to the
+	// client unread; only a success is unwrapped from the envelope.
+	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+		return upstream, nil
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Upstream{}, sentError{fmt.Errorf(
-			"websearch: antigravity answered %d: %s",
-			resp.StatusCode, truncateBody(body),
-		)}
-	}
-
-	unwrapped, err := unwrapAntigravityResponse(body)
+	unwrapped, err := unwrapAntigravityResponse(upstream.Body)
 	if err != nil {
 		return Upstream{}, sentError{err}
 	}
-
-	return Upstream{
-		Family:     r.Name(),
-		StatusCode: resp.StatusCode,
-		Header:     resp.Header.Clone(),
-		Body:       unwrapped,
-	}, nil
+	upstream.Body = unwrapped
+	return upstream, nil
 }
 
 // Fetch refuses the call because Antigravity publishes no fetch endpoint; its

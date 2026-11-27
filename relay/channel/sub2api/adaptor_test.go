@@ -44,7 +44,9 @@ func TestAdaptorInheritsNewAPIResponsesCompactSupport(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "https://sub2api.example/v1/responses/compact", url)
 	assert.Equal(t, "sub2api", adaptor.GetChannelName())
-	assert.Empty(t, adaptor.GetModelList())
+	// Chat models come from the upstream /v1/models, so the list holds only the
+	// capability names the pipeline can resolve on this channel type.
+	assert.Equal(t, []string{constant.ToolsSearchModel, constant.ToolsFetchModel}, adaptor.GetModelList())
 }
 
 func TestConvertClaudeRequestPreservesAdaptiveThinkingForCompatibleModel(t *testing.T) {
