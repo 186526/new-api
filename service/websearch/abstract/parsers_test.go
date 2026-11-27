@@ -273,7 +273,9 @@ func TestAntigravityParseSearchUsesTheSiteNameWithoutASnippet(t *testing.T) {
 func TestAntigravityParseSearchReadsTheURLLines(t *testing.T) {
 	// What the endpoint is asked for: one line per hit, carrying the three facts
 	// a caller cannot recompute. Asking for page prose instead makes the upstream
-	// copyright filter answer RECITATION and drop the body.
+	// copyright filter answer RECITATION and drop the body. This is the shape
+	// written before the fourth column existed, and a cached answer of it still
+	// has to parse.
 	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI1 | July 17 2026 | The Go Programming Language\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI2 | None | Linux.org"}]}}]}`)
 	results, err := parserFor(t, "antigravity").ParseSearch(body)
 	if err != nil {
@@ -286,8 +288,8 @@ func TestAntigravityParseSearchReadsTheURLLines(t *testing.T) {
 	if first.Title != "The Go Programming Language" {
 		t.Errorf("title = %q, want the page title", first.Title)
 	}
-	if first.Date != "July 17 2026" {
-		t.Errorf("date = %q, want the publication time", first.Date)
+	if first.Date != "2026-07-17" {
+		t.Errorf("date = %q, want the publication time in ISO 8601", first.Date)
 	}
 	if !first.Known.Date || !first.Known.SiteName {
 		t.Errorf("known = %+v, want date and site name marked", first.Known)
@@ -301,6 +303,55 @@ func TestAntigravityParseSearchReadsTheURLLines(t *testing.T) {
 	}
 	if !results[1].Known.SiteName || results[1].Known.Date {
 		t.Errorf("known = %+v for a hit without a date", results[1].Known)
+	}
+}
+
+func TestAntigravityParseSearchReadsTheFourthColumn(t *testing.T) {
+	// The current shape: the model adds a sentence of its own words, which is
+	// what a hit falls back to when its page cannot be read. The separator is a
+	// double pipe because a page title may contain a single one.
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI1 || November 23 2026 || nginx || Enterprise server and commercial distribution\nhttps://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZI2 || None || Nginx | Wikipedia || Encyclopedia entry about the web server"}]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want one per line", len(results))
+	}
+	if results[0].Title != "nginx" {
+		t.Errorf("title = %q, want the page title", results[0].Title)
+	}
+	if results[0].Summary != "Enterprise server and commercial distribution" {
+		t.Errorf("summary = %q, want the model's own sentence", results[0].Summary)
+	}
+	if !results[0].Known.Summary {
+		t.Errorf("known = %+v, want the summary marked", results[0].Known)
+	}
+	if results[0].Date != "2026-11-23" {
+		t.Errorf("date = %q, want ISO 8601", results[0].Date)
+	}
+	if results[0].Snippet != "" {
+		t.Errorf("snippet = %q, want empty: the page supplies it", results[0].Snippet)
+	}
+	// A single pipe inside the title survives, because only " || " splits.
+	if results[1].Title != "Nginx | Wikipedia" {
+		t.Errorf("title = %q, want the pipe kept inside the title", results[1].Title)
+	}
+	if results[1].Summary != "Encyclopedia entry about the web server" {
+		t.Errorf("summary = %q, want the model's own sentence", results[1].Summary)
+	}
+}
+
+func TestAntigravityParseSearchKeepsADateItCannotRead(t *testing.T) {
+	// A shape no layout matches is kept as it arrived: a caller can show an odd
+	// date, but cannot recover one that was dropped.
+	body := []byte(`{"candidates":[{"content":{"parts":[{"text":"https://a.example || last Tuesday || A page || A page about something"}]}}]}`)
+	results, err := parserFor(t, "antigravity").ParseSearch(body)
+	if err != nil {
+		t.Fatalf("ParseSearch: %v", err)
+	}
+	if results[0].Date != "last Tuesday" {
+		t.Errorf("date = %q, want the value kept as it arrived", results[0].Date)
 	}
 }
 

@@ -140,8 +140,10 @@ func TestRenderSearch(t *testing.T) {
 			name:     "moonshot/search with no optional member known",
 			contract: abstract.ContractMoonshotSearch,
 			results:  []abstract.Result{fullyUnknownResult()},
+			// The date is written as null rather than left out, so a caller can
+			// tell "this page names no date" from "this build does not know dates".
 			want: `{"search_results":[{"title":"Example title","url":"https://example.com/page",` +
-				`"snippet":"A short snippet."}]}`,
+				`"snippet":"A short snippet.","date":null}]}`,
 		},
 		{
 			name:     "moonshot/search without a hit is an empty list not null",

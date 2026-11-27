@@ -303,8 +303,16 @@ func TestAntigravitySearchInstructionAsksForTheURLs(t *testing.T) {
 	if !strings.Contains(got, `query "golang"`) {
 		t.Fatalf("instruction = %q, want the query passed to the tool", got)
 	}
-	if !strings.Contains(got, "URL | publication time | page title") {
-		t.Fatalf("instruction = %q, want the three fields the caller cannot recompute", got)
+	if !strings.Contains(got, "URL || publication time || page title ||") {
+		t.Fatalf("instruction = %q, want the four fields the caller cannot recompute", got)
+	}
+	if !strings.Contains(got, "your own words") || !strings.Contains(got, "Do not copy sentences") {
+		t.Fatalf("instruction = %q, want the sentence asked for in the model's own words", got)
+	}
+	// A single pipe cannot separate the columns: a page title may hold one, and
+	// every measured line then carries an extra pipe.
+	if strings.Contains(got, "URL | publication") {
+		t.Fatalf("instruction = %q, want the double-pipe separator", got)
 	}
 }
 

@@ -99,8 +99,9 @@ func (antigravityParser) ParseFetch([]byte) (Page, error) {
 }
 
 // antigravityRawResults turns the model's lines into results. The snippet stays
-// empty on purpose: the model is not asked to repeat page prose, so the caller
-// reads it from the page when it needs it.
+// empty on purpose even when the model wrote a sentence: the caller fills it from
+// the page, and the model's own sentence is carried in Summary as the fallback
+// for a page that cannot be read.
 func antigravityRawResults(raw []antigravityRawResult) []Result {
 	results := make([]Result, 0, len(raw))
 	for _, hit := range raw {
@@ -108,12 +109,14 @@ func antigravityRawResults(raw []antigravityRawResult) []Result {
 		results = append(results, Result{
 			Title:    hit.Title,
 			URL:      hit.URL,
+			Summary:  clipRunes(hit.Summary, antigravitySnippetMaxRune),
 			Date:     hit.PublicationTime,
 			SiteName: host,
 			// The upstream names no per-page score, so the field keeps its
 			// "unknown" value.
 			Authority: -1,
 			Known: KnownFields{
+				Summary:  hit.Summary != "",
 				Date:     hit.PublicationTime != "",
 				SiteName: host != "",
 			},

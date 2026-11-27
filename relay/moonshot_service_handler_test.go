@@ -220,3 +220,52 @@ func TestMoonshotServiceSearchTrimsTheQuery(t *testing.T) {
 	assert.Contains(t, sent, `"query":"deepseek"`)
 	assert.NotContains(t, sent, `"  deepseek`)
 }
+
+// A caller that names a count gets that many results. The upstream decides its
+// own count, so the cap is applied to the rendered answer.
+func TestMoonshotServiceSearchCapsTheResults(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	upstreamBody := `{"results":[` +
+		`{"title":"A","url":"https://a.example/","snippet":"sa"},` +
+		`{"title":"B","url":"https://b.example/","snippet":"sb"},` +
+		`{"title":"C","url":"https://c.example/","snippet":"sc"}]}`
+	recorder, _, apiErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotSearchPath,
+		`{"text_query":"deepseek","num_results":2}`,
+		upstreamBody,
+		constant.ChannelTypeDeepSeek,
+	)
+	require.Nil(t, apiErr)
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	var answer struct {
+		SearchResults []struct {
+			Title string `json:"title"`
+		} `json:"search_results"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &answer))
+	require.Len(t, answer.SearchResults, 2, "num_results must cap the rendered answer")
+	assert.Equal(t, "A", answer.SearchResults[0].Title, "the cap keeps the best-ranked results")
+}
+
+// A page that cannot be read at all is a failure, not an empty page. Answering
+// 200 with an empty body would tell the client the page holds no text, which is a
+// different fact and hides the failure.
+func TestMoonshotServiceFetchReportsAnUnreachablePage(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	recorder, settlement, apiErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotFetchPath,
+		`{"url":"https://this-domain-does-not-exist-xyz123.invalid/"}`,
+		`{"title":"Example","content":"# Example"}`,
+		// An Antigravity channel has no fetch upstream, so the fetch falls through
+		// to the in-process extractor, which is the path that has to report a
+		// page it could not reach.
+		constant.ChannelTypeAntigravity,
+	)
+	require.NotNil(t, apiErr, "an unreachable page must not be answered as a success")
+	assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+	assert.True(t, settlement.refunded, "a failed fetch must release the reservation")
+	_ = recorder
+}

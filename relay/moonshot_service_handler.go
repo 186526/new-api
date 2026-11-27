@@ -77,6 +77,9 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 		// cache entry and reach the upstream as different text. The case is left
 		// alone because the upstream answers differently for "nginx" and "NGINX".
 		Text: strings.TrimSpace(request_.TextQuery),
+		// The upstream decides how many results it returns, so a cap is applied
+		// to the rendered answer rather than sent to it.
+		Count: request_.NumResults,
 	}
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
@@ -136,17 +139,23 @@ func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel a
 			)
 			return types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
-		// The client swallows a failed fetch and fetches the page itself, so the
-		// only record of the provider's failure is this line.
-		outcome := moonshotServiceOutcomeError
+		moonshotServiceRefund(c, info, moonshotServiceOperationFetch, moonshotServiceOutcomeError, false)
 		if errors.Is(err, websearch.ErrEmptyContent) {
-			outcome = moonshotServiceOutcomeEmpty
-		} else {
-			logger.LogWarn(c.Request.Context(), "moonshot service fetch failed for %q: %v", request_.URL, err)
+			// The page answered but held no extractable text, which is a real
+			// answer about a page that is empty rather than a failure to reach it.
+			writeMoonshotServicePage(c, "")
+			return nil
 		}
-		moonshotServiceRefund(c, info, moonshotServiceOperationFetch, outcome, false)
-		writeMoonshotServicePage(c, "")
-		return nil
+		// The page could not be read at all. Answering 200 with an empty body
+		// would tell the client the page is empty, which is a different fact, so
+		// the failure is reported the way every other upstream failure is.
+		logger.LogWarn(c.Request.Context(), "moonshot service fetch failed for %q: %v", request_.URL, err)
+		return types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusBadGateway,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 
 	if len(answer.Body) == 0 {

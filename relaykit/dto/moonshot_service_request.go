@@ -13,10 +13,14 @@ import (
 // the distributor selects the channel with. RawBody preserves the original
 // JSON, which the search provider forwards with unknown fields intact.
 type MoonshotServiceRequest struct {
-	TextQuery string          `json:"text_query,omitempty"`
-	URL       string          `json:"url,omitempty"`
-	Model     string          `json:"model,omitempty"`
-	RawBody   json.RawMessage `json:"-"`
+	TextQuery string `json:"text_query,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Model     string `json:"model,omitempty"`
+	// NumResults caps how many results a rendered search answer carries. The
+	// upstream decides how many it returns, so this is applied after the answer
+	// arrives; zero leaves it uncapped.
+	NumResults int             `json:"num_results,omitempty"`
+	RawBody    json.RawMessage `json:"-"`
 }
 
 func (r *MoonshotServiceRequest) GetTokenCountMeta() *types.TokenCountMeta {

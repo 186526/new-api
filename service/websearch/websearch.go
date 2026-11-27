@@ -95,7 +95,7 @@ func answer(ctx context.Context, channel abstract.ChannelContext, query request.
 			return Answer{}, err
 		}
 
-		return render(upstream, renderer, channel, candidate, query, search)
+		return render(ctx, upstream, renderer, channel, candidate, query, search)
 	}
 	if lastErr == nil {
 		lastErr = ErrUnsupportedChannel
@@ -113,7 +113,7 @@ func send(ctx context.Context, requester request.Requester, channel abstract.Cha
 // render turns one upstream answer into the client's contract. A native
 // candidate's body is forwarded as it arrived, which is what keeps an existing
 // channel's answer byte for byte what it was.
-func render(upstream request.Upstream, renderer response.Renderer, channel abstract.ChannelContext, candidate abstract.Candidate, query request.Query, search bool) (Answer, error) {
+func render(ctx context.Context, upstream request.Upstream, renderer response.Renderer, channel abstract.ChannelContext, candidate abstract.Candidate, query request.Query, search bool) (Answer, error) {
 	answer := Answer{
 		ContentType: renderer.ContentType(),
 		StatusCode:  upstream.StatusCode,
@@ -156,7 +156,16 @@ func render(upstream request.Upstream, renderer response.Renderer, channel abstr
 		if resolvesCitations(upstream.Family) {
 			// A rendered Antigravity answer cites pages through a redirect
 			// service, so its links are resolved before the client reads them.
-			request.ResolveSearchRedirects(context.Background(), channel, &parsed)
+			request.ResolveSearchRedirects(ctx, channel, &parsed)
+		}
+		// Every result gets a snippet: the page's own lead paragraph when it can
+		// be read inside the budget, the model's own sentence otherwise.
+		fillSnippets(ctx, channel, parsed.Results)
+		// A caller that named a count gets that many results. The cap is applied
+		// here rather than at the upstream because the upstream decides its own
+		// count, and because a native pass-through is never reread.
+		if query.Count > 0 && len(parsed.Results) > query.Count {
+			parsed.Results = parsed.Results[:query.Count]
 		}
 		body, err := renderer.RenderSearch(parsed)
 		if err != nil {

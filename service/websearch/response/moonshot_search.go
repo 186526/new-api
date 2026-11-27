@@ -24,14 +24,17 @@ func (moonshotSearchRenderer) ContentType() string {
 
 // moonshotSearchResult matches the field set the client already reads. The
 // provider's summary, content and icon are dropped: this client shows the
-// snippet and links the URL. Date and site name are omitted when empty, the same
-// tags relay/moonshot_service_handler.go writes.
+// snippet and links the URL.
+//
+// Date carries no omitempty: a result whose page names no date writes null, so a
+// caller can tell "no date" from "this build does not know dates". SiteName keeps
+// omitempty because an unknown site reads as a missing member.
 type moonshotSearchResult struct {
-	Title    string `json:"title"`
-	URL      string `json:"url"`
-	Snippet  string `json:"snippet"`
-	Date     string `json:"date,omitempty"`
-	SiteName string `json:"site_name,omitempty"`
+	Title    string  `json:"title"`
+	URL      string  `json:"url"`
+	Snippet  string  `json:"snippet"`
+	Date     *string `json:"date"`
+	SiteName string  `json:"site_name,omitempty"`
 }
 
 func (renderer moonshotSearchRenderer) RenderSearch(answer abstract.Search) ([]byte, error) {
@@ -43,13 +46,16 @@ func (renderer moonshotSearchRenderer) RenderSearch(answer abstract.Search) ([]b
 	// malformed answer rather than as "no hit".
 	results := make([]moonshotSearchResult, 0, len(answer.Results))
 	for _, result := range answer.Results {
-		results = append(results, moonshotSearchResult{
+		rendered := moonshotSearchResult{
 			Title:    result.Title,
 			URL:      result.URL,
 			Snippet:  result.Snippet,
-			Date:     result.Date,
 			SiteName: result.SiteName,
-		})
+		}
+		if result.Date != "" {
+			rendered.Date = stringPointer(result.Date)
+		}
+		results = append(results, rendered)
 	}
 
 	return json.Marshal(struct {

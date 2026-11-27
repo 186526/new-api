@@ -107,6 +107,21 @@ func (r localRequester) Fetch(ctx context.Context, channel abstract.ChannelConte
 	}, nil
 }
 
+// FetchPageText reads one page for a caller that is not a fetch contract, which
+// today is the search path filling result snippets. It goes through Fetch rather
+// than extract so the page shares the fetch cache: a snippet request and a later
+// client fetch of the same page read one entry.
+func FetchPageText(ctx context.Context, channel abstract.ChannelContext, target string) (string, error) {
+	upstream, err := localRequester{}.Fetch(ctx, channel, Query{
+		Contract: abstract.ContractMoonshotFetch,
+		URL:      target,
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(upstream.Body), nil
+}
+
 func (r localRequester) httpClient() *http.Client {
 	if r.client != nil {
 		return r.client

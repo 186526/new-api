@@ -142,17 +142,20 @@ func antigravitySearchModel(channel abstract.ChannelContext) string {
 // keyword such as "linux" gets answered from the model's own knowledge, which
 // leaves no groundingMetadata and therefore no result.
 //
-// The instruction asks for the URLs and dates rather than for an answer or for
-// the tool's whole output. Asking for the answer returns a summary the caller
-// cannot use as results; asking for the whole output runs into the upstream
-// copyright filter, which answers finishReason=RECITATION with no body for
-// queries whose pages it recognises. URLs and dates are not prose, so they pass
-// the filter, and they are what a caller cannot recompute. Measured on the live
-// upstream: six out of six queries answered, nine URLs each, every one finishing
-// with STOP.
+// The instruction asks for the URLs, dates, titles and one sentence of the
+// model's own words rather than for an answer or for the tool's whole output.
+// Asking for the answer returns a summary the caller cannot use as results;
+// asking for the whole output runs into the upstream copyright filter, which
+// answers finishReason=RECITATION with no body for queries whose pages it
+// recognises. Four short fields are not reproduced prose, so they pass the
+// filter. Measured on the live upstream: ten queries, ninety lines, every one
+// finishing with STOP and parsing into four fields. The separator is a double
+// pipe because a page title may contain a single one.
 func antigravitySearchInstruction(query string) string {
 	return "Call the googleSearch tool with query \"" + query +
-		"\". Then output one line per result: URL | publication time | page title. No other text."
+		"\". Then output one line per result in this exact form: " +
+		"URL || publication time || page title || one sentence of your own words about what the page covers, at most 20 words. " +
+		"Do not copy sentences from the pages. No other text."
 }
 
 // antigravityEnvelope builds the Google request body the Antigravity endpoint
