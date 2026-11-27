@@ -14,6 +14,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -268,6 +269,35 @@ func TestMoonshotServiceFetchReportsAnUnreachablePage(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
 	assert.True(t, settlement.refunded, "a failed fetch must release the reservation")
 	_ = recorder
+}
+
+// A target that answered keeps its own status: a mistyped URL reads as 404 rather
+// than as the 502 every other fetch failure used to produce, so a caller tells
+// "this page does not exist" from "this host could not be reached".
+func TestMoonshotServiceFetchKeepsTheUpstreamStatus(t *testing.T) {
+	initLegacyWebsearchTest(t)
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(target.Close)
+	// The target is a loopback address, so the SSRF-protected client refuses it
+	// before the request leaves; this test is about the status the target
+	// answered, not about the dialer.
+	fetch := system_setting.GetFetchSetting()
+	previous := fetch.EnableSSRFProtection
+	fetch.EnableSSRFProtection = false
+	t.Cleanup(func() { fetch.EnableSSRFProtection = previous })
+
+	_, settlement, apiErr := runMoonshotServiceHelper(t,
+		relayconstant.MoonshotFetchPath,
+		`{"url":"`+target.URL+`/no-such-page"}`,
+		`{"title":"Example","content":"# Example"}`,
+		constant.ChannelTypeAntigravity,
+	)
+	require.NotNil(t, apiErr, "a page the target refused must not be answered as a success")
+	assert.Equal(t, http.StatusNotFound, apiErr.StatusCode, "the target's own status must reach the client")
+	assert.True(t, settlement.refunded, "a failed fetch must release the reservation")
 }
 
 // The client documentation used max_results before it used num_results. A caller
