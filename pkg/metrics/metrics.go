@@ -40,6 +40,7 @@ func init() {
 		upstreamQuotaRemainingRatio, upstreamQuotaResetTimestamp, upstreamQuotaRefreshTimestamp,
 		newPriceCollector(), newCacheCollector(), redisCacheCollector{},
 		imageLimitRejectionsTotal,
+		moonshotServiceRequestsTotal,
 	)
 }
 

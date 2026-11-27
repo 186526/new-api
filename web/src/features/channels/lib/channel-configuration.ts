@@ -27,6 +27,7 @@ import {
 import { CHANNEL_TYPE_ADVANCED_CUSTOM } from './advanced-custom'
 import { channelFormSchema, type ChannelFormValues } from './channel-form'
 import { supportsResponsesWebSocket } from './responses-websocket'
+import { supportsWebSearchSettings } from './websearch-setting'
 
 export type ChannelProviderTarget =
   | { kind: 'builtin'; type: number }
@@ -98,6 +99,15 @@ const CONFIGURATION_BLOCKS = {
       'upstream_model_update_check_enabled',
       'upstream_model_update_auto_sync_enabled',
       'upstream_model_update_ignored_models',
+    ],
+  },
+  websearchSettings: {
+    section: 'other',
+    fields: [
+      'websearch_provider',
+      'antigravity_web_search_model',
+      'websearch_cache_ttl_seconds',
+      'websearch_fetch_cache_ttl_seconds',
     ],
   },
   internalNotes: { section: 'other', fields: ['tag', 'remark'] },
@@ -194,6 +204,13 @@ export function getChannelConfigurationState(
         values.upstream_model_update_auto_sync_enabled ||
         values.upstream_model_update_ignored_models?.trim()
       ),
+    websearchSettings: Boolean(
+      supportsWebSearchSettings(values.type) &&
+      (values.websearch_provider ||
+        values.antigravity_web_search_model?.trim() ||
+        values.websearch_cache_ttl_seconds != null ||
+        values.websearch_fetch_cache_ttl_seconds != null)
+    ),
     internalNotes: Boolean(values.tag?.trim() || values.remark?.trim()),
   }
   const blocks = {} as Record<

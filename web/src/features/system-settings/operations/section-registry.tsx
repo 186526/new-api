@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { SystemBehaviorSection } from '../general/system-behavior-section'
 import { EmailSettingsSection } from '../integrations/email-settings-section'
 import { MonitoringSettingsSection } from '../integrations/monitoring-settings-section'
+import { ToolsProxySettingsSection } from '../integrations/tools-proxy-settings-section'
 import { WorkerSettingsSection } from '../integrations/worker-settings-section'
 import { LogSettingsSection } from '../maintenance/log-settings-section'
 import { PerformanceSection } from '../maintenance/performance-section'
@@ -93,6 +94,38 @@ const OPERATIONS_SECTIONS = [
           WorkerValidKey: settings.WorkerValidKey,
           WorkerAllowHttpImageRequestEnabled:
             settings.WorkerAllowHttpImageRequestEnabled,
+        }}
+      />
+    ),
+  },
+  {
+    id: 'tools',
+    titleKey: 'Tools Proxy',
+    build: (settings: OperationsSettings) => (
+      <ToolsProxySettingsSection
+        defaultValues={{
+          'websearch_setting.candidate_order':
+            settings['websearch_setting.candidate_order'],
+          'websearch_setting.native_first':
+            settings['websearch_setting.native_first'],
+          'websearch_setting.search_cache_ttl_seconds':
+            settings['websearch_setting.search_cache_ttl_seconds'],
+          'websearch_setting.fetch_cache_ttl_seconds':
+            settings['websearch_setting.fetch_cache_ttl_seconds'],
+          'websearch_setting.redirect_cache_ttl_seconds':
+            settings['websearch_setting.redirect_cache_ttl_seconds'],
+          'websearch_setting.response_header_timeout_seconds':
+            settings['websearch_setting.response_header_timeout_seconds'],
+          'websearch_setting.retry_attempts':
+            settings['websearch_setting.retry_attempts'],
+          'websearch_setting.retry_base_delay_milliseconds':
+            settings['websearch_setting.retry_base_delay_milliseconds'],
+          'websearch_setting.exa_base_url':
+            settings['websearch_setting.exa_base_url'],
+          'websearch_setting.exa_api_key': '',
+          'websearch_setting.antigravity_search_model':
+            settings['websearch_setting.antigravity_search_model'],
+          ExaKeyConfigured: settings.ExaKeyConfigured ?? false,
         }}
       />
     ),

@@ -13,6 +13,9 @@ const (
 	EndpointTypeOpenAIAlphaSearch     = types.EndpointTypeOpenAIAlphaSearch
 	EndpointTypeDeepSeekToolsSearch   = types.EndpointTypeDeepSeekToolsSearch
 	EndpointTypeDeepSeekToolsFetch    = types.EndpointTypeDeepSeekToolsFetch
+	EndpointTypeMoonshotServiceSearch = types.EndpointTypeMoonshotServiceSearch
+	EndpointTypeMoonshotServiceFetch  = types.EndpointTypeMoonshotServiceFetch
+	EndpointTypeSystemOne             = types.EndpointTypeSystemOne
 	EndpointTypeAnthropic             = types.EndpointTypeAnthropic
 	EndpointTypeGemini                = types.EndpointTypeGemini
 	EndpointTypeJinaRerank            = types.EndpointTypeJinaRerank
@@ -21,9 +24,12 @@ const (
 	EndpointTypeOpenAIVideo           = types.EndpointTypeOpenAIVideo
 )
 
-// Model names the distributor assigns to /v1/tools/search and /v1/tools/fetch,
-// whose bodies carry no model. Channels serve the endpoints by listing them.
+// Model names the distributor assigns to every search and fetch route, whose
+// bodies carry no model. They name the capability, not one protocol: a channel
+// that lists them serves /v1/tools/* and /moonshot.service/v1/* alike, because
+// both reach the same upstream through the same pipeline. They are also the
+// billing names.
 const (
-	DeepSeekSearchModel = "deepseek-search"
-	DeepSeekFetchModel  = "deepseek-fetch"
+	ToolsSearchModel = "tools-search"
+	ToolsFetchModel  = "tools-fetch"
 )

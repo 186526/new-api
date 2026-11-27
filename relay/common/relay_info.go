@@ -751,6 +751,11 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 	case types.RelayFormatDeepSeekTools:
 		info = genBaseRelayInfo(c, request)
 		info.RelayFormat = types.RelayFormatDeepSeekTools
+	case types.RelayFormatMoonshotService:
+		if request, ok := request.(*dto.MoonshotServiceRequest); ok {
+			return GenRelayInfoMoonshotService(c, request), nil
+		}
+		return nil, errors.New("request is not a MoonshotServiceRequest")
 	case types.RelayFormatTask:
 		info = genBaseRelayInfo(c, nil)
 		info.TaskRelayInfo = &TaskRelayInfo{}
@@ -839,6 +844,17 @@ func GenRelayInfoAlphaSearch(c *gin.Context, request *dto.AlphaSearchRequest) *R
 			},
 		},
 	}
+	return info
+}
+
+// GenRelayInfoMoonshotService builds the info for a Kimi Code search or fetch.
+// The two paths differ only in the mode, which the caller reads to decide
+// between a search and a fetch; neither carries a model and neither bills by
+// token, so no usage info is attached.
+func GenRelayInfoMoonshotService(c *gin.Context, request *dto.MoonshotServiceRequest) *RelayInfo {
+	info := genBaseRelayInfo(c, request)
+	info.RelayMode = relayconstant.Path2RelayMode(c.Request.URL.Path)
+	info.RelayFormat = types.RelayFormatMoonshotService
 	return info
 }
 

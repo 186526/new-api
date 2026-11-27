@@ -43,6 +43,7 @@ import {
 } from './advanced-custom'
 import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
 import { supportsResponsesWebSocket } from './responses-websocket'
+import { supportsWebSearchSettings } from './websearch-setting'
 
 // ============================================================================
 // Form Validation Schema
@@ -115,6 +116,31 @@ export function normalizeHttp2ConnectionShards(
 function parseOptionalJson(value: string | undefined): unknown {
   if (!value?.trim()) return undefined
   return JSON.parse(value)
+}
+
+export type WebSearchProvider = 'antigravity' | 'deepseek' | 'exa' | 'local'
+
+export function readWebSearchProvider(
+  value: unknown
+): WebSearchProvider | undefined {
+  const normalized = String(value ?? '')
+    .trim()
+    .toLowerCase()
+  if (
+    normalized === 'antigravity' ||
+    normalized === 'deepseek' ||
+    normalized === 'exa' ||
+    normalized === 'local'
+  ) {
+    return normalized
+  }
+  return undefined
+}
+
+/** Reads a stored TTL; an absent or non-numeric value means "use the default". */
+export function readOptionalInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return undefined
+  return value
 }
 
 function isJsonObjectValue(value: unknown): value is Record<string, unknown> {
@@ -311,6 +337,14 @@ export const channelFormSchema = z
     ollama_openai_chat: z.boolean().optional(), // Ollama: OpenAI-compatible /v1/chat/completions instead of native /api/chat
     disable_task_polling_sleep: z.boolean().optional(),
     mistral_vibe_attribution: z.boolean().optional(), // Mistral: tag requests for the Vibe allowance
+    // Search and fetch settings shared by /moonshot.service/v1, /v1/tools/* and
+    // /v1/alpha/search. The backend accepts a TTL of -1 (cache disabled) or more.
+    websearch_provider: z
+      .enum(['antigravity', 'deepseek', 'exa', 'local'])
+      .optional(),
+    antigravity_web_search_model: z.string().optional(),
+    websearch_cache_ttl_seconds: z.number().int().min(-1).optional(),
+    websearch_fetch_cache_ttl_seconds: z.number().int().min(-1).optional(),
     // Upstream model update settings (stored in settings JSON)
     upstream_model_update_check_enabled: z.boolean().optional(),
     upstream_model_update_auto_sync_enabled: z.boolean().optional(),
@@ -550,6 +584,10 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   ollama_openai_chat: false,
   disable_task_polling_sleep: false,
   mistral_vibe_attribution: true,
+  websearch_provider: undefined,
+  antigravity_web_search_model: '',
+  websearch_cache_ttl_seconds: undefined,
+  websearch_fetch_cache_ttl_seconds: undefined,
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
@@ -581,6 +619,15 @@ export function transformChannelToFormDefaults(
     responses_websocket_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
+    websearch_provider: undefined as
+      | 'antigravity'
+      | 'deepseek'
+      | 'exa'
+      | 'local'
+      | undefined,
+    antigravity_web_search_model: '',
+    websearch_cache_ttl_seconds: undefined as number | undefined,
+    websearch_fetch_cache_ttl_seconds: undefined as number | undefined,
   }
 
   if (channel.setting) {
@@ -608,6 +655,14 @@ export function transformChannelToFormDefaults(
           parsed.responses_websocket_enabled === true,
         system_prompt: parsed.system_prompt || '',
         system_prompt_override: parsed.system_prompt_override || false,
+        websearch_provider: readWebSearchProvider(parsed.websearch_provider),
+        antigravity_web_search_model: parsed.antigravity_web_search_model || '',
+        websearch_cache_ttl_seconds: readOptionalInteger(
+          parsed.websearch_cache_ttl_seconds
+        ),
+        websearch_fetch_cache_ttl_seconds: readOptionalInteger(
+          parsed.websearch_fetch_cache_ttl_seconds
+        ),
       }
     } catch (error) {
       // eslint-disable-next-line no-console
@@ -770,6 +825,29 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   }
   if (formData.tls_insecure_skip_verify === true) {
     settingObj.tls_insecure_skip_verify = true
+  }
+
+  // Web search and fetch settings are opt-in; omit them so the backend keeps
+  // its defaults (provider from channel type, built-in cache TTLs). Only a
+  // channel whose type can search or fetch stores them.
+  if (supportsWebSearchSettings(formData.type)) {
+    const webSearchProvider = readWebSearchProvider(formData.websearch_provider)
+    if (webSearchProvider) {
+      settingObj.websearch_provider = webSearchProvider
+    }
+    const antigravityWebSearchModel =
+      formData.antigravity_web_search_model?.trim()
+    if (antigravityWebSearchModel) {
+      settingObj.antigravity_web_search_model = antigravityWebSearchModel
+    }
+    if (formData.websearch_cache_ttl_seconds != null) {
+      settingObj.websearch_cache_ttl_seconds =
+        formData.websearch_cache_ttl_seconds
+    }
+    if (formData.websearch_fetch_cache_ttl_seconds != null) {
+      settingObj.websearch_fetch_cache_ttl_seconds =
+        formData.websearch_fetch_cache_ttl_seconds
+    }
   }
 
   return JSON.stringify(settingObj)

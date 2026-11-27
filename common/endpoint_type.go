@@ -4,12 +4,25 @@ import "github.com/QuantumNous/new-api/constant"
 
 // GetEndpointTypesByChannelType 获取渠道最优先端点类型（所有的渠道都支持 OpenAI 端点）
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
-	// The DeepSeek Search and Fetch routing names serve only their endpoint.
+	// The search and fetch routing names are capabilities, not protocols: one
+	// name serves every route that reaches the pipeline, so the model square
+	// lists every contract those routes speak.
 	switch modelName {
-	case constant.DeepSeekSearchModel:
-		return []constant.EndpointType{constant.EndpointTypeDeepSeekToolsSearch}
-	case constant.DeepSeekFetchModel:
-		return []constant.EndpointType{constant.EndpointTypeDeepSeekToolsFetch}
+	case constant.ToolsSearchModel:
+		return []constant.EndpointType{
+			constant.EndpointTypeDeepSeekToolsSearch,
+			constant.EndpointTypeMoonshotServiceSearch,
+		}
+	case constant.ToolsFetchModel:
+		return []constant.EndpointType{
+			constant.EndpointTypeDeepSeekToolsFetch,
+			constant.EndpointTypeMoonshotServiceFetch,
+		}
+	}
+	// A decision model is served only through the System One contract, so the
+	// model square must name that endpoint instead of the chat ones.
+	if IsSystemOneModel(modelName) {
+		return []constant.EndpointType{constant.EndpointTypeSystemOne}
 	}
 	var endpointTypes []constant.EndpointType
 	switch channelType {

@@ -57,6 +57,8 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		err = relay.DeepSeekToolsHelper(c, info)
 	case relayconstant.RelayModeSystemOne:
 		err = relay.SystemOneHelper(c, info)
+	case relayconstant.RelayModeMoonshotSearch, relayconstant.RelayModeMoonshotFetch:
+		err = relay.MoonshotServiceHelper(c, info)
 	default:
 		err = relay.TextHelper(c, info)
 	}

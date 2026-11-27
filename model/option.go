@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/performance_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	"gorm.io/gorm"
 )
 
@@ -744,6 +745,10 @@ func handleConfigUpdate(key, value string) bool {
 	} else if configName == "billing_setting" {
 		InvalidatePricingCache()
 		ratio_setting.InvalidateExposedDataCache()
+	} else if configName == "websearch_setting" {
+		if err := websearch_setting.UpdateAndSync(); err != nil {
+			common.SysError(common.LogText("invalid websearch_setting: %s", err.Error()))
+		}
 	}
 
 	return true // 已处理

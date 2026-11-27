@@ -16,6 +16,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
@@ -90,6 +91,118 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("database: %s", version)
 			runFixedPriceAccountingCases(t, db, logDB)
+		})
+	}
+}
+
+// TestSearchCapabilitySettlesOncePerCall runs the built-in price of the two
+// search routing names through the same reservation and settlement the relay
+// uses, because their expression is the only one billed per call rather than by
+// token: a call costs its fixed price whatever it carries, and the refund path
+// an empty answer takes must leave the wallet untouched.
+func TestSearchCapabilitySettlesOncePerCall(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	model.DB, model.LOG_DB = db, db
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB; common.SetDatabaseTypes(oldMainType, oldLogType) })
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}))
+
+	for _, tc := range []struct {
+		name       string
+		model      string
+		usage      *dto.Usage
+		want       int
+		wantRefund bool
+	}{
+		{
+			name:  "a search charges its fixed price",
+			model: constant.ToolsSearchModel,
+			usage: &dto.Usage{PromptTokens: 9000, CompletionTokens: 4000, TotalTokens: 13000},
+			want:  5000,
+		},
+		{
+			name:  "a fetch charges its fixed price",
+			model: constant.ToolsFetchModel,
+			usage: &dto.Usage{},
+			want:  1000,
+		},
+		{
+			name:       "an empty search refunds the whole reservation",
+			model:      constant.ToolsSearchModel,
+			usage:      nil,
+			want:       5000,
+			wantRefund: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const startingQuota = 2_000_000
+			user := model.User{Username: "search_billing_" + tc.model, Quota: startingQuota, Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "search-billing-" + tc.model, Name: "search-billing", RemainQuota: startingQuota, Status: common.TokenStatusEnabled}
+			require.NoError(t, db.Create(&token).Error)
+			channel := model.Channel{Name: "search-billing", Key: "unused", Status: common.ChannelStatusEnabled}
+			require.NoError(t, db.Create(&channel).Error)
+			t.Cleanup(func() {
+				require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.Log{}).Error)
+				require.NoError(t, db.Unscoped().Delete(&token).Error)
+				require.NoError(t, db.Unscoped().Delete(&user).Error)
+				require.NoError(t, db.Unscoped().Delete(&channel).Error)
+			})
+
+			expression, ok := billing_setting.GetBillingExpr(tc.model)
+			require.True(t, ok, tc.model)
+			request := &billingexpr.RequestInput{Body: []byte(`{}`)}
+			cost, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, *request)
+			require.NoError(t, err)
+			require.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
+			reservation, err := billingexpr.QuotaRoundStrict(cost / 1_000_000 * common.QuotaPerUnit)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, reservation)
+
+			snapshot := &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: tc.model, ExprString: expression, ExprHash: billingexpr.ExprHashString(expression), QuotaPerUnit: common.QuotaPerUnit, GroupRatio: 1, EstimatedTier: trace.MatchedTier, EstimatedBillingUnit: trace.BillingUnit, EstimatedFixedPrice: trace.FixedPrice, EstimatedQuotaAfterGroup: reservation}
+			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, OriginModelName: tc.model, UsingGroup: "default", UserGroup: "default", UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, ForcePreConsume: true, StartTime: time.Now(), RelayFormat: types.RelayFormatMoonshotService, PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1}}, TieredBillingSnapshot: snapshot, BillingRequestInput: request}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/moonshot.service/v1/search", nil)
+
+			apiErr := PreConsumeBilling(ctx, reservation, info)
+			require.Nil(t, apiErr)
+			held, err := model.GetUserQuota(user.Id, true)
+			require.NoError(t, err)
+			assert.Equal(t, startingQuota-reservation, held)
+
+			if tc.wantRefund {
+				info.Billing.Refund(ctx)
+				// The refund writes through the detached work queue so a shutdown
+				// waits for it; the test waits the same way instead of sleeping.
+				_, finished := model.WaitDetachedQuotaWork(5 * time.Second)
+				require.True(t, finished, "the refund did not finish")
+				require.NoError(t, db.First(&user, user.Id).Error)
+				assert.Equal(t, startingQuota, user.Quota, "a refund must return the reservation")
+				assert.Zero(t, user.UsedQuota)
+				return
+			}
+
+			PostTextConsumeQuota(ctx, info, tc.usage, nil)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			assert.Equal(t, startingQuota-tc.want, user.Quota)
+			assert.Equal(t, startingQuota-tc.want, token.RemainQuota)
+			assert.Equal(t, tc.want, user.UsedQuota)
+
+			var log model.Log
+			require.NoError(t, db.Where("user_id = ?", user.Id).Take(&log).Error)
+			assert.Equal(t, tc.want, log.Quota)
+			var other map[string]any
+			require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+			assert.Equal(t, string(billingexpr.BillingUnitRequest), other["billing_unit"])
 		})
 	}
 }

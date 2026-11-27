@@ -108,6 +108,10 @@ func GetOptions(c *gin.Context) {
 	options = append(options, &model.Option{
 		Key: "ResendKeyConfigured", Value: strconv.FormatBool(strings.TrimSpace(common.OptionMap["ResendApiKey"]) != ""),
 	})
+	options = append(options, &model.Option{
+		Key:   "ExaKeyConfigured",
+		Value: strconv.FormatBool(strings.TrimSpace(common.Interface2String(common.OptionMap["websearch_setting.exa_api_key"])) != ""),
+	})
 	common.OptionMapRWMutex.Unlock()
 	// Display the same effective expressions used by pricing and settlement,
 	// including built-in defaults absent from persisted administrator options.

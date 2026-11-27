@@ -54,10 +54,18 @@ const (
 	RelayModeToolsFetch
 
 	RelayModeSystemOne
+
+	RelayModeMoonshotSearch
+	RelayModeMoonshotFetch
 )
 
 func Path2RelayMode(path string) int {
 	relayMode := RelayModeUnknown
+	if strings.HasPrefix(path, MoonshotSearchPath) {
+		return RelayModeMoonshotSearch
+	} else if strings.HasPrefix(path, MoonshotFetchPath) {
+		return RelayModeMoonshotFetch
+	}
 	if strings.HasPrefix(path, "/v1/chat/completions") || strings.HasPrefix(path, "/pg/chat/completions") {
 		relayMode = RelayModeChatCompletions
 	} else if strings.HasPrefix(path, "/v1/completions") {

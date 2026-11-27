@@ -85,6 +85,9 @@ export const ENDPOINT_TYPES = {
   IMAGE_GENERATION: 'image-generation',
   EMBEDDINGS: 'embeddings',
   OPENAI_VIDEO: 'openai-video',
+  SYSTEMONE: 'systemone',
+  MOONSHOT_SEARCH: 'moonshot-service-search',
+  MOONSHOT_FETCH: 'moonshot-service-fetch',
 } as const
 
 export type EndpointTypeOption =
@@ -104,6 +107,9 @@ export function getEndpointTypeLabels(
     [ENDPOINT_TYPES.IMAGE_GENERATION]: t('Image'),
     [ENDPOINT_TYPES.EMBEDDINGS]: t('Embeddings'),
     [ENDPOINT_TYPES.OPENAI_VIDEO]: t('Video'),
+    [ENDPOINT_TYPES.SYSTEMONE]: 'System One',
+    [ENDPOINT_TYPES.MOONSHOT_SEARCH]: t('Search'),
+    [ENDPOINT_TYPES.MOONSHOT_FETCH]: t('Fetch'),
   }
 }
 

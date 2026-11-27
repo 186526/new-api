@@ -202,11 +202,17 @@ func TestDeepSeekBuiltinBilling(t *testing.T) {
 			}
 		})
 	}
-	for _, model := range []string{"deepseek-search", "deepseek-fetch"} {
+	// The search and fetch capability names charge per successful call, so one
+	// request costs 5000 quota for a search and 1000 for a fetch at 500000 quota
+	// per unit whatever the call carries.
+	for model, want := range map[string]int{
+		"tools-search": 5000,
+		"tools-fetch":  1000,
+	} {
 		expression, ok := billing_setting.GetBillingExpr(model)
 		require.True(t, ok, model)
-		result := quota(expression, &dto.Usage{})
+		result := quota(expression, &dto.Usage{PromptTokens: 9000, CompletionTokens: 4000})
 		assert.Equal(t, billingexpr.BillingUnitRequest, result.BillingUnit, model)
-		assert.Equal(t, 375, result.ActualQuotaAfterGroup, model)
+		assert.Equal(t, want, result.ActualQuotaAfterGroup, model)
 	}
 }

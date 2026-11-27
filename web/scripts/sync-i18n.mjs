@@ -116,6 +116,20 @@ const BRAND_AND_LITERAL_KEYS = new Set([
   'new-api-key-tool',
   'price_xxx',
   'whsec_xxx',
+  // Protocol and brand names the api-docs page and channel settings render.
+  'Authorization: Bearer <API key>',
+  'Anthropic Messages',
+  'Command Code',
+  'Doubao',
+  'Gemini generateContent',
+  'Mantle (Messages API)',
+  'Moonshot Service',
+  'OpenAI Chat Completions',
+  'OpenAI Responses',
+  'Responses WebSocket',
+  'SGLang',
+  'System One',
+  'Zhipu GLM',
 ])
 
 function isPlainObject(v) {

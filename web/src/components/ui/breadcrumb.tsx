@@ -24,13 +24,16 @@ import {
 } from '@hugeicons/core-free-icons'
 import { HugeiconsIcon } from '@hugeicons/react'
 import * as React from 'react'
+import { useTranslation } from 'react-i18next'
 
 import { cn } from '@/lib/utils'
 
 function Breadcrumb({ className, ...props }: React.ComponentProps<'nav'>) {
+  const { t } = useTranslation()
+
   return (
     <nav
-      aria-label='breadcrumb'
+      aria-label={t('breadcrumb')}
       data-slot='breadcrumb'
       className={cn(className)}
       {...props}

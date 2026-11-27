@@ -54,6 +54,17 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		// A decision model is served by the System One contract alone. Asking
+		// for one over a chat endpoint would fail in channel selection with a
+		// message that names no reachable path, so it is refused here with the
+		// path the client should use instead.
+		if common.IsSystemOneModel(modelRequest.Model) && !relayconstant.IsSystemOnePath(c.Request.URL.Path) {
+			abortWithOpenAiMessage(c, http.StatusBadRequest,
+				fmt.Sprintf("model %s is served by the System One contract; send it to %s/systemone instead",
+					modelRequest.Model, relayconstant.SystemOneContractPathPrefix),
+				types.ErrorCodeInvalidRequest)
+			return
+		}
 		_, pinned, _ := constraints.ResolvedPin()
 		if !pinned {
 			// Select a channel for the user
@@ -472,11 +483,15 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 	}
 	// The routing name is also the billing name, so a model named in the body
-	// must not replace it: DeepSeek ignores that field.
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/tools/search") {
-		modelRequest.Model = constant.DeepSeekSearchModel
-	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/tools/fetch") {
-		modelRequest.Model = constant.DeepSeekFetchModel
+	// must not replace it: DeepSeek ignores that field. Both route families
+	// assign the same capability name, because the capability, not the protocol,
+	// is what a channel serves and what a call costs.
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/tools/search") ||
+		strings.HasPrefix(c.Request.URL.Path, relayconstant.MoonshotSearchPath) {
+		modelRequest.Model = constant.ToolsSearchModel
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/tools/fetch") ||
+		strings.HasPrefix(c.Request.URL.Path, relayconstant.MoonshotFetchPath) {
+		modelRequest.Model = constant.ToolsFetchModel
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations") {
 		modelRequest.Model = common.GetStringIfEmpty(modelRequest.Model, "dall-e")

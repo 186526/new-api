@@ -208,6 +208,7 @@ import {
   assessBaseUrlTrust,
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
+import { supportsWebSearchSettings } from '../../lib/websearch-setting'
 import type { Channel } from '../../types'
 import { BalanceSourceSetting } from '../balance-source-setting'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
@@ -238,6 +239,7 @@ import {
 import { ModelRedirectPanel } from '../model-redirect-panel'
 import { ResponsesWebSocketSetting } from '../responses-websocket-setting'
 import { UpstreamModelSelection } from '../upstream-model-selection'
+import { WebSearchSetting } from '../websearch-setting'
 import {
   ChannelConfiguration,
   ChannelConfigurationStatusIndicator,
@@ -2264,8 +2266,7 @@ export function ChannelMutateDrawer({
     />
   )
 
-  const mistralVibeAttributionFields = currentType ===
-    CHANNEL_TYPE_MISTRAL && (
+  const mistralVibeAttributionFields = currentType === CHANNEL_TYPE_MISTRAL && (
     <FormField
       control={form.control}
       name='mistral_vibe_attribution'
@@ -2290,6 +2291,32 @@ export function ChannelMutateDrawer({
       )}
     />
   )
+
+  const websearchSettingsBlock = supportsWebSearchSettings(currentType) ? (
+    <div
+      role='group'
+      aria-label={t('Search and fetch')}
+      className={channelConfigurationBlockClassName(
+        configuration.blocks.websearchSettings,
+        'space-y-4'
+      )}
+    >
+      <CardHeading
+        status={configuration.blocks.websearchSettings}
+        title={t('Search and fetch')}
+        icon={<Settings className='size-4' />}
+      />
+      <fieldset
+        disabled={sensitiveLocked}
+        className='space-y-4 disabled:opacity-60'
+      >
+        <WebSearchSetting
+          channelType={currentType}
+          disabled={sensitiveLocked || isSubmitting}
+        />
+      </fieldset>
+    </div>
+  ) : null
 
   const routingFields = (
     <div
@@ -4909,6 +4936,7 @@ export function ChannelMutateDrawer({
                 {mistralVibeAttributionFields}
               </fieldset>
             </div>
+            {websearchSettingsBlock}
             {upstreamModelDetectionFields}
             {notesFields}
           </>

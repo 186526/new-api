@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import {
   Activity,
+  BookOpen,
   Box,
   ClipboardList,
   CreditCard,
@@ -97,6 +98,11 @@ export function useSidebarData(): SidebarData {
             title: t('Audit Logs'),
             url: '/usage-logs/audit',
             icon: ClipboardList,
+          },
+          {
+            title: t('API Docs'),
+            url: '/docs',
+            icon: BookOpen,
           },
           {
             title: t('Task Logs'),

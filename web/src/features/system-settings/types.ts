@@ -394,6 +394,20 @@ export type OperationsSettings = {
   'perf_metrics_setting.flush_interval': number
   'perf_metrics_setting.bucket_time': 'hour' | 'minute' | '5min'
   'perf_metrics_setting.retention_days': number
+  'websearch_setting.candidate_order': string
+  'websearch_setting.native_first': boolean
+  'websearch_setting.search_cache_ttl_seconds': number
+  'websearch_setting.fetch_cache_ttl_seconds': number
+  'websearch_setting.redirect_cache_ttl_seconds': number
+  'websearch_setting.response_header_timeout_seconds': number
+  'websearch_setting.retry_attempts': number
+  'websearch_setting.retry_base_delay_milliseconds': number
+  'websearch_setting.exa_base_url': string
+  'websearch_setting.exa_api_key': string
+  'websearch_setting.antigravity_search_model': string
+  // Reported by the option API in place of the stored Exa key, which is never
+  // returned.
+  ExaKeyConfigured?: boolean
 }
 
 export type SecuritySettings = {

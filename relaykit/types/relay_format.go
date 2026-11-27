@@ -16,6 +16,7 @@ const (
 	RelayFormatRerank                                = "rerank"
 	RelayFormatEmbedding                             = "embedding"
 	RelayFormatSystemOne                             = "systemone"
+	RelayFormatMoonshotService                       = "moonshot_service"
 
 	RelayFormatTask    = "task"
 	RelayFormatMjProxy = "mj_proxy"

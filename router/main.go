@@ -19,6 +19,7 @@ func SetRouter(router *gin.Engine, assets WebAssets) {
 	if common.RunsRelay() {
 		SetRelayRouter(router)
 		SetSystemOneRouter(router)
+		SetMoonshotServiceRouter(router)
 		// The playground relays model requests too, so it lives with the relay
 		// routes instead of on the admin.
 		SetPlaygroundRouter(router)

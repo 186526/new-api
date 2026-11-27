@@ -63,6 +63,18 @@ const defaultOperationsSettings: OperationsSettings = {
   'perf_metrics_setting.flush_interval': 5,
   'perf_metrics_setting.bucket_time': 'hour',
   'perf_metrics_setting.retention_days': 0,
+  'websearch_setting.candidate_order': '',
+  'websearch_setting.native_first': true,
+  'websearch_setting.search_cache_ttl_seconds': 600,
+  'websearch_setting.fetch_cache_ttl_seconds': 3600,
+  'websearch_setting.redirect_cache_ttl_seconds': 86400,
+  'websearch_setting.response_header_timeout_seconds': 25,
+  'websearch_setting.retry_attempts': 3,
+  'websearch_setting.retry_base_delay_milliseconds': 500,
+  'websearch_setting.exa_base_url': '',
+  'websearch_setting.exa_api_key': '',
+  'websearch_setting.antigravity_search_model': '',
+  ExaKeyConfigured: false,
 }
 
 export function OperationsSettings() {

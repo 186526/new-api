@@ -45,6 +45,8 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		request, err = GetAndValidateDeepSeekToolsRequest(c)
 	case types.RelayFormatSystemOne:
 		request, err = GetAndValidateSystemOneRequest(c)
+	case types.RelayFormatMoonshotService:
+		request, err = GetAndValidateMoonshotServiceRequest(c)
 
 	case types.RelayFormatOpenAIImage:
 		request, err = GetAndValidOpenAIImageRequest(c, relayMode)
@@ -217,6 +219,59 @@ func GetAndValidateDeepSeekToolsRequest(c *gin.Context) (*dto.DeepSeekToolsReque
 	}
 	request.RawBody = rawBody
 	return request, nil
+}
+
+// GetAndValidateMoonshotServiceRequest validates the Kimi Code search and fetch
+// bodies. A discovery request the client never sends (an unknown path) is
+// refused rather than guessed, because the two paths take different fields. The
+// raw body is kept for the provider to forward untouched.
+func GetAndValidateMoonshotServiceRequest(c *gin.Context) (*dto.MoonshotServiceRequest, error) {
+	request := &dto.MoonshotServiceRequest{}
+	if err := common.UnmarshalBodyReusable(c, request); err != nil {
+		return nil, err
+	}
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil, err
+	}
+	rawBody, err := storage.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	request.RawBody = rawBody
+
+	switch relayconstant.Path2RelayMode(c.Request.URL.Path) {
+	case relayconstant.RelayModeMoonshotSearch:
+		if strings.TrimSpace(request.TextQuery) == "" {
+			return nil, errors.New("text_query is required")
+		}
+	case relayconstant.RelayModeMoonshotFetch:
+		if err := validateMoonshotFetchURL(request.URL); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported moonshot service path: %s", c.Request.URL.Path)
+	}
+	return request, nil
+}
+
+// validateMoonshotFetchURL rejects anything but an absolute http(s) URL here,
+// so a malformed target costs no channel attempt.
+func validateMoonshotFetchURL(rawURL string) error {
+	if strings.TrimSpace(rawURL) == "" {
+		return errors.New("url is required")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("url is invalid: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("url must be an absolute http or https address, got scheme %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return errors.New("url must carry a host")
+	}
+	return nil
 }
 
 func GetAndValidateResponsesCompactionRequest(c *gin.Context) (*dto.OpenAIResponsesCompactionRequest, error) {

@@ -67,7 +67,34 @@ type ChannelSettings struct {
 	// cover all of them. A model missing here falls back to
 	// MaxImagesPerRequest.
 	MaxImagesPerModel map[string]int `json:"max_images_per_model,omitempty"`
+	// WebSearchProvider binds the channel to one search and fetch provider
+	// instead of deriving it from the channel type. Accepted values are
+	// "antigravity", "deepseek", "exa" and "local"; an empty value derives the
+	// provider from the channel type. It only decides which provider is tried
+	// first: the channel's own upstream and any provider the global settings
+	// hold a key for stay in the candidate list behind it.
+	WebSearchProvider string `json:"websearch_provider,omitempty"`
+	// AntigravityWebSearchModel is the model an Antigravity search is sent to.
+	// Google encodes the capability in the model id, so this cannot be read
+	// from the credential; an empty value keeps the built-in default.
+	AntigravityWebSearchModel string `json:"antigravity_web_search_model,omitempty"`
+	// WebSearchCacheTTLSeconds overrides how long a search answer is cached.
+	// Zero keeps the built-in default, a negative value disables the cache.
+	WebSearchCacheTTLSeconds int `json:"websearch_cache_ttl_seconds,omitempty"`
+	// WebSearchFetchCacheTTLSeconds overrides how long a fetched page is
+	// cached. Zero keeps the built-in default, a negative value disables the
+	// cache.
+	WebSearchFetchCacheTTLSeconds int `json:"websearch_fetch_cache_ttl_seconds,omitempty"`
 }
+
+// WebSearchProvider names the search and fetch providers a channel can be
+// bound to through the WebSearchProvider setting.
+const (
+	WebSearchProviderAntigravity = "antigravity"
+	WebSearchProviderDeepSeek    = "deepseek"
+	WebSearchProviderExa         = "exa"
+	WebSearchProviderLocal       = "local"
+)
 
 // ImageLimitForModel returns the image limit for a request to any of the given
 // model names, which are the names the same request may be sent under, such as
@@ -167,6 +194,18 @@ func (s *ChannelSettings) ValidateHTTPTransport() error {
 	}
 	if protocol == HTTPProtocolHTTP1 && s.HTTP2ConnectionShards > 1 {
 		return fmt.Errorf("http2_connection_shards must be 1 when http_protocol is http1")
+	}
+	provider := strings.ToLower(strings.TrimSpace(s.WebSearchProvider))
+	switch provider {
+	case "", WebSearchProviderAntigravity, WebSearchProviderDeepSeek, WebSearchProviderExa, WebSearchProviderLocal:
+	default:
+		return fmt.Errorf("invalid websearch_provider: %s", s.WebSearchProvider)
+	}
+	if s.WebSearchCacheTTLSeconds < -1 {
+		return fmt.Errorf("invalid websearch_cache_ttl_seconds: %d", s.WebSearchCacheTTLSeconds)
+	}
+	if s.WebSearchFetchCacheTTLSeconds < -1 {
+		return fmt.Errorf("invalid websearch_fetch_cache_ttl_seconds: %d", s.WebSearchFetchCacheTTLSeconds)
 	}
 	return nil
 }

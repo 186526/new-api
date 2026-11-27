@@ -96,16 +96,16 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 		refunded                   bool
 	}{
 		{name: "search with results", path: search, body: `{"query":"deepseek","count":2,"future_field":{"nested":true}}`,
-			response: results, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{375}},
+			response: results, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{5000}},
 		{name: "search without results", path: search, body: `{"query":"site:none.invalid deepseek"}`,
 			response: `{"results":[]}`, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, refunded: true},
 		{name: "fetch with page content", path: fetch, body: `{"url":"https://example.com/"}`,
-			response: `{"title":"Example Domain","content":"# Example Domain"}`, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{375}},
+			response: `{"title":"Example Domain","content":"# Example Domain"}`, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{1000}},
 		{name: "fetch failure keeps its status", path: fetch, body: `{"url":"https://example.com/missing"}`,
 			response:    `{"error":{"message":"failed to fetch URL","type":"not_found_error","param":null,"code":"invalid_request_error"}}`,
 			channelType: constant.ChannelTypeDeepSeek, status: http.StatusNotFound},
 		{name: "search through a New API channel", path: search, body: `{"query":"deepseek"}`,
-			response: results, channelType: constant.ChannelTypeNewAPI, status: http.StatusOK, settled: []int{375}},
+			response: results, channelType: constant.ChannelTypeNewAPI, status: http.StatusOK, settled: []int{5000}},
 		{name: "channel without the endpoint", path: search, body: `{"query":"deepseek"}`, channelType: constant.ChannelTypeOpenAI},
 	}
 	for _, tc := range tests {
@@ -124,7 +124,7 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 			c, _ := gin.CreateTestContext(recorder)
 			c.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
 			c.Request.Header.Set("Content-Type", "application/json")
-			routingName := map[string]string{search: constant.DeepSeekSearchModel, fetch: constant.DeepSeekFetchModel}[tc.path]
+			routingName := map[string]string{search: constant.ToolsSearchModel, fetch: constant.ToolsFetchModel}[tc.path]
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, routingName)
 			common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 			common.SetContextKey(c, constant.ContextKeyUserGroup, "default")

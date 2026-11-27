@@ -102,7 +102,7 @@ export function PaymentMethodsVisualEditor({
       template: {
         icon: 'LuCreditCard',
         min_topup: '50',
-        name: '自定义1',
+        name: t('Custom Epay method'),
         type: 'custom1',
       },
     },

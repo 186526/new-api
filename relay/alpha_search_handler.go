@@ -3,38 +3,32 @@ package relay
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/websearch"
+	"github.com/QuantumNous/new-api/service/websearch/abstract"
+	"github.com/QuantumNous/new-api/service/websearch/request"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
+// AlphaSearchHelper relays the Codex standalone web search through the websearch
+// pipeline. A Codex channel's own upstream is the native candidate, so its
+// request and answer stay byte for byte what they were; a channel that can only
+// reach Codex through a global credential would be rendered, but no provider
+// publishes that credential today, so in practice the Codex channel is the only
+// candidate.
 func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
 
-	switch info.ChannelType {
-	case constant.ChannelTypeSub2API,
-		constant.ChannelTypeNewAPI,
-		constant.ChannelTypeCodex,
-		constant.ChannelTypeAdvancedCustom:
-	default:
-		// Allow retry onto another channel that may support this endpoint.
-		return types.NewError(
-			errors.New("channel does not support /v1/alpha/search"),
-			types.ErrorCodeInvalidRequest,
-		)
-	}
-
-	request, ok := info.Request.(*dto.AlphaSearchRequest)
+	request_, ok := info.Request.(*dto.AlphaSearchRequest)
 	if !ok {
 		return types.NewErrorWithStatusCode(
 			fmt.Errorf("invalid request type, expected *dto.AlphaSearchRequest, got %T", info.Request),
@@ -44,12 +38,12 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 		)
 	}
 
-	err := helper.ModelMappedHelper(c, info, request)
+	err := helper.ModelMappedHelper(c, info, request_)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
-	jsonData, err := buildAlphaSearchRequestBody(request.RawBody, info.OriginModelName, info.UpstreamModelName)
+	jsonData, err := buildAlphaSearchRequestBody(request_.RawBody, info.OriginModelName, info.UpstreamModelName)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -62,50 +56,43 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 	}
 
 	logger.LogDebug(c, "requestBody: %s", jsonData)
-	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-	}
-	defer closer.Close()
 
-	adaptor := GetAdaptor(info.ApiType)
-	if adaptor == nil {
-		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
+	target, prepare, buildErr := channelUpstream(c, info)
+	if buildErr != nil {
+		return types.NewOpenAIError(buildErr, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
-	adaptor.Init(info)
 
-	resp, err := adaptor.DoRequest(c, info, body)
+	query := request.Query{
+		Contract: abstract.ContractAlphaSearch,
+		Text:     gjson.GetBytes(jsonData, "commands.search_query.0.q").String(),
+		Raw:      jsonData,
+		Endpoint: target,
+		Prepare:  prepare,
+	}
+
+	channel := websearchChannelContext(c)
+	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
+
+	answer, err := websearch.Search(c.Request.Context(), channel, query)
 	if err != nil {
+		if errors.Is(err, websearch.ErrUnsupportedChannel) {
+			// Allow retry onto another channel that may support this endpoint.
+			return types.NewError(
+				errors.New("channel does not support /v1/alpha/search"),
+				types.ErrorCodeInvalidRequest,
+			)
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 
-	statusCodeMappingStr := c.GetString("status_code_mapping")
-	httpResp, ok := resp.(*http.Response)
-	if !ok || httpResp == nil {
-		return types.NewOpenAIError(errors.New("invalid http response"), types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
-		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+	if answer.StatusCode < 200 || answer.StatusCode >= 300 {
+		newAPIError = writeWebsearchAnswer(c, info, answer, func([]byte) bool { return true })
 		return newAPIError
-	}
-
-	if contentType := httpResp.Header.Get("Content-Type"); contentType != "" {
-		c.Writer.Header().Set("Content-Type", contentType)
-	}
-	c.Writer.WriteHeader(httpResp.StatusCode)
-	if _, err := io.Copy(c.Writer, httpResp.Body); err != nil {
-		return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
 	// Upstream alpha search returns no usage; bill one web_search_preview call.
 	info.SetBillableToolCount(dto.BuildInToolWebSearchPreview, 1)
-
-	usage := &dto.Usage{}
-	service.PostTextConsumeQuota(c, info, usage, nil)
-	return nil
+	return writeWebsearchAnswer(c, info, answer, func([]byte) bool { return true })
 }
 
 // buildAlphaSearchRequestBody returns RawBody unchanged unless the model was

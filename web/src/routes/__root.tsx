@@ -136,6 +136,9 @@ export const Route = createRootRouteWithContext<{
         '/reset',
         '/user/reset',
       ].includes(pathname) || /^\/oauth\/[^/]+$/.test(pathname)
+    // Public content that needs no session: the API reference documents the
+    // endpoints a visitor can call with a key they already hold.
+    const publicContentRoute = pathname === '/docs'
     const isSetupRoute = pathname === '/setup'
     if (!setupStatusChecked || isSetupRoute) {
       const status = await getSetupStatus().catch((error: unknown) => {
@@ -156,13 +159,18 @@ export const Route = createRootRouteWithContext<{
       }
     }
 
-    const outcome = await (publicAuthenticationRoute && pathname !== '/sign-in'
+    const outcome = await ((publicAuthenticationRoute || publicContentRoute) &&
+    pathname !== '/sign-in'
       ? bootstrapAuthentication()
       : resolveAuthentication())
     if (outcome.kind === 'transient_error') {
       throw routeRequestError(outcome.error)
     }
-    if (!publicAuthenticationRoute && outcome.kind !== 'authenticated') {
+    if (
+      !publicAuthenticationRoute &&
+      !publicContentRoute &&
+      outcome.kind !== 'authenticated'
+    ) {
       throw redirect({
         to: '/sign-in',
         search: { redirect: location.href },

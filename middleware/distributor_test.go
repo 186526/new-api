@@ -174,10 +174,10 @@ func TestTokenModelLimitAllowsLegacyAliasAndModifierVariant(t *testing.T) {
 func TestGetModelRequestAssignsDeepSeekToolRoutingNames(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, tc := range []struct{ path, body, want string }{
-		{"/v1/tools/search", `{"query":"deepseek","count":3}`, constant.DeepSeekSearchModel},
-		{"/v1/tools/fetch", `{"url":"https://example.com/"}`, constant.DeepSeekFetchModel},
-		{"/v1/tools/search", `{"query":"deepseek","model":"deepseek-flash"}`, constant.DeepSeekSearchModel},
-		{"/v1/tools/fetch", `{"url":"https://example.com/","model":"deepseek-v4-pro"}`, constant.DeepSeekFetchModel},
+		{"/v1/tools/search", `{"query":"deepseek","count":3}`, constant.ToolsSearchModel},
+		{"/v1/tools/fetch", `{"url":"https://example.com/"}`, constant.ToolsFetchModel},
+		{"/v1/tools/search", `{"query":"deepseek","model":"deepseek-flash"}`, constant.ToolsSearchModel},
+		{"/v1/tools/fetch", `{"url":"https://example.com/","model":"deepseek-v4-pro"}`, constant.ToolsFetchModel},
 	} {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		c.Request = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
