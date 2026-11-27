@@ -1,6 +1,6 @@
 # Billing Rules
 
-Mandatory conventions for quota, pricing, pre-consume, settlement, refund, and usage-quantity code in the Go backend. `AGENTS.md` defines when a task touches billing (see **Billing rules (mandatory read gate)**); any task that matches MUST read this whole file before planning, coding, or reviewing. Tasks that match none of those triggers may skip it. Rules use the same MUST / Do NOT wording as `AGENTS.md` and carry the same weight.
+Mandatory conventions for quota, pricing, pre-consume, settlement, refund, and usage-quantity code in the Go backend. `AGENTS.md`'s **Rule files** table names this file for that scope; a task that matches MUST read this whole file before planning, coding, or reviewing. Tasks that match none of those triggers may skip it. Rules use the same MUST / Do NOT wording as `AGENTS.md` and carry the same weight.
 
 **Billing expression system:** When working on tiered/dynamic billing (expression-based pricing), MUST read `pkg/billingexpr/expr.md` first. It documents the design philosophy, expression language, full architecture, token normalization rules, quota conversion, and expression versioning. All billing expression changes must follow that document.
 
