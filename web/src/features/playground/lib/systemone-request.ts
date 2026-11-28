@@ -63,24 +63,52 @@ export type SystemOneRunResult = {
   rawText: string
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+async function getSystemOneAuthorization(
+  keyId: number,
+  signal: AbortSignal
+): Promise<string> {
+  signal.throwIfAborted()
+  const key = requireServerSuccess(await fetchTokenKey(keyId)).data?.key
+  signal.throwIfAborted()
+  if (!key) throw new Error('Could not load API key')
+  return `Bearer sk-${key}`
+}
+
 export async function listSystemOneModels(
   keyId: number,
   signal: AbortSignal
 ): Promise<string[]> {
-  const key = requireServerSuccess(await fetchTokenKey(keyId)).data?.key
-  if (!key) return ['jev-latest']
+  const authorization = await getSystemOneAuthorization(keyId, signal)
   const response = await fetch('/systemone/v1/models', {
-    headers: { Authorization: `Bearer sk-${key}` },
+    headers: { Authorization: authorization },
+    cache: 'no-store',
     signal,
   })
-  if (!response.ok) return ['jev-latest']
-  const payload = (await response.json()) as {
-    data?: Array<{ id?: string }>
+  if (!response.ok) {
+    throw new Error(
+      `System One model discovery failed: HTTP ${response.status}`
+    )
   }
-  const ids = (payload.data ?? [])
-    .map((item) => item.id?.trim())
-    .filter((id): id is string => Boolean(id))
-  return ids.length > 0 ? ids : ['jev-latest']
+
+  const payload: unknown = await response.json()
+  if (!isRecord(payload) || !Array.isArray(payload.models)) {
+    throw new Error('Invalid System One model list')
+  }
+  const names = new Set<string>()
+  for (const entry of payload.models) {
+    if (
+      isRecord(entry) &&
+      typeof entry.name === 'string' &&
+      entry.name.trim()
+    ) {
+      names.add(entry.name)
+    }
+  }
+  return [...names]
 }
 
 export async function runSystemOneRequest(
@@ -94,14 +122,13 @@ export async function runSystemOneRequest(
   },
   signal: AbortSignal
 ): Promise<SystemOneRunResult> {
-  const key = requireServerSuccess(await fetchTokenKey(params.keyId)).data?.key
-  if (!key) throw new Error('Could not load API key')
+  const authorization = await getSystemOneAuthorization(params.keyId, signal)
   const headers: Record<string, string> = {
-    Authorization: `Bearer sk-${key}`,
+    Authorization: authorization,
     'Content-Type': 'application/json',
   }
-  if (params.longContext) headers['X-SystemOne-Long-Context'] = 'true'
-  if (params.images) headers['X-SystemOne-Images'] = 'true'
+  if (params.longContext) headers['TypeSafe-Danger-Zone-Long-Context'] = 'true'
+  if (params.images) headers['TypeSafe-Danger-Zone-Images'] = 'true'
 
   const response = await fetch('/systemone/v1/systemone', {
     method: 'POST',

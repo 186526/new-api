@@ -369,8 +369,8 @@ func TestPipelinePreferenceReordersOnlyReachableProviders(t *testing.T) {
 	candidates, err := websearch.Candidates(channel, abstract.ContractToolsFetch)
 	require.NoError(t, err)
 	require.Len(t, candidates, 2)
-	assert.Equal(t, "deepseek", candidates[0].Provider)
-	assert.Equal(t, "local", candidates[1].Provider)
+	assert.Equal(t, "local", candidates[0].Provider)
+	assert.Equal(t, "deepseek", candidates[1].Provider)
 }
 
 func TestPipelinePreferredGlobalProviderDoesNotReceiveChannelCredentials(t *testing.T) {

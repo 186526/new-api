@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { skipToken, useQuery } from '@tanstack/react-query'
 import { useEffect, useId, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -7,7 +7,6 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
-import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
@@ -24,8 +23,8 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
   const { t } = useTranslation()
   const id = useId()
   const pending = useRef<AbortController | null>(null)
-  const [keyId, setKeyId] = useState('')
-  const [model, setModel] = useState('jev-latest')
+  const [keyId, setKeyId] = useState<number>()
+  const [model, setModel] = useState('')
   const [stateText, setStateText] = useState(SYSTEM_ONE_PRESETS[0].state)
   const [questionsText, setQuestionsText] = useState(
     SYSTEM_ONE_PRESETS[0].questions
@@ -43,37 +42,58 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
     meta: { errorToast: false },
   })
   const keys = keysQuery.data ?? []
-  const selectedKeyNum = Number(keyId)
+  const selectedKey =
+    keys.find((key) => key.id === keyId) ??
+    keys.find((key) => key.group === props.group) ??
+    keys[0]
 
   const modelsQuery = useQuery({
-    queryKey: ['playground', 'systemone-models', selectedKeyNum],
-    queryFn: ({ signal }) => listSystemOneModels(selectedKeyNum, signal),
-    enabled: selectedKeyNum > 0,
+    queryKey: ['playground', 'systemone-models', props.userId, selectedKey?.id],
+    queryFn: selectedKey
+      ? ({ signal }) => listSystemOneModels(selectedKey.id, signal)
+      : skipToken,
     retry: false,
     meta: { errorToast: false },
   })
-  const availableModels = modelsQuery.data ?? ['jev-latest']
+  const modelsLoading =
+    !!selectedKey && (modelsQuery.isPending || modelsQuery.isFetching)
+  const confirmedModels =
+    modelsQuery.isSuccess && !modelsLoading ? modelsQuery.data : undefined
+  const selectedModel = confirmedModels?.includes(model)
+    ? model
+    : (confirmedModels?.[0] ?? '')
 
   useEffect(() => {
-    const list = keysQuery.data
-    if (!keyId && list && list.length > 0) {
-      const preferred = props.group
-        ? list.find((k) => k.group === props.group)
-        : undefined
-      setKeyId(String((preferred ?? list[0]).id))
+    if (selectedModel) setModel(selectedModel)
+  }, [selectedModel])
+
+  let keyStatus = ''
+  if (!selectedKey) {
+    if (keysQuery.isPending) {
+      keyStatus = t('Loading...')
+    } else if (keysQuery.isError) {
+      keyStatus = t('Failed to load API keys')
+    } else {
+      keyStatus = t('No enabled API keys found. Create or enable one first.')
     }
-  }, [keyId, keysQuery.data, props.group])
+  }
+
+  let modelStatus = ''
+  if (modelsLoading) {
+    modelStatus = t('Loading System One models...')
+  } else if (modelsQuery.isError) {
+    modelStatus = t('Failed to load System One models.')
+  } else if (confirmedModels?.length === 0) {
+    modelStatus = t('No System One models available for this API key.')
+  }
 
   useEffect(() => () => pending.current?.abort(), [])
 
   async function handleRun(event: React.FormEvent) {
     event.preventDefault()
+    if (isRunning || !selectedKey || !selectedModel) return
     setErrorMessage('')
     setResult(undefined)
-    if (!selectedKeyNum) {
-      setErrorMessage(t('Select an API key first.'))
-      return
-    }
     let parsedQuestions: Record<string, unknown>
     try {
       const parsed: unknown = JSON.parse(questionsText)
@@ -106,8 +126,8 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
     try {
       const response = await runSystemOneRequest(
         {
-          keyId: selectedKeyNum,
-          model: model.trim() || 'jev-latest',
+          keyId: selectedKey.id,
+          model: selectedModel,
           state: parsedState,
           questions: parsedQuestions,
           longContext,
@@ -132,7 +152,7 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
       <Card>
         <CardHeader className='flex flex-row flex-wrap items-center justify-between gap-2'>
           <div>
-            <CardTitle className='text-base'>
+            <CardTitle className='text-base' id={`${id}-title`}>
               {t('System One (Jev) Playground')}
             </CardTitle>
             <p className='text-muted-foreground mt-1 text-xs'>
@@ -160,44 +180,62 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
           </div>
         </CardHeader>
         <CardContent>
-          <form onSubmit={(event) => void handleRun(event)} className='space-y-4'>
+          <form
+            aria-labelledby={`${id}-title`}
+            onSubmit={(event) => void handleRun(event)}
+            className='flex flex-col gap-4'
+          >
             <FieldGroup className='grid gap-4 sm:grid-cols-2'>
               <Field>
                 <FieldLabel htmlFor={`${id}-key`}>{t('API Key')}</FieldLabel>
                 <NativeSelect
                   id={`${id}-key`}
-                  value={keyId}
-                  disabled={keys.length === 0 || isRunning}
-                  onChange={(event) => setKeyId(event.target.value)}
+                  name='keyId'
+                  value={selectedKey?.id ?? ''}
+                  disabled={!selectedKey || isRunning}
+                  onChange={(event) => setKeyId(Number(event.target.value))}
                 >
-                  {keys.length === 0 ? (
-                    <NativeSelectOption value=''>
-                      {t('No enabled API keys')}
-                    </NativeSelectOption>
-                  ) : (
-                    keys.map((item) => (
-                      <NativeSelectOption key={item.id} value={String(item.id)}>
-                        {item.name} ({item.group})
-                      </NativeSelectOption>
-                    ))
+                  {!selectedKey && (
+                    <NativeSelectOption value=''>{keyStatus}</NativeSelectOption>
                   )}
+                  {keys.map((item) => (
+                    <NativeSelectOption key={item.id} value={item.id}>
+                      {item.name} ({item.group})
+                    </NativeSelectOption>
+                  ))}
                 </NativeSelect>
               </Field>
               <Field>
                 <FieldLabel htmlFor={`${id}-model`}>{t('Model')}</FieldLabel>
-                <Input
+                <NativeSelect
                   id={`${id}-model`}
-                  list={`${id}-models-list`}
-                  value={model}
-                  disabled={isRunning}
+                  name='model'
+                  value={selectedModel}
+                  disabled={!selectedModel || isRunning}
+                  aria-describedby={`${id}-model-status`}
                   onChange={(event) => setModel(event.target.value)}
-                  placeholder='jev-latest'
-                />
-                <datalist id={`${id}-models-list`}>
-                  {availableModels.map((entry) => (
-                    <option key={entry} value={entry} />
+                >
+                  {!selectedModel && <NativeSelectOption value='' />}
+                  {confirmedModels?.map((name) => (
+                    <NativeSelectOption key={name} value={name}>
+                      {name}
+                    </NativeSelectOption>
                   ))}
-                </datalist>
+                </NativeSelect>
+                <FieldDescription id={`${id}-model-status`} role='status'>
+                  {modelStatus}
+                </FieldDescription>
+                {modelsQuery.isError && !modelsLoading && (
+                  <Button
+                    type='button'
+                    variant='outline'
+                    size='xs'
+                    className='self-start'
+                    onClick={() => void modelsQuery.refetch()}
+                  >
+                    {t('Retry')}
+                  </Button>
+                )}
               </Field>
             </FieldGroup>
 
@@ -205,6 +243,7 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
               <FieldLabel htmlFor={`${id}-state`}>{t('State (text or JSON)')}</FieldLabel>
               <Textarea
                 id={`${id}-state`}
+                name='state'
                 rows={3}
                 value={stateText}
                 disabled={isRunning}
@@ -218,6 +257,7 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
               </FieldLabel>
               <Textarea
                 id={`${id}-questions`}
+                name='questions'
                 rows={8}
                 spellCheck={false}
                 value={questionsText}
@@ -231,25 +271,35 @@ export function PlaygroundSystemOne(props: { userId: number; group?: string }) {
             </Field>
 
             <div className='flex flex-wrap items-center justify-between gap-3'>
-              <div className='flex flex-wrap items-center gap-4'>
-                <label className='flex items-center gap-2 text-xs'>
+              <FieldGroup className='w-auto flex-row flex-wrap gap-4'>
+                <Field orientation='horizontal' className='w-auto'>
                   <Switch
+                    id={`${id}-long-context`}
+                    name='longContext'
                     checked={longContext}
                     onCheckedChange={setLongContext}
                     disabled={isRunning}
+                    nativeButton
+                    render={<button type='button' />}
                   />
-                  <span>Long context</span>
-                </label>
-                <label className='flex items-center gap-2 text-xs'>
+                  <FieldLabel htmlFor={`${id}-long-context`}>
+                    {t('Long context')}
+                  </FieldLabel>
+                </Field>
+                <Field orientation='horizontal' className='w-auto'>
                   <Switch
+                    id={`${id}-images`}
+                    name='images'
                     checked={images}
                     onCheckedChange={setImages}
                     disabled={isRunning}
+                    nativeButton
+                    render={<button type='button' />}
                   />
-                  <span>Images</span>
-                </label>
-              </div>
-              <Button type='submit' disabled={isRunning || !keyId}>
+                  <FieldLabel htmlFor={`${id}-images`}>{t('Images')}</FieldLabel>
+                </Field>
+              </FieldGroup>
+              <Button type='submit' disabled={isRunning || !selectedModel}>
                 {isRunning ? t('Running...') : t('Run System One')}
               </Button>
             </div>

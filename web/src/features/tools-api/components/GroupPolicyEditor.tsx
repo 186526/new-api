@@ -400,9 +400,9 @@ function GroupPolicyForm(props: GroupPolicyFormProps) {
               />
               <CapabilityPolicyCard
                 title={t('Fetch')}
-                description={t(
-                  'Applies to /v1/tools/fetch and /moonshot.service/v1/fetch. Defaults to built-in local fetch when inherited.'
-                )}
+                description={t('toolsApi.fetchEndpoints', {
+                  defaultValue: 'Applies to /v1/tools/fetch and /moonshot.service/v1/fetch.',
+                })}
                 icon={<Globe className='text-muted-foreground size-4' />}
                 contract='tools/fetch'
                 state={fetchState}
@@ -414,6 +414,13 @@ function GroupPolicyForm(props: GroupPolicyFormProps) {
                 }
               />
             </div>
+
+            <p className='text-muted-foreground text-xs'>
+              {t('toolsApi.channelFreeFallbackHelp', {
+                defaultValue:
+                  'Channel-free fallback is off by default. When enabled, if no eligible channel is available on the first attempt, Local Fetch (fetch only) or global Exa (with a key) may be used. The group policy, token and routing restrictions, and pricing still apply. Alpha Search is excluded.',
+              })}
+            </p>
 
             <Collapsible
               open={showAdvanced}
@@ -514,10 +521,46 @@ function CapabilityPolicyCard(props: {
 }) {
   const { t } = useTranslation()
   const titleId = useId()
+  const modeHelpId = useId()
+
+  function modeHelp(): string {
+    if (props.state.mixed) {
+      return t('toolsApi.mixedModeHelp', {
+        defaultValue: 'Protocols use different rules. See per-protocol overrides.',
+      })
+    }
+    switch (props.state.mode) {
+      case 'inherit':
+        if (props.contract === 'tools/fetch') {
+          return t('toolsApi.inheritFetchHelp', {
+            defaultValue:
+              'Uses configured global routing defaults. The built-in Fetch order ranks eligible channel providers first, then Local Fetch, then global Exa when its key is configured. Global provider order can change this ranking.',
+          })
+        }
+        return t('toolsApi.inheritSearchHelp', {
+          defaultValue: 'Uses configured global routing defaults for Search.',
+        })
+      case 'disabled':
+        return t('toolsApi.disabledModeHelp', {
+          defaultValue: 'Blocks requests to these endpoints for this group.',
+        })
+      case 'prefer':
+        return t('toolsApi.preferModeHelp', {
+          defaultValue:
+            'Ranks listed eligible providers first. Unlisted eligible providers can still be used.',
+        })
+      case 'only':
+        return t('toolsApi.onlyModeHelp', {
+          defaultValue:
+            'Uses only listed providers that are eligible. Listing a provider does not make it eligible.',
+        })
+    }
+  }
+
   return (
     <div className='flex flex-col gap-3 rounded-lg border p-3.5'>
       <div className='flex items-start justify-between gap-2'>
-        <div className='space-y-0.5'>
+        <div className='flex flex-col gap-0.5'>
           <h4 id={titleId} className='flex items-center gap-1.5 text-sm font-medium'>
             {props.icon}
             {props.title}
@@ -531,33 +574,39 @@ function CapabilityPolicyCard(props: {
         )}
       </div>
 
-      <ToggleGroup
-        aria-labelledby={titleId}
-        disabled={props.disabled}
-        value={props.state.mixed ? [] : [props.state.mode]}
-        onValueChange={(value) => {
-          if (value[0]) {
-            props.onModeChange(
-              value[0] as GroupPolicyFormValues['rules'][ToolContract]['mode']
-            )
-          }
-        }}
-        variant='outline'
-        className='flex flex-wrap'
-      >
-        <ToggleGroupItem value='inherit' className='h-8 text-xs'>
-          {t('toolsApi.inherit')}
-        </ToggleGroupItem>
-        <ToggleGroupItem value='disabled' className='h-8 text-xs'>
-          {t('Disabled')}
-        </ToggleGroupItem>
-        <ToggleGroupItem value='prefer' className='h-8 text-xs'>
-          {t('toolsApi.prefer')}
-        </ToggleGroupItem>
-        <ToggleGroupItem value='only' className='h-8 text-xs'>
-          {t('Only listed providers')}
-        </ToggleGroupItem>
-      </ToggleGroup>
+      <div className='flex flex-col gap-1.5'>
+        <ToggleGroup
+          aria-labelledby={titleId}
+          aria-describedby={modeHelpId}
+          disabled={props.disabled}
+          value={props.state.mixed ? [] : [props.state.mode]}
+          onValueChange={(value) => {
+            if (value[0]) {
+              props.onModeChange(
+                value[0] as GroupPolicyFormValues['rules'][ToolContract]['mode']
+              )
+            }
+          }}
+          variant='outline'
+          className='flex flex-wrap'
+        >
+          <ToggleGroupItem value='inherit' className='h-8 text-xs'>
+            {t('toolsApi.inherit')}
+          </ToggleGroupItem>
+          <ToggleGroupItem value='disabled' className='h-8 text-xs'>
+            {t('Disabled')}
+          </ToggleGroupItem>
+          <ToggleGroupItem value='prefer' className='h-8 text-xs'>
+            {t('toolsApi.prefer')}
+          </ToggleGroupItem>
+          <ToggleGroupItem value='only' className='h-8 text-xs'>
+            {t('Only listed providers')}
+          </ToggleGroupItem>
+        </ToggleGroup>
+        <p id={modeHelpId} role='status' className='text-muted-foreground text-xs'>
+          {modeHelp()}
+        </p>
+      </div>
 
       {!props.state.mixed &&
         (props.state.mode === 'prefer' || props.state.mode === 'only') && (

@@ -109,6 +109,59 @@ test('selecting another configured group displays its independent rules', async 
   expect(group).toHaveFocus()
 })
 
+test('inherited Fetch explains the built-in rank separately from channel-free fallback', async () => {
+  mockOptions('{}')
+  renderToolsApi()
+  await screen.findByRole('combobox', { name: 'Group' })
+
+  const fetchMode = screen.getByRole('group', { name: 'Fetch' })
+  expect(fetchMode).toHaveAccessibleDescription(
+    /configured global routing defaults.*eligible channel providers first, then Local Fetch, then global Exa when its key is configured/i
+  )
+  expect(
+    screen.getByText(/channel-free fallback is off by default/i)
+  ).toHaveTextContent(
+    /no eligible channel.*group policy.*Alpha Search is excluded/i
+  )
+})
+
+test.each([
+  ['toolsApi.prefer', /unlisted eligible providers can still be used/i],
+  ['Only listed providers', /listing a provider does not make it eligible/i],
+  ['Disabled', /blocks requests to these endpoints for this group/i],
+])('selecting Fetch mode %s updates the live help without saving', async (mode, guidance) => {
+  mockOptions('{}')
+  const put = vi.spyOn(api, 'put').mockResolvedValue({ data: { success: true } })
+  renderToolsApi()
+  await screen.findByRole('combobox', { name: 'Group' })
+  const fetchMode = screen.getByRole('group', { name: 'Fetch' })
+  const button = within(fetchMode).getByRole('button', { name: mode })
+  const user = userEvent.setup()
+
+  button.focus()
+  await user.keyboard('[Space]')
+
+  expect(button).toHaveFocus()
+  expect(button).toHaveAttribute('aria-pressed', 'true')
+  expect(fetchMode).toHaveAccessibleDescription(guidance)
+  expect(screen.getByText(guidance)).toHaveAttribute('role', 'status')
+  expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  expect(put).not.toHaveBeenCalled()
+})
+
+test('mixed Fetch rules refer to per-protocol overrides instead of a shared default', async () => {
+  mockOptions(JSON.stringify({ default: { 'tools/fetch': { mode: 'disabled' } } }))
+  renderToolsApi()
+  await screen.findByRole('combobox', { name: 'Group' })
+
+  const fetchMode = screen.getByRole('group', { name: 'Fetch' })
+  expect(fetchMode).toHaveAccessibleDescription(/protocols use different rules/i)
+  expect(within(fetchMode).queryByRole('button', { pressed: true })).toBeNull()
+  expect(
+    screen.getByRole('button', { name: /Per-protocol overrides \(Advanced\)/ })
+  ).toHaveAttribute('aria-expanded', 'true')
+})
+
 test('saving inherit removes only the edited override', async () => {
   mockOptions(
     JSON.stringify({

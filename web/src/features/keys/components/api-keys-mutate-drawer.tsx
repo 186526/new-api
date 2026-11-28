@@ -37,11 +37,20 @@ import {
 } from '@/components/drawer-layout'
 import { MultiSelect } from '@/components/multi-select'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import {
+  Field,
+  FieldDescription,
+  FieldGroup,
+  FieldLabel,
+  FieldLegend,
+  FieldSet,
+} from '@/components/ui/field'
 import {
   Form,
   FormControl,
@@ -795,26 +804,11 @@ export function ApiKeysMutateDrawer({
                       control={form.control}
                       name='model_limits'
                       render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>{t('Model Limits')}</FormLabel>
-                          <FormControl>
-                            <MultiSelect
-                              options={models.map((m) => ({
-                                label: m,
-                                value: m,
-                              }))}
-                              selected={field.value}
-                              onChange={field.onChange}
-                              placeholder={t(
-                                'Select models (empty for allow all)'
-                              )}
-                            />
-                          </FormControl>
-                          <FormDescription>
-                            {t('Limit which models can be used with this key')}
-                          </FormDescription>
-                          <FormMessage />
-                        </FormItem>
+                        <ApiKeyAccessLimits
+                          models={models}
+                          value={field.value}
+                          onChange={field.onChange}
+                        />
                       )}
                     />
 
@@ -899,5 +893,98 @@ export function ApiKeysMutateDrawer({
         </SheetFooter>
       </SheetContent>
     </Sheet>
+  )
+}
+
+type ApiKeyAccessLimitsProps = {
+  models: string[]
+  value: string[]
+  onChange: (value: string[]) => void
+}
+
+function ApiKeyAccessLimits(props: ApiKeyAccessLimitsProps) {
+  const { t } = useTranslation()
+  const id = useId()
+  const tools = [
+    { value: 'tools-search', label: t('Web search') },
+    {
+      value: 'tools-fetch',
+      label: t('keys.toolPermissions.fetch', {
+        defaultValue: 'Fetch web pages',
+      }),
+    },
+  ]
+  const toolValues = new Set(tools.map((tool) => tool.value))
+  const selected = new Set(props.value)
+
+  function changeModels(models: string[]): void {
+    const nextModels = new Set(models)
+    props.onChange([
+      ...props.value.filter(
+        (value) => toolValues.has(value) || nextModels.has(value)
+      ),
+      ...models.filter((model) => !selected.has(model)),
+    ])
+  }
+
+  return (
+    <>
+      <FormItem>
+        <FormLabel>{t('Model Limits')}</FormLabel>
+        <FormControl>
+          <MultiSelect
+            options={props.models
+              .filter((model) => !toolValues.has(model))
+              .map((model) => ({ label: model, value: model }))}
+            selected={props.value.filter((value) => !toolValues.has(value))}
+            onChange={changeModels}
+            placeholder={t('Select models')}
+          />
+        </FormControl>
+        <FormMessage />
+      </FormItem>
+      <FieldSet aria-describedby={`${id}-status`} className='gap-2'>
+        <FieldLegend variant='label'>
+          {t('keys.toolPermissions.title', { defaultValue: 'Tool permissions' })}
+        </FieldLegend>
+        <FieldGroup className='gap-2'>
+          {tools.map((tool) => {
+            const checkboxId = `${id}-${tool.value}`
+            return (
+              <Field key={tool.value} orientation='horizontal'>
+                <Checkbox
+                  id={checkboxId}
+                  name='model_limits'
+                  value={tool.value}
+                  nativeButton
+                  render={<button type='button' />}
+                  checked={selected.has(tool.value)}
+                  onCheckedChange={(checked) => {
+                    if (checked === selected.has(tool.value)) return
+                    props.onChange(
+                      checked
+                        ? [...props.value, tool.value]
+                        : props.value.filter((value) => value !== tool.value)
+                    )
+                  }}
+                />
+                <FieldLabel htmlFor={checkboxId}>{tool.label}</FieldLabel>
+              </Field>
+            )
+          })}
+        </FieldGroup>
+        <FieldDescription id={`${id}-status`} role='status'>
+          {props.value.length === 0
+            ? t('keys.accessLimits.unrestricted', {
+                defaultValue:
+                  'No limits: this key can use any available models and tools.',
+              })
+            : t('keys.accessLimits.restricted', {
+                defaultValue:
+                  'This key can use only the selected models and tools.',
+              })}
+        </FieldDescription>
+      </FieldSet>
+    </>
   )
 }

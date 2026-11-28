@@ -93,6 +93,70 @@ func TestSystemOneModelsAnswersTheContractDocument(t *testing.T) {
 	require.JSONEq(t, recorder.Body.String(), string(payload))
 }
 
+func TestSystemOneModelsRespectTokenModelLimits(t *testing.T) {
+	_, user := setupSystemOneTestToken(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Model{}, &model.Vendor{}))
+	require.NoError(t, model.DB.Create(&[]model.Ability{
+		{Group: "default", Model: "jev-latest", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "jev-preview@thinking:on", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "jev-restricted", ChannelId: 1, Enabled: true},
+		{Group: "default", Model: "jev-disabled", ChannelId: 1, Enabled: false},
+		{Group: "other", Model: "jev-other-group", ChannelId: 1, Enabled: true},
+	}).Error)
+	previousSelfUseMode := operation_setting.SelfUseModeEnabled
+	operation_setting.SelfUseModeEnabled = true
+	t.Cleanup(func() { operation_setting.SelfUseModeEnabled = previousSelfUseMode })
+
+	engine := gin.New()
+	SetRelayRouter(engine)
+	SetSystemOneRouter(engine)
+
+	for _, test := range []struct {
+		name        string
+		modelLimits string
+		want        []string
+	}{
+		{"restricted", "jev-latest,jev-preview,jev-disabled,jev-other-group", []string{"jev-latest", "jev-preview@thinking:on"}},
+		{"tools only", constant.ToolsSearchModel + "," + constant.ToolsFetchModel, []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key := "systemone" + strings.ReplaceAll(test.name, " ", "")
+			require.NoError(t, model.DB.Create(&model.Token{
+				UserId: user.Id, Key: key, Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true,
+				ModelLimitsEnabled: true, ModelLimits: test.modelLimits,
+			}).Error)
+
+			for _, list := range []struct{ path, field, nameField string }{
+				{"/systemone/v1/models", "models", "name"},
+				{"/v1/models", "data", "id"},
+			} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, list.path, nil)
+				request.Header.Set("Authorization", "Bearer "+key)
+				engine.ServeHTTP(recorder, request)
+
+				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+				var document map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &document))
+				var items []map[string]json.RawMessage
+				require.NoError(t, json.Unmarshal(document[list.field], &items))
+				require.NotNil(t, items, list.path)
+				names := make([]string, 0, len(items))
+				for _, item := range items {
+					var name string
+					require.NoError(t, json.Unmarshal(item[list.nameField], &name))
+					names = append(names, name)
+				}
+				assert.ElementsMatch(t, test.want, names, list.path)
+			}
+
+			const body = `{"model":"jev-restricted","state":"x","questions":{"q":{"type":"noul","instructions":"y"}}}`
+			decision := serveSystemOneDecision(engine, "/systemone/v1/systemone", key, "", body)
+			require.Equal(t, http.StatusForbidden, decision.Code, decision.Body.String())
+		})
+	}
+}
+
 func TestSystemOneModelsRejectsAnUnauthorizedCallerInContractShape(t *testing.T) {
 	setupSystemOneTestToken(t)
 

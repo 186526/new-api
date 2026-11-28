@@ -2,10 +2,12 @@ package controller
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/systemone"
 	"github.com/QuantumNous/new-api/service"
@@ -15,8 +17,8 @@ import (
 
 // ListSystemOneModels answers GET /systemone/v1/models with the document the
 // upstream declares: {"models":[{name,description,release_date}]}, naming only
-// the decision models the caller's own groups may reach. This gateway keeps no
-// release date, so that key is written empty rather than left out.
+// enabled decision models in the caller's groups that the token permits. This
+// gateway writes an empty release date because it keeps no release dates.
 func ListSystemOneModels(c *gin.Context) {
 	groups, err := getModelListGroups(c)
 	if err != nil {
@@ -24,6 +26,11 @@ func ListSystemOneModels(c *gin.Context) {
 		return
 	}
 	names := FilterSystemOneModels(service.GetGroupsEnabledModels(groups.ownerGroups))
+	if limit, enabled := tokenModelLimitForList(c); enabled {
+		names = slices.DeleteFunc(names, func(name string) bool {
+			return !middleware.TokenModelLimitAllows(limit, name)
+		})
+	}
 
 	// A catalog the description read cannot answer leaves the entries without a
 	// description; failing the whole listing would hide the models a caller can

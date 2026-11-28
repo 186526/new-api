@@ -16,7 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import type { ApiKey } from '../../types'
@@ -49,13 +57,19 @@ const originalGet = apiClient.get
 const originalPost = apiClient.post
 let renderedDrawer: RenderedDrawer | null = null
 
-function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
+function installApiFixtures(
+  createdPayloads: Array<Record<string, unknown>>,
+  fixtures: { models?: string[]; currentRow?: ApiKey } = {}
+): void {
   apiClient.get = async (url) => {
+    if (fixtures.currentRow && url === `/api/token/${fixtures.currentRow.id}`) {
+      return { data: { success: true, data: fixtures.currentRow } }
+    }
     switch (url) {
       case '/api/status':
         return { data: { data: { default_use_auto_group: true } } }
       case '/api/user/models':
-        return { data: { success: true, data: [] } }
+        return { data: { success: true, data: fixtures.models ?? [] } }
       case '/api/user/self/groups':
         return {
           data: {
@@ -92,7 +106,10 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
   }
 }
 
-async function renderCreateDrawer(onOpenChange = vi.fn()): Promise<void> {
+async function renderKeyDrawer(
+  onOpenChange = vi.fn(),
+  currentRow?: ApiKey
+): Promise<void> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -102,38 +119,17 @@ async function renderCreateDrawer(onOpenChange = vi.fn()): Promise<void> {
     { default_use_auto_group: true },
     { updatedAt: freshAt }
   )
-  queryClient.setQueryData(
-    ['user-models'],
-    { success: true, data: [] },
-    { updatedAt: freshAt }
-  )
-  queryClient.setQueryData(
-    ['user-groups'],
-    {
-      success: true,
-      data: {
-        auto: { desc: 'Automatic routing', ratio: 'auto' },
-        default: { desc: 'Standard access', ratio: 1 },
-        vip: { desc: 'Priority access', ratio: 2 },
-      },
-    },
-    { updatedAt: freshAt }
-  )
-  queryClient.setQueryData(
-    ['token-auto-groups'],
-    {
-      success: true,
-      data: { groups: ['vip', 'default'], max_count: 3 },
-    },
-    { updatedAt: freshAt }
-  )
   renderedDrawer = { queryClient }
 
   render(
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
         <ApiKeysProvider>
-          <ApiKeysMutateDrawer open onOpenChange={onOpenChange} />
+          <ApiKeysMutateDrawer
+            open
+            onOpenChange={onOpenChange}
+            currentRow={currentRow}
+          />
         </ApiKeysProvider>
       </I18nextProvider>
     </QueryClientProvider>
@@ -216,7 +212,7 @@ describe('API keys mutate drawer Auto group integration', () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)
     const close = vi.fn()
-    await renderCreateDrawer(close)
+    await renderKeyDrawer(close)
 
     const groupTrigger = getControlByLabel('Group')
     expect(groupTrigger.textContent?.includes('auto')).toBe(true)
@@ -255,7 +251,7 @@ describe('API keys mutate drawer Auto group integration', () => {
         return { data: { success: true, message: '' } }
       })
       apiClient.post = post
-      await renderCreateDrawer()
+      await renderKeyDrawer()
 
       const name = getControlByLabel('Name')
       const quantity = getControlByLabel('Quantity')
@@ -283,7 +279,7 @@ describe('API keys mutate drawer Auto group integration', () => {
     })
     const post = vi.fn<ApiMethod>(() => request)
     apiClient.post = post
-    await renderCreateDrawer()
+    await renderKeyDrawer()
 
     const name = getControlByLabel('Name')
     changeInput(name, 'batch')
@@ -303,7 +299,7 @@ describe('API keys mutate drawer Auto group integration', () => {
   test('preserves an unsaved custom order and mode after Auto to ordinary to Auto changes', async () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)
-    await renderCreateDrawer()
+    await renderKeyDrawer()
 
     const autoOrderControl = getControlByLabel('Auto group order')
     const addGroupTrigger = autoOrderControl.querySelector<HTMLButtonElement>(
@@ -449,7 +445,7 @@ describe('API key expiry across editing sessions', () => {
     async (action) => {
       const payloads: Array<Record<string, unknown>> = []
       installApiFixtures(payloads)
-      await renderCreateDrawer()
+      await renderKeyDrawer()
       changeInput(getControlByLabel('Name'), 'no-expiry')
       fireEvent.click(screen.getByRole('button', { name: '1 Month' }))
       expect(screen.getByLabelText('Time')).toBeEnabled()
@@ -469,7 +465,7 @@ describe('API keys mutate drawer user quota query switch', () => {
   test('sends false for a new key after the switch, which starts on, is turned off', async () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)
-    await renderCreateDrawer()
+    await renderKeyDrawer()
 
     fireEvent.click(findButton('Advanced Settings', true))
     const quotaQuerySwitch = await screen.findByRole('switch', {
@@ -483,5 +479,129 @@ describe('API keys mutate drawer user quota query switch', () => {
     fireEvent.click(findButton('Save changes', true))
     await waitFor(() => expect(createdPayloads).toHaveLength(1))
     expect(createdPayloads[0]?.allow_user_quota_query).toBe(false)
+  })
+})
+
+describe('API key tool permissions', () => {
+  test('creates a key with tool permissions when no models are available', async () => {
+    const user = userEvent.setup()
+    const createdPayloads: Array<Record<string, unknown>> = []
+    installApiFixtures(createdPayloads)
+    await renderKeyDrawer()
+
+    changeInput(getControlByLabel('Name'), 'tools-only')
+    await user.click(findButton('Advanced Settings', true))
+    const permissions = within(
+      screen.getByRole('group', { name: 'Tool permissions' })
+    )
+    const search = permissions.getByRole('checkbox', { name: 'Web search' })
+    const fetch = permissions.getByRole('checkbox', { name: 'Fetch web pages' })
+    const status = permissions.getByRole('status')
+    expect(search).not.toBeChecked()
+    expect(fetch).not.toBeChecked()
+    expect(status).toHaveTextContent('No limits:')
+
+    await user.click(permissions.getByText('Web search', { exact: true }))
+    await user.tab()
+    expect(fetch).toHaveFocus()
+    await user.keyboard(' ')
+    expect(search).toBeChecked()
+    expect(fetch).toBeChecked()
+    expect(status).toHaveTextContent('only the selected models and tools')
+    expect(createdPayloads).toHaveLength(0)
+
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(createdPayloads).toHaveLength(1))
+    expect(createdPayloads[0]).toMatchObject({
+      model_limits_enabled: true,
+      model_limits: 'tools-search,tools-fetch',
+    })
+  })
+
+  const savedKey: ApiKey = {
+    id: 3,
+    name: 'restricted-key',
+    key: '',
+    status: 1,
+    remain_quota: 0,
+    used_quota: 0,
+    unlimited_quota: true,
+    expired_time: -1,
+    created_time: 1,
+    accessed_time: 0,
+    group: 'default',
+    auto_groups: [],
+    cross_group_retry: false,
+    model_limits_enabled: true,
+    model_limits: 'tools-search,retired-model',
+    allow_ips: '',
+    allow_user_quota_query: true,
+  }
+
+  test('keeps a saved model absent from the catalog when editing models and tools', async () => {
+    const user = userEvent.setup()
+    installApiFixtures([], {
+      currentRow: savedKey,
+      models: ['current-model', 'tools-search', 'tools-fetch'],
+    })
+    const put = vi.spyOn(api, 'put').mockResolvedValue({ data: { success: true } })
+    const close = vi.fn()
+    await renderKeyDrawer(close, savedKey)
+
+    await user.click(screen.getByRole('button', { name: /^Advanced Settings/ }))
+    const search = screen.getByRole('checkbox', { name: 'Web search' })
+    const fetch = screen.getByRole('checkbox', { name: 'Fetch web pages' })
+    expect(search).toBeChecked()
+    expect(fetch).not.toBeChecked()
+    expect(screen.getByText('retired-model')).toBeVisible()
+
+    await user.click(screen.getByRole('combobox', { name: 'Select models' }))
+    const model = await screen.findByRole('option', { name: 'current-model' })
+    expect(screen.queryByRole('option', { name: /^tools-/ })).not.toBeInTheDocument()
+    await user.click(model)
+    expect(search).toBeChecked()
+    await user.click(search)
+    await user.click(fetch)
+    expect(put).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(close).toHaveBeenCalledWith(false))
+    expect(put).toHaveBeenCalledExactlyOnceWith(
+      '/api/token/',
+      expect.objectContaining({
+        id: savedKey.id,
+        model_limits_enabled: true,
+        model_limits: 'retired-model,current-model,tools-fetch',
+      })
+    )
+  })
+
+  test('clears limits when removing the last saved model absent from the catalog', async () => {
+    const user = userEvent.setup()
+    const currentRow = { ...savedKey, model_limits: 'retired-model' }
+    installApiFixtures([], { currentRow })
+    const put = vi.spyOn(api, 'put').mockResolvedValue({ data: { success: true } })
+    const close = vi.fn()
+    await renderKeyDrawer(close, currentRow)
+
+    await user.click(screen.getByRole('button', { name: /^Advanced Settings/ }))
+    expect(screen.getByText('retired-model')).toBeVisible()
+    await user.click(screen.getByRole('combobox', { name: 'Select models' }))
+    await user.keyboard('{Backspace}{Escape}')
+    expect(screen.queryByText('retired-model')).not.toBeInTheDocument()
+    const permissions = screen.getByRole('group', { name: 'Tool permissions' })
+    expect(within(permissions).getByRole('status')).toHaveTextContent('No limits:')
+    expect(put).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(close).toHaveBeenCalledWith(false))
+    expect(put).toHaveBeenCalledExactlyOnceWith(
+      '/api/token/',
+      expect.objectContaining({
+        id: currentRow.id,
+        model_limits_enabled: false,
+        model_limits: '',
+      })
+    )
   })
 })

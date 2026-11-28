@@ -215,6 +215,15 @@ func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 	}, nil
 }
 
+func tokenModelLimitForList(c *gin.Context) (map[string]bool, bool) {
+	if !common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled) {
+		return nil, false
+	}
+	value, _ := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
+	limit, _ := value.(map[string]bool)
+	return limit, true
+}
+
 func ListModels(c *gin.Context, modelType int) {
 	acceptUnsetRatioModel := operation_setting.SelfUseModeEnabled
 	if !acceptUnsetRatioModel {
@@ -237,17 +246,7 @@ func ListModels(c *gin.Context, modelType int) {
 		return
 	}
 	ownerGroups := groups.ownerGroups
-	modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)
-	var tokenModelLimit map[string]bool
-	if modelLimitEnable {
-		s, ok := common.GetContextKey(c, constant.ContextKeyTokenModelLimit)
-		if ok {
-			tokenModelLimit, _ = s.(map[string]bool)
-		}
-		if tokenModelLimit == nil {
-			tokenModelLimit = map[string]bool{}
-		}
-	}
+	tokenModelLimit, modelLimitEnable := tokenModelLimitForList(c)
 	models := service.GetGroupsEnabledModels(ownerGroups)
 	for _, modelName := range models {
 		if constant.IsInternalCapabilityModel(modelName) {
