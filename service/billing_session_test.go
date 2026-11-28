@@ -138,6 +138,61 @@ func TestShutdownWaitsForTheRefundBeforeFlushingTheAccumulator(t *testing.T) {
 	assert.Equal(t, "requested", relayInfo.ToolExecution.Refund)
 }
 
+func TestLegacyToolRefundWithoutReceiptTable(t *testing.T) {
+	truncate(t)
+	require.False(t, model.SQLQuotaLedgerWriterEnabled())
+	require.False(t, model.DB.Migrator().HasTable(&model.QuotaRefundReceipt{}))
+	const userID, tokenID, initial, reserved = 4242, 4343, 1000, 30
+	const tokenKey = "legacy-tool-refund-token"
+	seedShutdownOrderingUser(t, userID, initial)
+	seedToken(t, tokenID, userID, tokenKey, initial)
+	funding := &WalletFunding{userId: userID}
+	require.NoError(t, funding.PreConsume(reserved))
+	require.NoError(t, model.DecreaseTokenQuota(tokenID, tokenKey, reserved))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/tools/search", nil)
+	ctx.Set(common.RequestIdKey, "legacy-tool-refund")
+	info := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: tokenKey}
+	session := &BillingSession{relayInfo: info, funding: funding, preConsumedQuota: reserved, tokenConsumed: reserved}
+	info.Billing = session
+	RefundRequestBilling(ctx, info)
+	RefundRequestBilling(ctx, info)
+	_, finished := model.WaitDetachedQuotaWork(5 * time.Second)
+	require.True(t, finished)
+
+	assert.False(t, session.NeedsRefund())
+	assert.Equal(t, initial, getUserQuota(t, userID))
+	var token model.Token
+	require.NoError(t, model.DB.First(&token, tokenID).Error)
+	assert.Equal(t, initial, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+	assert.Equal(t, model.RefundRequested, info.ToolExecution.Refund)
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("request_id = ?", "legacy-tool-refund").Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Contains(t, logs[0].Other, `"refund":"requested"`)
+}
+
+func TestSQLDebitRefundDoesNotFallBackToLegacyCredit(t *testing.T) {
+	truncate(t)
+	require.False(t, model.DB.Migrator().HasTable(&model.QuotaRefundReceipt{}))
+	const userID, remaining, reserved = 4242, 970, 30
+	seedShutdownOrderingUser(t, userID, remaining)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	session := &BillingSession{
+		relayInfo: &relaycommon.RelayInfo{UserId: userID, IsPlayground: true},
+		funding: &WalletFunding{userId: userID, consumed: reserved},
+		preConsumedQuota: reserved,
+		sqlDebit: &model.SQLQuotaDebit{ID: "existing-sql-debit", UserID: userID},
+	}
+	session.Refund(ctx)
+	_, finished := model.WaitDetachedQuotaWork(5 * time.Second)
+	require.True(t, finished)
+	assert.True(t, session.NeedsRefund())
+	assert.Equal(t, remaining, getUserQuota(t, userID))
+}
+
 func TestBillingSessionRefundDoesNotMarkAnUnreservedToolRequest(t *testing.T) {
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	info := &relaycommon.RelayInfo{ToolExecution: &relaycommon.ToolExecutionMeta{Contract: "tools/search"}}

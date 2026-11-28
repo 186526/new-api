@@ -641,7 +641,7 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 	}
 }
 
-func TestAddTokenCreatesBatchWithSeparatelySealedPolicies(t *testing.T) {
+func TestAddTokenRejectsPolicyWithReleaseHardOff(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	payload := map[string]any{
 		"name": "batch", "count": 3, "unlimited_quota": true,
@@ -649,12 +649,20 @@ func TestAddTokenCreatesBatchWithSeparatelySealedPolicies(t *testing.T) {
 	}
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", payload, 1)
 	AddToken(ctx)
-	response := decodeAPIResponse(t, recorder)
-	require.True(t, response.Success, response.Message)
-	assert.JSONEq(t, `{"created":3,"redaction_enabled":false}`, string(response.Data))
-	var tokens []model.Token
-	require.NoError(t, db.Where("user_id = ?", 1).Find(&tokens).Error)
+	assert.JSONEq(t, `{"success":false,"message":"request redaction is unavailable","message_key":"redaction.unavailable","field":"redaction_enabled"}`, recorder.Body.String())
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestCloneTokenCreateBatchSeparatelySealsPolicies(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	first := model.Token{UserId: 1, Key: "first-key"}
+	require.NoError(t, first.StoreRedactionConfig([]byte(`{"strategy":"typed_placeholder"}`)))
+	tokens, err := cloneTokenCreateBatch(first, 3)
+	require.NoError(t, err)
 	require.Len(t, tokens, 3)
+	require.NoError(t, insertTokenCreateBatch(tokens, 4))
 	original, err := tokens[0].RedactionConfigBytes()
 	require.NoError(t, err)
 	require.NotEmpty(t, original)
@@ -671,17 +679,60 @@ func TestAddTokenCreatesBatchWithSeparatelySealedPolicies(t *testing.T) {
 	assert.EqualValues(t, 3, count)
 }
 
-func TestAddTokenReturnsStablePolicyErrorWithoutRuleContents(t *testing.T) {
-	setupTokenControllerTestDB(t)
+func TestUpdateTokenRejectsPolicyWithReleaseHardOff(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		name, handler := "single", UpdateToken
+		if batch {
+			name, handler = "batch", BatchUpdateTokenRedaction
+		}
+		t.Run(name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			token := seedToken(t, db, 1, "original", "redaction-test-key")
+			item := map[string]any{
+				"id": token.Id, "name": "updated", "redaction_revision": 0, "redaction_enabled": false,
+				"redaction_config": map[string]any{"strategy": "typed_placeholder", "builtin_rules": []string{"email"}, "scopes": map[string]bool{"user_messages": true}},
+			}
+			payload := item
+			if batch {
+				payload = map[string]any{"items": []map[string]any{item}}
+			}
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", payload, 1)
+			handler(ctx)
+			response := decodeAPIResponse(t, recorder)
+			if batch {
+				require.True(t, response.Success, response.Message)
+				var result struct {
+					Items   []batchTokenRedactionResult `json:"items"`
+					Updated int                         `json:"updated"`
+				}
+				require.NoError(t, json.Unmarshal(response.Data, &result))
+				require.Len(t, result.Items, 1)
+				assert.False(t, result.Items[0].Success)
+				assert.Equal(t, "redaction.unavailable", result.Items[0].MessageKey)
+				assert.Zero(t, result.Updated)
+			} else {
+				assert.False(t, response.Success)
+				assert.Equal(t, errRedactionUnavailable.Error(), response.Message)
+			}
+			var saved model.Token
+			require.NoError(t, db.First(&saved, token.Id).Error)
+			assert.Equal(t, "original", saved.Name)
+			assert.False(t, saved.RedactionEnabled)
+			assert.Empty(t, saved.RedactionConfig)
+			assert.Zero(t, saved.RedactionRevision)
+		})
+	}
+}
+
+func TestPreviewTokenRedactionReturnsStablePolicyErrorWithoutRuleContents(t *testing.T) {
 	payload := map[string]any{
-		"name": "batch", "count": 2,
-		"redaction_config": map[string]any{
+		"config": map[string]any{
 			"strategy": "typed_placeholder", "scopes": map[string]bool{"user_messages": true},
 			"custom_rules": []map[string]string{{"id": "rule", "label": "RULE", "pattern": "[PRIVATE_TEST"}},
 		},
 	}
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", payload, 1)
-	AddToken(ctx)
+	PreviewTokenRedaction(ctx)
 	var response struct {
 		Success    bool   `json:"success"`
 		MessageKey string `json:"message_key"`

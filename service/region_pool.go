@@ -111,7 +111,7 @@ func reportRegionPending(region string) {
 			common.SysLog(common.LogText("failed to report region quota batch %s/%d: %s", entry.SubjectType, entry.Seq, err.Error()))
 			continue
 		}
-		if err := model.AcknowledgePendingRegionReport(entry); err != nil {
+		if err := model.ClearPendingRegionReport(region, entry.SubjectType, entry.SubjectID); err != nil {
 			common.SysLog(common.LogText("failed to clear reported region batch: %s", err.Error()))
 		}
 	}
@@ -124,8 +124,17 @@ func pendingReportSnapshot(region string) {
 		return
 	}
 	for _, subject := range subjects {
-		if err := model.SnapshotRegionReport(region, subject[0], subject[1]); err != nil {
+		report, err := model.NextRegionReport(region, subject[0], subject[1])
+		if err != nil {
 			common.SysLog(common.LogText("failed to snapshot region spend: %s", err.Error()))
+			continue
+		}
+		if report == nil {
+			continue
+		}
+		if err := model.SavePendingRegionReport(report); err != nil {
+			common.SysLog(common.LogText("failed to persist region batch: %s", err.Error()))
+			continue
 		}
 	}
 }

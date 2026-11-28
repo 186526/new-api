@@ -19,6 +19,15 @@ func (token Token) cacheMAC() (string, error) {
 	if token.AllowIps != nil && *token.AllowIps == "" {
 		token.AllowIps = nil
 	}
+	// Select exactly one format. Falling back to the legacy MAC after a policy
+	// signature fails would let unsigned policy fields ride on a legacy hash.
+	if !token.RedactionEnabled && token.RedactionConfig == "" {
+		return authCacheMAC(key, struct {
+			Token          Token
+			AutoGroups     string
+			CacheExpiresAt int64
+		}{token, token.AutoGroups, token.CacheExpiresAt})
+	}
 	return authCacheMAC(key, struct {
 		Token            Token
 		AutoGroups       string

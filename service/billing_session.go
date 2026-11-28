@@ -138,7 +138,13 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		applySQLRefund(debit.ApplyRefund, persistOutcome)
 		return
 	}
-	receipts, err := s.registerRefunds(c)
+	var receipts map[string]model.QuotaRefundReceipt
+	var err error
+	if model.SQLQuotaLedgerWriterEnabled() {
+		receipts, err = s.registerRefunds(c)
+	}
+	// Legacy credits are not replayable. Claim the refund under the lock even
+	// when there are no SQL receipts, before scheduling compensation.
 	if err == nil {
 		s.refunded = true
 	}

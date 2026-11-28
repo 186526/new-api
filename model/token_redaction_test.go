@@ -1,9 +1,11 @@
 package model
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,4 +59,46 @@ func TestTokenCachePolicyMutationPreservesSignedQuota(t *testing.T) {
 	require.Equal(t, 30, cached.RemainQuota)
 	require.Equal(t, fenced.RedactionConfig, cached.RedactionConfig)
 	require.True(t, cached.RedactionEnabled)
+
+	require.NoError(t, common.RDB.HDel(context.Background(), getTokenCacheKey(token.Key), "RedactionEnabled", "RedactionConfig").Err())
+	_, err = cacheGetTokenByKey(token.Key)
+	require.ErrorIs(t, err, errTokenCacheIntegrity)
+}
+
+func TestTokenCacheLegacyMetadataMAC(t *testing.T) {
+	useUserCacheMiniRedis(t)
+	ctx := context.Background()
+	emptyIPs := ""
+	token := Token{Id: 42, UserId: 9, Key: "legacy-token-cache-test", AutoGroups: "default", AllowIps: &emptyIPs, RemainQuota: 100}
+	cacheKey := getTokenCacheKey(token.Key)
+	_, err := cacheInitToken(token)
+	require.NoError(t, err)
+
+	var cached Token
+	require.NoError(t, common.RedisHGetObj(cacheKey, &cached))
+	// The metadata payload and normalization used by f77225142.
+	legacy := cached
+	legacy.Key, legacy.AllowIps = "", nil
+	legacy.RemainQuota, legacy.UsedQuota, legacy.AccessedTime = 0, 0, 0
+	legacyMAC, err := authCacheMAC(cacheKey, struct {
+		Token          Token
+		AutoGroups     string
+		CacheExpiresAt int64
+	}{legacy, legacy.AutoGroups, legacy.CacheExpiresAt})
+	require.NoError(t, err)
+	require.Equal(t, legacyMAC, cached.CacheMAC)
+
+	require.NoError(t, common.RDB.HDel(ctx, cacheKey, "RedactionEnabled", "RedactionConfig").Err())
+	read, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	require.Equal(t, 100, read.RemainQuota)
+	for _, field := range []struct{ name, value string }{
+		{"RedactionEnabled", "true"},
+		{"RedactionConfig", "unsigned-policy"},
+	} {
+		require.NoError(t, common.RDB.HSet(ctx, cacheKey, field.name, field.value).Err())
+		_, err := cacheGetTokenByKey(token.Key)
+		require.ErrorIs(t, err, errTokenCacheIntegrity)
+		require.NoError(t, common.RDB.HDel(ctx, cacheKey, field.name).Err())
+	}
 }

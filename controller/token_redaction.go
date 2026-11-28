@@ -83,11 +83,13 @@ func applyTokenRedaction(token *model.Token, request tokenRedactionInput) (bool,
 	}
 	settings := redaction_setting.Get()
 	readiness := redaction_setting.Readiness()
-	if enabled && !token.RedactionEnabled && !readiness.EnableKeys {
-		return false, errRedactionUnavailable
-	}
-	if enabled && !token.RedactionEnabled && !settings.Enabled {
-		return false, errRedactionDisabled
+	if request.RedactionConfig != nil || (enabled && !token.RedactionEnabled) {
+		if !readiness.EnableKeys {
+			return false, errRedactionUnavailable
+		}
+		if !settings.Enabled {
+			return false, errRedactionDisabled
+		}
 	}
 	if request.RedactionConfig == nil && enabled == token.RedactionEnabled {
 		return false, nil
