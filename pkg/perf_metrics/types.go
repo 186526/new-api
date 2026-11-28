@@ -1,6 +1,11 @@
 package perfmetrics
 
-import "sync/atomic"
+import (
+	"sync"
+	"sync/atomic"
+
+	"github.com/QuantumNous/new-api/model"
+)
 
 type Store interface {
 	Record(sample Sample)
@@ -8,14 +13,17 @@ type Store interface {
 }
 
 type Sample struct {
-	Model        string
-	Group        string
-	LatencyMs    int64
-	TtftMs       int64
-	HasTtft      bool
-	Success      bool
-	OutputTokens int64
-	GenerationMs int64
+	Model           string
+	Group           string
+	LatencyMs       int64
+	TtftMs          int64
+	HasTtft         bool
+	Success         bool
+	OutputTokens    int64
+	GenerationMs    int64
+	observation     model.PerfMetricObservation
+	distribution    []model.PerfMetricDistributionEntry
+	observationOnly bool
 }
 
 type QueryParams struct {
@@ -76,10 +84,12 @@ type ModelSummary struct {
 }
 
 type SummaryAllResult struct {
-	Summary     *Summary       `json:"summary"`
-	WindowStart int64          `json:"window_start"`
-	WindowEnd   int64          `json:"window_end"`
-	Models      []ModelSummary `json:"models"`
+	RequestObservations     *model.PerfMetricObservation        `json:"request_observations,omitempty"`
+	ObservationDistribution []model.PerfMetricDistributionEntry `json:"request_observation_distribution,omitempty"`
+	Summary                 *Summary                            `json:"summary"`
+	WindowStart             int64                               `json:"window_start"`
+	WindowEnd               int64                               `json:"window_end"`
+	Models                  []ModelSummary                      `json:"models"`
 	// RecentSuccessSeries contains up to 24 nonempty hours from the last 7 days,
 	// including requested models with no traffic in the summary window.
 	RecentSuccessSeries map[string][]SuccessRatePoint `json:"recent_success_series,omitempty"`
@@ -99,9 +109,14 @@ type counters struct {
 	ttftCount      int64
 	outputTokens   int64
 	generationMs   int64
+	observation    model.PerfMetricObservation
+	distribution   model.PerfMetricDistribution
 }
 
 type atomicBucket struct {
+	observationMu  sync.Mutex
+	observation    model.PerfMetricObservation
+	distribution   model.PerfMetricDistribution
 	requestCount   atomic.Int64
 	successCount   atomic.Int64
 	totalLatencyMs atomic.Int64
@@ -111,7 +126,23 @@ type atomicBucket struct {
 	generationMs   atomic.Int64
 }
 
+func (b *atomicBucket) addDistribution(entry model.PerfMetricDistributionEntry) {
+	if b.distribution == nil {
+		b.distribution = make(model.PerfMetricDistribution)
+	}
+	b.distribution.Add(entry)
+}
+
 func (b *atomicBucket) add(sample Sample) {
+	b.observationMu.Lock()
+	defer b.observationMu.Unlock()
+	b.observation.Add(sample.observation)
+	for _, entry := range sample.distribution {
+		b.addDistribution(entry)
+	}
+	if sample.observationOnly {
+		return
+	}
 	b.requestCount.Add(1)
 	if sample.Success {
 		b.successCount.Add(1)
@@ -141,7 +172,18 @@ func (b *atomicBucket) snapshot() counters {
 	}
 }
 
+func (b *atomicBucket) observations() model.PerfMetricObservation {
+	b.observationMu.Lock()
+	defer b.observationMu.Unlock()
+	return b.observation
+}
+
 func (b *atomicBucket) drain() counters {
+	b.observationMu.Lock()
+	defer b.observationMu.Unlock()
+	observation, distribution := b.observation, b.distribution
+	b.observation = model.PerfMetricObservation{}
+	b.distribution = nil
 	return counters{
 		requestCount:   b.requestCount.Swap(0),
 		successCount:   b.successCount.Swap(0),
@@ -150,10 +192,18 @@ func (b *atomicBucket) drain() counters {
 		ttftCount:      b.ttftCount.Swap(0),
 		outputTokens:   b.outputTokens.Swap(0),
 		generationMs:   b.generationMs.Swap(0),
+		observation:    observation,
+		distribution:   distribution,
 	}
 }
 
 func (b *atomicBucket) addCounters(c counters) {
+	b.observationMu.Lock()
+	defer b.observationMu.Unlock()
+	b.observation.Add(c.observation)
+	for _, entry := range c.distribution {
+		b.addDistribution(entry)
+	}
 	if c.requestCount != 0 {
 		b.requestCount.Add(c.requestCount)
 	}

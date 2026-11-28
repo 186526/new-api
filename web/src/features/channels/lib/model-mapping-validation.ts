@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { TOOLS_FETCH_MODEL, TOOLS_SEARCH_MODEL } from '../constants'
+
 // ============================================================================
 // Model Mapping Validation Utilities
 // ============================================================================
@@ -128,7 +130,7 @@ export function hasModelConfigChanged(
 }
 
 /**
- * Find models in model_mapping that are missing from the models list
+ * Find unpublished mapping sources that should be suggested for publication.
  */
 export function findMissingModelsInMapping(
   modelMapping: string,
@@ -153,9 +155,16 @@ export function findMissingModelsInMapping(
   }
 
   const modelSet = new Set(currentModels.map((m) => normalizeModelName(m)))
+  // A saved search mapping can be reused after the capability is enabled again.
   const missingModels = Object.keys(parsedMapping)
     .map((key) => normalizeModelName(key))
-    .filter((key) => key && !modelSet.has(key))
+    .filter(
+      (key) =>
+        key &&
+        key !== TOOLS_SEARCH_MODEL &&
+        key !== TOOLS_FETCH_MODEL &&
+        !modelSet.has(key)
+    )
 
   return [...new Set(missingModels)]
 }

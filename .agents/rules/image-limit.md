@@ -9,7 +9,7 @@ Per-model and per-channel image ceiling. Code: `relaykit/dto/channel_settings.go
 
 ## The limit lookup
 
-- `CheckRequestImageLimitForModels` is the production entry. `UpstreamModelNames` lists the requested model, the name its reasoning suffix strips to, and the name the channel `model_mapping` sends it under (chain followed to its end; a self-map stops where it is). First hit in `ChannelSettings.MaxImagesPerModel` supplies the limit, a miss falls back to `ChannelSettings.MaxImagesPerRequest`.
+- HTTP and Responses WebSocket call `RequestPreprocessing.ApplyForAttempt` before sending upstream. It passes the selected channel settings and model mapping from the request context to `CheckRequestImageLimitForModels`; the placeholder channel in `controller/relay.go` has neither. `UpstreamModelNames` lists the requested model, the name its reasoning suffix strips to, and the name the channel `model_mapping` sends it under (chain followed to its end; a self-map stops where it is). First hit in `ChannelSettings.MaxImagesPerModel` supplies the limit, a miss falls back to `ChannelSettings.MaxImagesPerRequest`.
 - A `model_mapping` cycle is refused locally with `400 invalid_request` and `model_mapping_contains_cycle`; `helper.ModelMappedHelper` rejects the same mapping later with `channel:model_mapped_error`.
 - Exactly that many images still goes out; the first past it is refused in the retry loop before the handler runs. Zero or missing leaves the channel unlimited; `ValidateHTTPTransport` rejects a negative value at save time. A Mistral Studio key rejects the ninth image on the weaker models and the twenty-first on the stronger ones, so channels carry a per-model ceiling and keep 20 channel-wide as fallback.
 

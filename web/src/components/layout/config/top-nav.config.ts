@@ -24,10 +24,7 @@ import type { TopNavLink } from '../types'
  * In practice, navigation links are dynamically fetched from backend.
  * Priority: Backend dynamic links > Provided navLinks > defaultTopNavLinks
  *
- * Only entries that always resolve inside this deployment belong here. `Docs`
- * points at the gateway's own `/docs` page, never at an external site; an
- * administrator who wants an external documentation link sets `docs_link` in
- * the header navigation settings, which takes precedence.
+ * `Docs` points to the gateway's built-in API reference.
  */
 export const defaultTopNavLinks: TopNavLink[] = [
   { title: 'Docs', href: '/docs' },

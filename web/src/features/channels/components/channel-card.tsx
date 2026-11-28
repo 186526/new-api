@@ -24,9 +24,10 @@ import { GroupBadge } from '@/components/group-badge'
 import { StatusBadgeTypeContext } from '@/components/status-badge'
 
 import { CHANNEL_STATUS } from '../constants'
-import { isTagAggregateRow, parseGroupsList } from '../lib'
+import { isTagAggregateRow, parseGroupsList, parseModelsList } from '../lib'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
+import { ChannelToolBadges } from './channel-tool-badges'
 import { useChannels } from './channels-provider'
 
 const SENSITIVE_MASK = '••••'
@@ -155,6 +156,12 @@ function ChannelCardComponent({
             </dl>
           </div>
         </StatusBadgeTypeContext.Provider>
+
+        <div className='flex flex-wrap gap-1 empty:hidden'>
+          <ChannelToolBadges
+            models={parseModelsList(row.original.models ?? '')}
+          />
+        </div>
 
         {/* Groups retain their compact, full-width footer. */}
         <div className='min-w-0'>

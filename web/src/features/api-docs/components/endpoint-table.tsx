@@ -18,8 +18,15 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
-import { StaticDataTable } from '@/components/data-table'
 import { Badge } from '@/components/ui/badge'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 
 type EndpointRow = {
   id: string
@@ -30,6 +37,7 @@ type EndpointRow = {
 
 type EndpointTableProps = {
   rows: EndpointRow[]
+  labelledBy: string
 }
 
 /**
@@ -40,43 +48,50 @@ export function EndpointTable(props: EndpointTableProps) {
   const { t } = useTranslation()
 
   return (
-    <StaticDataTable<EndpointRow>
-      data={props.rows}
-      getRowKey={(row) => row.id}
-      columns={[
-        {
-          id: 'method',
-          header: t('apiDocs.table.method', { defaultValue: 'Method' }),
-          className: 'w-24',
-          cell: (row) => (
-            <Badge
-              variant={row.method === 'GET' ? 'secondary' : 'outline'}
-              className='font-mono text-[11px]'
+    <Table
+      aria-labelledby={props.labelledBy}
+      withContainer={false}
+      className='table-fixed border-y'
+    >
+      <TableHeader>
+        <TableRow className='transition-none'>
+          <TableHead
+            scope='col'
+            className='w-17 wrap-anywhere whitespace-normal sm:w-20'
+          >
+            {t('apiDocs.table.method', { defaultValue: 'Method' })}
+          </TableHead>
+          <TableHead scope='col' className='wrap-anywhere whitespace-normal'>
+            {t('apiDocs.table.path', { defaultValue: 'Path' })}
+          </TableHead>
+          <TableHead
+            scope='col'
+            className='w-2/5 wrap-anywhere whitespace-normal'
+          >
+            {t('apiDocs.table.description', { defaultValue: 'Description' })}
+          </TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody className='[&>tr]:h-auto'>
+        {props.rows.map((row) => (
+          <TableRow key={row.id} className='transition-none'>
+            <TableCell className='align-top'>
+              <Badge variant={row.method === 'GET' ? 'secondary' : 'outline'}>
+                {row.method}
+              </Badge>
+            </TableCell>
+            <TableHead
+              scope='row'
+              className='h-auto py-2 align-top wrap-anywhere whitespace-normal'
             >
-              {row.method}
-            </Badge>
-          ),
-        },
-        {
-          id: 'path',
-          header: t('apiDocs.table.path', { defaultValue: 'Path' }),
-          cell: (row) => (
-            <code className='font-mono text-[13px] break-all'>{row.path}</code>
-          ),
-        },
-        {
-          id: 'description',
-          header: t('apiDocs.table.description', {
-            defaultValue: 'Description',
-          }),
-          className: 'w-1/2',
-          cell: (row) => (
-            <span className='text-muted-foreground text-sm'>
+              <code className='font-mono!'>{row.path}</code>
+            </TableHead>
+            <TableCell className='text-muted-foreground align-top wrap-anywhere whitespace-normal'>
               {row.description}
-            </span>
-          ),
-        },
-      ]}
-    />
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }

@@ -17,9 +17,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { createFileRoute } from '@tanstack/react-router'
+import { z } from 'zod'
 
 import { ApiDocs } from '@/features/api-docs'
 
 export const Route = createFileRoute('/docs/')({
-  component: ApiDocs,
+  validateSearch: z.object({ group: z.string().max(255).optional().catch(undefined) }),
+  component: DocsPage,
 })
+
+function DocsPage() {
+  const { group } = Route.useSearch()
+  return <ApiDocs initialGroup={group} />
+}

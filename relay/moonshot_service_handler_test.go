@@ -15,6 +15,8 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service/websearch"
+	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
@@ -27,11 +29,14 @@ import (
 // the way the router does: the channel context the distributor would have
 // written, the same validation, the same price lookup, and a settlement stub the
 // test reads afterwards.
-func runMoonshotServiceHelper(t *testing.T, path, body string, upstreamBody string, channelType int) (*httptest.ResponseRecorder, *recordedSettlement, *types.NewAPIError) {
+func runMoonshotServiceHelper(t *testing.T, path, body string, upstreamBody string, channelType int, upstreamStatus ...int) (*httptest.ResponseRecorder, *recordedSettlement, *types.NewAPIError) {
 	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
+		if len(upstreamStatus) != 0 {
+			w.WriteHeader(upstreamStatus[0])
+		}
 		_, _ = io.WriteString(w, upstreamBody)
 	}))
 	t.Cleanup(upstream.Close)
@@ -53,8 +58,41 @@ func runMoonshotServiceHelper(t *testing.T, path, body string, upstreamBody stri
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "sk-test")
 
 	info, settlement := prepareMoonshotServiceTest(t, c)
-	apiErr := MoonshotServiceHelper(c, info)
+	apiErr := RefundFailedRequestBilling(c, info, MoonshotServiceHelper(c, info))
 	return recorder, settlement, apiErr
+}
+
+func TestMoonshotServiceRejectsUnsuccessfulAnswersWithoutCharging(t *testing.T) {
+	initLegacyWebsearchTest(t)
+	for _, tc := range []struct {
+		path   string
+		body   string
+		status int
+	}{
+		{relayconstant.MoonshotSearchPath, `{"text_query":"rate limit"}`, http.StatusTooManyRequests},
+		{relayconstant.MoonshotSearchPath, `{"text_query":"internal error"}`, http.StatusInternalServerError},
+		{relayconstant.MoonshotFetchPath, `{"url":"https://a.example/rate-limit"}`, http.StatusTooManyRequests},
+		{relayconstant.MoonshotFetchPath, `{"url":"https://a.example/internal-error"}`, http.StatusInternalServerError},
+	} {
+		t.Run(tc.path+"/"+http.StatusText(tc.status), func(t *testing.T) {
+			// A result-shaped error payload must still be classified by its status.
+			recorder, settlement, apiErr := runMoonshotServiceHelper(t, tc.path, tc.body,
+				`{"search_results":[{"title":"error"}],"error":{"message":"upstream refusal"}}`,
+				constant.ChannelTypeDeepSeek, tc.status)
+			if tc.path == relayconstant.MoonshotSearchPath {
+				require.Nil(t, apiErr)
+				assert.Equal(t, http.StatusOK, recorder.Code)
+				assert.JSONEq(t, `{"search_results":[]}`, recorder.Body.String())
+			} else {
+				require.NotNil(t, apiErr)
+				assert.Equal(t, tc.status, apiErr.StatusCode)
+				assert.True(t, types.IsSkipRetryError(apiErr))
+				assert.Empty(t, recorder.Body.String())
+			}
+			assert.Empty(t, settlement.settled)
+			assert.Equal(t, 1, settlement.refundCalls)
+		})
+	}
 }
 
 func prepareMoonshotServiceTest(t *testing.T, c *gin.Context) (*relaycommon.RelayInfo, *recordedSettlement) {
@@ -71,7 +109,35 @@ func prepareMoonshotServiceTest(t *testing.T, c *gin.Context) (*relaycommon.Rela
 	return info, settlement
 }
 
+type pendingToolRefund struct{ recordedSettlement }
+
+func (s *pendingToolRefund) NeedsRefund() bool { return !s.refunded }
+
+func TestMoonshotServiceRefundObservation(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{}
+	recordWebsearchResult(info, abstract.ContractMoonshotSearch, websearch.Answer{StatusCode: http.StatusOK, Cached: true}, nil)
+	info.Billing = &recordedSettlement{}
+	moonshotServiceRefund(ctx, info, moonshotServiceOperationSearch, moonshotServiceOutcomeEmpty, true)
+	require.Equal(t, &relaycommon.ToolExecutionMeta{Contract: "moonshot/search", Outcome: "empty", CacheHit: true}, info.RequestObservation().Tool)
+
+	settlement := &pendingToolRefund{}
+	info.Billing = settlement
+	moonshotServiceRefund(ctx, info, moonshotServiceOperationSearch, moonshotServiceOutcomeEmpty, true)
+	require.Equal(t, 1, settlement.refundCalls)
+	require.Equal(t, "requested", info.RequestObservation().Tool.Refund)
+}
+
 func TestMoonshotServiceSearchUsesCodexAlpha(t *testing.T) {
+	testToolSearchUsesCodexAlpha(t, relayconstant.MoonshotSearchPath)
+}
+
+func TestDeepSeekToolsSearchUsesCodexAlpha(t *testing.T) {
+	testToolSearchUsesCodexAlpha(t, toolsSearchPath)
+}
+
+func testToolSearchUsesCodexAlpha(t *testing.T, path string) {
+	t.Helper()
 	initLegacyWebsearchTest(t)
 
 	var calls atomic.Int32
@@ -96,8 +162,11 @@ func TestMoonshotServiceSearchUsesCodexAlpha(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, relayconstant.MoonshotSearchPath,
-		strings.NewReader(`{"text_query":"  query  ","num_results":1,"model":"ignored-client-model"}`))
+	body := `{"text_query":"  query  ","num_results":1,"model":"ignored-client-model"}`
+	if path == toolsSearchPath {
+		body = `{"query":"query","count":1}`
+	}
+	c.Request = httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	common.SetContextKey(c, constant.ContextKeyOriginalModel, constant.ToolsSearchModel)
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
@@ -108,17 +177,36 @@ func TestMoonshotServiceSearchUsesCodexAlpha(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, `{"tools-search":"search-alias","search-alias":"gpt-5.1"}`)
 	common.SetContextKey(c, constant.ContextKeyChannelHeaderOverride, map[string]any{"X-Channel-Override": "channel-value"})
 
-	info, settlement := prepareMoonshotServiceTest(t, c)
-	require.Nil(t, MoonshotServiceHelper(c, info))
+	if path == toolsSearchPath {
+		request, err := helper.GetAndValidateRequest(c, types.RelayFormatDeepSeekTools)
+		require.NoError(t, err)
+		info, err := relaycommon.GenRelayInfo(c, types.RelayFormatDeepSeekTools, request, nil)
+		require.NoError(t, err)
+		info.BillingRequestInput = &billingexpr.RequestInput{Body: []byte(body)}
+		_, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+		require.NoError(t, err)
+		settlement := &recordedSettlement{}
+		info.Billing = settlement
+		require.Nil(t, DeepSeekToolsHelper(c, info))
+		assert.Equal(t, &relaycommon.ToolExecutionMeta{Contract: "tools/search", Provider: "codex", Outcome: "success"}, info.RequestObservation().Tool)
+		assert.Contains(t, recorder.Body.String(), `"results":[`)
+		assert.Contains(t, recorder.Body.String(), `"url":"https://a.example/"`)
+		assert.NotContains(t, recorder.Body.String(), `https://b.example/`)
+		assert.Equal(t, []int{5000}, settlement.settled)
+		assert.False(t, settlement.refunded)
+	} else {
+		info, settlement := prepareMoonshotServiceTest(t, c)
+		require.Nil(t, MoonshotServiceHelper(c, info))
+		assert.JSONEq(t, `{"search_results":[{"title":"A","url":"https://a.example/","snippet":"sa","date":null}]}`, recorder.Body.String())
+		assert.Equal(t, relayconstant.RelayModeMoonshotSearch, info.RelayMode)
+		assert.Equal(t, constant.ToolsSearchModel, info.UpstreamModelName)
+		assert.False(t, info.IsModelMapped)
+		assert.Equal(t, []int{5000}, settlement.settled)
+		assert.False(t, settlement.refunded)
+	}
 	require.EqualValues(t, 1, calls.Load())
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.Equal(t, "application/json", recorder.Header().Get("Content-Type"))
-	assert.JSONEq(t, `{"search_results":[{"title":"A","url":"https://a.example/","snippet":"sa","date":null}]}`, recorder.Body.String())
-	assert.Equal(t, relayconstant.RelayModeMoonshotSearch, info.RelayMode)
-	assert.Equal(t, constant.ToolsSearchModel, info.UpstreamModelName)
-	assert.False(t, info.IsModelMapped)
-	assert.Equal(t, []int{5000}, settlement.settled)
-	assert.False(t, settlement.refunded)
 }
 
 func TestMoonshotServiceSearchKeepsExaCandidateIndependentOfCodex(t *testing.T) {
@@ -175,6 +263,7 @@ func TestMoonshotServiceSearchKeepsExaCandidateIndependentOfCodex(t *testing.T) 
 			require.Nil(t, MoonshotServiceHelper(c, info))
 			assert.Equal(t, http.StatusOK, recorder.Code)
 			assert.Contains(t, recorder.Body.String(), `"title":"Fallback"`)
+			assert.Equal(t, &relaycommon.ToolExecutionMeta{Contract: "moonshot/search", Provider: "exa", Outcome: "success"}, info.RequestObservation().Tool)
 			assert.Equal(t, []int{5000}, settlement.settled)
 		})
 	}

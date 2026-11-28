@@ -650,7 +650,7 @@ func TokenAuth() func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
 
 		err = SetupContextForToken(c, token, parts...)
-		if err != nil {
+		if err != nil || !enforceRequestRedaction(c, token) {
 			return
 		}
 		c.Next()

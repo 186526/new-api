@@ -233,10 +233,13 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	input := a.AwsReq.(*bedrockruntime.InvokeModelInput)
+	awsResp, err := a.AwsClient.InvokeModel(ctx, input)
 	if err != nil {
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
+	info.AutoReasoning.ObserveOutboundJSON(input.Body)
+	info.ImageCompression.ObserveOutboundJSON(input.Body, types.RelayFormatClaude)
 
 	claudeInfo := &claude.ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -263,10 +266,13 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
+	input := a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput)
+	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, input)
 	if err != nil {
 		return newAwsInvokeError(requestContext, err, "InvokeModelWithResponseStream"), nil
 	}
+	info.AutoReasoning.ObserveOutboundJSON(input.Body)
+	info.ImageCompression.ObserveOutboundJSON(input.Body, types.RelayFormatClaude)
 	stream := awsResp.GetStream()
 	defer stream.Close()
 
@@ -323,10 +329,13 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 	ctx, cancel := newAwsInvokeContext(requestContext)
 	defer cancel()
 
-	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	input := a.AwsReq.(*bedrockruntime.InvokeModelInput)
+	awsResp, err := a.AwsClient.InvokeModel(ctx, input)
 	if err != nil {
 		return newAwsInvokeError(requestContext, err, "InvokeModel"), nil
 	}
+	info.AutoReasoning.ObserveOutboundJSON(input.Body)
+	info.ImageCompression.ObserveOutboundJSON(input.Body, "")
 
 	// 解析Nova响应
 	var novaResp struct {

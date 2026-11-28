@@ -69,13 +69,28 @@ export function RequestChecksSection({
     defaultValues,
   })
 
+  const { dirtyFields } = form.formState
+  const {
+    CheckSensitiveEnabled,
+    CheckSensitiveOnPromptEnabled,
+    SensitiveWords,
+  } = defaultValues
   useEffect(() => {
-    form.reset(defaultValues)
-  }, [defaultValues, form])
+    form.reset(
+      { CheckSensitiveEnabled, CheckSensitiveOnPromptEnabled, SensitiveWords },
+      { keepDirtyValues: true }
+    )
+  }, [
+    CheckSensitiveEnabled,
+    CheckSensitiveOnPromptEnabled,
+    SensitiveWords,
+    form,
+  ])
 
   const onSubmit = async (values: SensitiveFormValues) => {
     const updates = Object.entries(values).filter(
       ([key, value]) =>
+        dirtyFields[key as keyof SensitiveFormValues] &&
         value !== defaultValues[key as keyof SensitiveFormValues]
     )
 

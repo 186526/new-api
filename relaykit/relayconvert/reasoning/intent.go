@@ -60,10 +60,11 @@ const (
 )
 
 const (
-	SourceExplicit Source = "explicit"
-	SourceNative   Source = "native"
-	SourceSuffix   Source = "suffix"
-	SourcePivot    Source = "pivot"
+	SourceExplicit  Source = "explicit"
+	SourceNative    Source = "native"
+	SourceSuffix    Source = "suffix"
+	SourcePivot     Source = "pivot"
+	SourceAutoScale Source = "auto_scale"
 )
 
 var (
@@ -97,12 +98,16 @@ func IntentFromState(state *dto.ReasoningConversionState) Intent {
 	if state == nil {
 		return Intent{}
 	}
+	source := SourceSuffix
+	if state.Source == string(SourceAutoScale) {
+		source = SourceAutoScale
+	}
 	return Intent{
 		Mode:            Mode(state.Mode),
 		Effort:          Effort(state.Effort),
 		BudgetTokens:    state.BudgetTokens,
 		IncludeThoughts: state.IncludeThoughts,
-		Source:          SourceSuffix,
+		Source:          source,
 		BudgetSource:    SourceSuffix,
 	}
 }
@@ -113,12 +118,16 @@ func StateFromIntent(intent Intent) *dto.ReasoningConversionState {
 	if intent.IsEmpty() {
 		return nil
 	}
-	return &dto.ReasoningConversionState{
+	state := &dto.ReasoningConversionState{
 		Mode:            string(intent.Mode),
 		Effort:          string(intent.Effort),
 		BudgetTokens:    intent.BudgetTokens,
 		IncludeThoughts: intent.IncludeThoughts,
 	}
+	if intent.Source == SourceAutoScale {
+		state.Source = string(intent.Source)
+	}
+	return state
 }
 
 func ParseEffort(value string) (Effort, error) {

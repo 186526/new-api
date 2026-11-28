@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import type { Table } from '@tanstack/react-table'
-import { Copy, Trash2, Loader2 } from 'lucide-react'
+import { Copy, Trash2, Loader2, Shield } from 'lucide-react'
 import { useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -32,6 +32,7 @@ import {
 import { copyToClipboard } from '@/lib/copy-to-clipboard'
 
 import type { ApiKey } from '../types'
+import { ApiKeysBatchRedactionDialog } from './api-keys-batch-redaction-dialog'
 import { ApiKeysMultiDeleteDialog } from './api-keys-multi-delete-dialog'
 import { useApiKeys } from './api-keys-provider'
 
@@ -46,6 +47,7 @@ export function DataTableBulkActions<TData>({
   const { resolveRealKeysBatch } = useApiKeys()
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isCopying, setIsCopying] = useState(false)
+  const [redactionKeys, setRedactionKeys] = useState<ApiKey[] | null>(null)
   const selectedRows = table.getFilteredSelectedRowModel().rows
 
   const handleBatchCopy = useCallback(async () => {
@@ -126,8 +128,14 @@ export function DataTableBulkActions<TData>({
             <p>{t('Delete selected API keys')}</p>
           </TooltipContent>
         </Tooltip>
+        <Button type='button' variant='outline' size='icon' className='size-8' aria-label={t('Configure selected keys’ redaction')} title={t('Configure selected keys’ redaction')} onClick={() => setRedactionKeys(selectedRows.map((row) => row.original as ApiKey))}>
+          <Shield aria-hidden='true' />
+        </Button>
       </BulkActionsToolbar>
 
+      {redactionKeys && (
+        <ApiKeysBatchRedactionDialog keys={redactionKeys} onClose={() => setRedactionKeys(null)} />
+      )}
       <ApiKeysMultiDeleteDialog
         open={showDeleteConfirm}
         onOpenChange={setShowDeleteConfirm}

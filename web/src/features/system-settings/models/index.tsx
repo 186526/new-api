@@ -19,12 +19,17 @@ For commercial licensing, please contact support@quantumnous.com
 import { SettingsPage } from '../components/settings-page'
 import type { ModelSettings } from '../types'
 import {
+  AUTO_EFFORT_KEY,
+  defaultAutoReasoningPolicy,
+} from './auto-reasoning-policy'
+import {
   MODELS_DEFAULT_SECTION,
   getModelsSectionContent,
   getModelsSectionMeta,
 } from './section-registry.tsx'
 
 const defaultModelSettings: ModelSettings = {
+  [AUTO_EFFORT_KEY]: JSON.stringify(defaultAutoReasoningPolicy),
   'global.pass_through_request_enabled': false,
   'global.thinking_model_blacklist': '[]',
   'global.chat_completions_to_responses_policy': '{}',

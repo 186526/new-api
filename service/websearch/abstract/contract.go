@@ -3,42 +3,23 @@ package abstract
 import (
 	"errors"
 	"net/http"
+
+	"github.com/QuantumNous/new-api/pkg/toolcatalog"
 )
 
-// Contract names one document a client can ask for. The same client request
-// always names exactly one, and every provider either speaks it already or is
-// rendered into it.
-type Contract string
+// Contract names the response format the client requested.
+type Contract = toolcatalog.Contract
 
 const (
-	ContractToolsSearch    Contract = "tools/search"
-	ContractToolsFetch     Contract = "tools/fetch"
-	ContractAlphaSearch    Contract = "alpha/search"
-	ContractMoonshotSearch Contract = "moonshot/search"
-	ContractMoonshotFetch  Contract = "moonshot/fetch"
+	ContractToolsSearch    Contract = toolcatalog.ToolsSearch
+	ContractToolsFetch     Contract = toolcatalog.ToolsFetch
+	ContractAlphaSearch    Contract = toolcatalog.AlphaSearch
+	ContractMoonshotSearch Contract = toolcatalog.MoonshotSearch
+	ContractMoonshotFetch  Contract = toolcatalog.MoonshotFetch
 )
 
-// AllContracts lists every contract this package knows, in the order a new
-// provider should be wired for them.
 func AllContracts() []Contract {
-	return []Contract{
-		ContractToolsSearch,
-		ContractToolsFetch,
-		ContractAlphaSearch,
-		ContractMoonshotSearch,
-		ContractMoonshotFetch,
-	}
-}
-
-// IsSearch reports whether a contract answers a search rather than a fetch, so
-// a caller can pick the search or the fetch half of a provider.
-func (c Contract) IsSearch() bool {
-	switch c {
-	case ContractToolsSearch, ContractAlphaSearch, ContractMoonshotSearch:
-		return true
-	default:
-		return false
-	}
+	return toolcatalog.Contracts()
 }
 
 // KnownFields records which members the provider published. A renderer needs

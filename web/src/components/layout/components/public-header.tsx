@@ -16,8 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { Link, useNavigate } from '@tanstack/react-router'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
@@ -27,7 +34,6 @@ import { ProfileDropdown } from '@/components/profile-dropdown'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { SystemUpdateAction } from '@/features/system-update/system-update-action'
 import { useNotifications } from '@/hooks/use-notifications'
 import { useSystemConfig } from '@/hooks/use-system-config'
 import { useTopNavLinks } from '@/hooks/use-top-nav-links'
@@ -89,10 +95,10 @@ export function PublicHeader(props: PublicHeaderProps) {
     loading,
     logoLoaded,
   } = useSystemConfig()
-  const dynamicLinks = useTopNavLinks()
+  const dynamicLinks = useTopNavLinks({ includeApiReference: true })
   const notifications = useNotifications()
-  const routerState = useRouterState()
-  const pathname = routerState.location.pathname
+  const mobileNavId = useId()
+  const mobileToggle = useRef<HTMLButtonElement>(null)
 
   const user = auth.user
   const isAuthenticated = !!user
@@ -130,9 +136,26 @@ export function PublicHeader(props: PublicHeaderProps) {
   }, [])
 
   useEffect(() => {
-    document.body.style.overflow = mobileOpen ? 'hidden' : ''
+    if (!mobileOpen) return
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return
+      setMobileOpen(false)
+      mobileToggle.current?.focus()
+    }
+    const desktop = window.matchMedia('(min-width: 64rem)')
+    const handleDesktop = (event: MediaQueryListEvent) => {
+      if (event.matches) setMobileOpen(false)
+    }
+    window.addEventListener('keydown', handleEscape)
+    desktop.addEventListener('change', handleDesktop)
     return () => {
-      document.body.style.overflow = ''
+      document.body.style.overflow = previousOverflow
+      window.removeEventListener('keydown', handleEscape)
+      desktop.removeEventListener('change', handleDesktop)
     }
   }, [mobileOpen])
 
@@ -215,7 +238,7 @@ export function PublicHeader(props: PublicHeaderProps) {
             )}
           >
             {/* Logo */}
-            <div className='@container/system-brand flex min-w-0 flex-1 items-center gap-1 lg:min-w-36'>
+            <div className='flex min-w-0 flex-1 items-center lg:min-w-36'>
               <Link
                 to={homeUrl}
                 className='group flex min-w-0 items-center gap-2.5'
@@ -234,13 +257,11 @@ export function PublicHeader(props: PublicHeaderProps) {
                   )}
                 </span>
               </Link>
-              <SystemUpdateAction presentation='version' />
             </div>
 
             {/* Desktop nav */}
             <div className='hidden min-w-0 items-center gap-0.5 lg:flex'>
               {links.map((link) => {
-                const isActive = pathname === link.href
                 if (link.external) {
                   return (
                     <a
@@ -267,12 +288,10 @@ export function PublicHeader(props: PublicHeaderProps) {
                     to={link.href}
                     title={t(link.title)}
                     disabled={link.disabled}
+                    activeOptions={{ exact: true, includeSearch: false }}
                     onClick={(event) => handleNavLinkClick(event, link)}
                     className={cn(
-                      'min-w-0 truncate rounded-lg px-3 py-1.5 text-sm font-medium transition-colors duration-200',
-                      isActive
-                        ? 'text-foreground'
-                        : 'text-muted-foreground hover:text-foreground',
+                      'text-muted-foreground hover:text-foreground focus-visible:outline-ring aria-[current=page]:text-foreground min-w-0 truncate rounded-lg px-3 py-1.5 text-sm font-medium focus-visible:outline-2 aria-[current=page]:underline aria-[current=page]:underline-offset-4',
                       link.disabled && 'pointer-events-none opacity-50'
                     )}
                   >
@@ -321,7 +340,10 @@ export function PublicHeader(props: PublicHeaderProps) {
                 variant='ghost'
                 size='icon'
                 className='size-9'
+                ref={mobileToggle}
                 onClick={() => setMobileOpen((v) => !v)}
+                aria-expanded={mobileOpen}
+                aria-controls={mobileNavId}
                 aria-label={t('Toggle navigation menu')}
               >
                 <div className='relative size-4'>
@@ -350,30 +372,18 @@ export function PublicHeader(props: PublicHeaderProps) {
         </div>
       </header>
 
-      {/* Mobile full-screen overlay */}
       <div
-        className={cn(
-          'bg-background/98 fixed inset-0 z-40 backdrop-blur-2xl transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)] lg:pointer-events-none lg:hidden',
-          mobileOpen
-            ? 'pointer-events-auto opacity-100'
-            : 'pointer-events-none opacity-0'
-        )}
+        id={mobileNavId}
+        hidden={!mobileOpen}
+        className='bg-background fixed inset-0 z-40 overflow-y-auto lg:hidden'
       >
-        <div className='flex h-full flex-col justify-between px-8 pt-20 pb-10'>
+        <div className='flex min-h-full flex-col justify-between gap-5 px-8 pt-20 pb-10'>
           <nav className='flex flex-col gap-1'>
-            {links.map((link, i) => {
-              const isActive = pathname === link.href
+            {links.map((link) => {
               const linkClassName = cn(
-                'flex items-center gap-3 py-3 text-base font-medium tracking-tight transition-all duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]',
-                mobileOpen
-                  ? 'translate-y-0 opacity-100'
-                  : 'translate-y-4 opacity-0',
-                isActive ? 'text-foreground' : 'text-muted-foreground',
+                'text-muted-foreground hover:text-foreground focus-visible:outline-ring aria-[current=page]:text-foreground flex items-center gap-3 py-3 text-base font-medium tracking-tight focus-visible:outline-2 aria-[current=page]:underline aria-[current=page]:underline-offset-4',
                 link.disabled && 'pointer-events-none opacity-50'
               )
-              const transitionStyle = {
-                transitionDelay: mobileOpen ? `${100 + i * 50}ms` : '0ms',
-              }
               if (link.external) {
                 return (
                   <a
@@ -385,7 +395,6 @@ export function PublicHeader(props: PublicHeaderProps) {
                     tabIndex={link.disabled ? -1 : undefined}
                     onClick={(event) => handleNavLinkClick(event, link, true)}
                     className={linkClassName}
-                    style={transitionStyle}
                   >
                     {t(link.title)}
                   </a>
@@ -396,9 +405,9 @@ export function PublicHeader(props: PublicHeaderProps) {
                   key={`${link.title}:${link.href}`}
                   to={link.href}
                   disabled={link.disabled}
+                  activeOptions={{ exact: true, includeSearch: false }}
                   onClick={(event) => handleNavLinkClick(event, link, true)}
                   className={linkClassName}
-                  style={transitionStyle}
                 >
                   {t(link.title)}
                 </Link>
@@ -406,25 +415,15 @@ export function PublicHeader(props: PublicHeaderProps) {
             })}
           </nav>
 
-          <div
-            className={cn(
-              'flex flex-col gap-3 transition-all duration-500',
-              mobileOpen
-                ? 'translate-y-0 opacity-100'
-                : 'translate-y-4 opacity-0'
-            )}
-            style={{ transitionDelay: mobileOpen ? '250ms' : '0ms' }}
-          >
-            {showAuthButtons && (
-              <Link
-                to={isAuthenticated ? '/dashboard' : '/sign-in'}
-                onClick={() => setMobileOpen(false)}
-                className='bg-foreground text-background inline-flex h-10 items-center justify-center rounded-lg text-sm font-medium transition-opacity hover:opacity-90 active:opacity-80'
-              >
-                {isAuthenticated ? t('Go to Dashboard') : t('Sign in')}
-              </Link>
-            )}
-          </div>
+          {showAuthButtons && (
+            <Link
+              to={isAuthenticated ? '/dashboard' : '/sign-in'}
+              onClick={() => setMobileOpen(false)}
+              className='bg-foreground text-background inline-flex h-10 items-center justify-center rounded-lg text-sm font-medium hover:opacity-90 active:opacity-80'
+            >
+              {isAuthenticated ? t('Go to Dashboard') : t('Sign in')}
+            </Link>
+          )}
         </div>
       </div>
 

@@ -77,7 +77,11 @@ func TestShutdownWaitsForTheRefundBeforeFlushingTheAccumulator(t *testing.T) {
 		userId:   userID,
 		consumed: consumed,
 	}
-	relayInfo := &relaycommon.RelayInfo{UserId: userID, IsPlayground: true}
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:        userID,
+		IsPlayground:  true,
+		ToolExecution: &relaycommon.ToolExecutionMeta{Contract: "tools/search"},
+	}
 	session := &BillingSession{
 		relayInfo:        relayInfo,
 		funding:          funding,
@@ -98,6 +102,8 @@ func TestShutdownWaitsForTheRefundBeforeFlushingTheAccumulator(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the refund goroutine never started")
 	}
+
+	assert.Equal(t, "requested", relayInfo.ToolExecution.Refund)
 
 	// 3) A periodic flush writes the debit while the refund is still pending.
 	model.FlushBatchUpdates()
@@ -129,4 +135,13 @@ func TestShutdownWaitsForTheRefundBeforeFlushingTheAccumulator(t *testing.T) {
 	model.FlushBatchUpdates()
 
 	assert.Equal(t, start, getUserQuota(t, userID), "the failed request must cost nothing")
+	assert.Equal(t, "requested", relayInfo.ToolExecution.Refund)
+}
+
+func TestBillingSessionRefundDoesNotMarkAnUnreservedToolRequest(t *testing.T) {
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{ToolExecution: &relaycommon.ToolExecutionMeta{Contract: "tools/search"}}
+	session := &BillingSession{relayInfo: info, funding: &WalletFunding{}}
+	session.Refund(ctx)
+	assert.Empty(t, info.ToolExecution.Refund)
 }

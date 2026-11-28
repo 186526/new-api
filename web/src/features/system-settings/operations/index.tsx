@@ -16,8 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useStatus } from '@/hooks/use-status'
-
 import { SettingsPage } from '../components/settings-page'
 import type { OperationsSettings } from '../types'
 import {
@@ -65,6 +63,7 @@ const defaultOperationsSettings: OperationsSettings = {
   'perf_metrics_setting.retention_days': 0,
   'websearch_setting.candidate_order': '',
   'websearch_setting.native_first': true,
+  'websearch_setting.builtin_fallback_enabled': false,
   'websearch_setting.search_cache_ttl_seconds': 600,
   'websearch_setting.fetch_cache_ttl_seconds': 3600,
   'websearch_setting.redirect_cache_ttl_seconds': 86400,
@@ -78,8 +77,6 @@ const defaultOperationsSettings: OperationsSettings = {
 }
 
 export function OperationsSettings() {
-  const { status } = useStatus()
-
   return (
     <SettingsPage
       routePath='/_authenticated/system-settings/operations/$section'
@@ -87,10 +84,6 @@ export function OperationsSettings() {
       defaultSection={OPERATIONS_DEFAULT_SECTION}
       getSectionContent={getOperationsSectionContent}
       getSectionMeta={getOperationsSectionMeta}
-      extraArgs={[
-        status?.version as string | undefined,
-        status?.start_time as number | null | undefined,
-      ]}
       loadingMessage='Loading maintenance settings...'
     />
   )

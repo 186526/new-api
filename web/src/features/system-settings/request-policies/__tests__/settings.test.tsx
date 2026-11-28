@@ -253,6 +253,171 @@ describe('request policy settings', () => {
     )
   })
 
+  it('saving redaction settings does not save the sensitive-word draft', async () => {
+    await renderPolicies('/system-settings/request-policies/filtering')
+    const keywords = await screen.findByRole('textbox', {
+      name: 'Blocked keywords',
+    })
+    fireEvent.change(keywords, { target: { value: 'unsaved' } })
+    fireEvent.change(
+      screen.getByRole('spinbutton', { name: 'Custom rules per key' }),
+      {
+        target: { value: '0' },
+      }
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save redaction settings' })
+    )
+    await waitFor(() =>
+      expect(api.patch).toHaveBeenCalledExactlyOnceWith(
+        '/api/option/request_policy',
+        {
+          options: { 'redaction_setting.max_custom_rules_per_key': '0' },
+        }
+      )
+    )
+    expect(keywords).toHaveValue('unsaved')
+  })
+
+  it('rejects a redaction rule limit above the server maximum', async () => {
+    await renderPolicies('/system-settings/request-policies/filtering')
+    const limit = await screen.findByRole('spinbutton', {
+      name: 'Custom rules per key',
+    })
+    fireEvent.change(limit, { target: { value: '11' } })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Save redaction settings' })
+    )
+    expect(limit).toHaveAttribute('aria-invalid', 'true')
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+
+  it('previews a dropped image with unsaved settings without persisting them', async () => {
+    settings['image_compression_setting.enabled'] = true
+    settings['global.pass_through_request_enabled'] = true
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          original: { width: 4096, height: 2048, bytes: 5000, format: 'png' },
+          result: { width: 1024, height: 512, bytes: 4000, format: 'jpeg' },
+          saved_bytes: 1000,
+          elapsed_ms: 10,
+          outcome: 'compressed',
+          image_base64: 'AQID',
+          image_mime: 'image/jpeg',
+        },
+      },
+    })
+    await renderPolicies('/system-settings/request-policies/image-compression')
+    expect(
+      await screen.findByText(
+        'Requests in passthrough mode skip image compression.'
+      )
+    ).toBeVisible()
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Set target edge to 1024 pixels' })
+    )
+    expect(
+      screen.getByRole('spinbutton', { name: 'Target max edge (px)' })
+    ).toHaveValue(1024)
+    const image = new File(['sample'], 'test.png', { type: 'image/png' })
+    fireEvent.drop(screen.getByLabelText('Test image'), {
+      dataTransfer: { files: [image] },
+    })
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Test compression' })
+    )
+    expect(await screen.findByText('Bytes saved')).toBeVisible()
+    const original = await screen.findByRole('img', { name: 'Original' })
+    const result = screen.getByRole('img', { name: 'Result' })
+    expect(original).toHaveAttribute('src', expect.stringMatching(/^blob:/))
+    expect(result).toHaveAttribute('src', expect.stringMatching(/^blob:/))
+    expect(result.getAttribute('src')).not.toEqual(original.getAttribute('src'))
+    expect(result).toHaveAttribute('width', '1024')
+    const [path, body] = post.mock.calls[0] ?? []
+    expect(path).toBe('/api/system-settings/image-compression/preview')
+    if (!(body instanceof FormData)) {
+      throw new TypeError('Expected a multipart preview request')
+    }
+    expect(body.get('image')).toBe(image)
+    expect(JSON.parse(String(body.get('settings')))).toMatchObject({
+      max_dimension: 1024,
+    })
+    expect(api.patch).not.toHaveBeenCalled()
+    post.mockRestore()
+  })
+
+  it.each(['compressed', 'below_threshold'])(
+    'keeps statistics when %s has no separate result image',
+    async (outcome) => {
+      const info = { width: 256, height: 128, bytes: 1024, format: 'png' }
+      const post = vi.spyOn(api, 'post').mockResolvedValueOnce({
+        data: {
+          success: true,
+          data: {
+            original: info,
+            result: info,
+            saved_bytes: 0,
+            elapsed_ms: 1,
+            outcome,
+          },
+        },
+      })
+      try {
+        await renderPolicies(
+          '/system-settings/request-policies/image-compression'
+        )
+        fireEvent.drop(await screen.findByLabelText('Test image'), {
+          dataTransfer: {
+            files: [new File(['sample'], 'test.png', { type: 'image/png' })],
+          },
+        })
+        await userEvent.click(
+          screen.getByRole('button', { name: 'Test compression' })
+        )
+        const original = await screen.findByRole('img', { name: 'Original' })
+        expect(screen.getByText('Bytes saved')).toBeVisible()
+        if (outcome === 'compressed') {
+          expect(
+            screen.queryByRole('img', { name: 'Result' })
+          ).not.toBeInTheDocument()
+          expect(screen.getByText('Preview unavailable')).toBeVisible()
+        } else {
+          expect(screen.getByRole('img', { name: 'Result' })).toHaveAttribute(
+            'src',
+            original.getAttribute('src')
+          )
+        }
+      } finally {
+        post.mockRestore()
+      }
+    }
+  )
+
+  it('keeps the JPEG quality slider and number input in sync and disables both for PNG', async () => {
+    settings['image_compression_setting.enabled'] = true
+    await renderPolicies('/system-settings/request-policies/image-compression')
+    const number = await screen.findByRole('spinbutton', {
+      name: 'JPEG quality',
+    })
+    const slider = screen.getByLabelText('JPEG quality', {
+      selector: 'input[type="range"]',
+    })
+    expect(slider).toHaveAttribute('aria-valuenow', '82')
+    slider.focus()
+    await userEvent.keyboard('{ArrowRight}')
+    expect(number).toHaveValue(83)
+    fireEvent.change(number, { target: { value: '71' } })
+    expect(slider).toHaveAttribute('aria-valuenow', '71')
+    await userEvent.selectOptions(
+      screen.getByRole('combobox', { name: 'Output format' }),
+      'png'
+    )
+    expect(number).toBeDisabled()
+    expect(slider).toBeDisabled()
+  })
+
   it('refreshing another policy keeps unsaved filter text', async () => {
     await renderPolicies('/system-settings/request-policies/filtering')
     const keywords = await screen.findByRole('textbox', {

@@ -219,9 +219,7 @@ func TestCodexFetchIsNotSent(t *testing.T) {
 	}
 }
 
-// TestDeepSeekSearchRetriesTransientRefusal checks the retry policy lives in
-// Forward: a 408 is retried and the following 200 is returned.
-func TestDeepSeekSearchRetriesTransientRefusal(t *testing.T) {
+func TestDeepSeekSearchReturnsTransientRefusalWithoutRetry(t *testing.T) {
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -245,11 +243,11 @@ func TestDeepSeekSearchRetriesTransientRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if got := atomic.LoadInt32(&attempts); got != 2 {
-		t.Errorf("upstream attempts = %d, want 2", got)
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Errorf("upstream attempts = %d, want 1", got)
 	}
-	if upstream.StatusCode != http.StatusOK {
-		t.Errorf("StatusCode = %d, want 200", upstream.StatusCode)
+	if upstream.StatusCode != http.StatusRequestTimeout || string(upstream.Body) != "timeout" {
+		t.Errorf("upstream response = %d %q, want 408 timeout", upstream.StatusCode, upstream.Body)
 	}
 }
 

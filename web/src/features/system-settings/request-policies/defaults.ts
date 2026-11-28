@@ -18,6 +18,30 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import type { ChannelAffinitySettings } from '../general/channel-affinity/types'
 import type { SecuritySettings } from '../types'
+import {
+  imageCompressionDefaults,
+  imageCompressionPrefix,
+  type ImageCompressionSettings,
+} from './image-compression-settings'
+
+export const redactionDefaults = {
+  'redaction_setting.enabled': true,
+  'redaction_setting.max_custom_rules_per_key': 10,
+  'redaction_setting.allow_response_restore': true,
+}
+
+type ImageCompressionOptions = {
+  [
+    Key in keyof ImageCompressionSettings as `${typeof imageCompressionPrefix}${Key}`
+  ]: ImageCompressionSettings[Key]
+}
+
+const imageCompressionOptions = Object.fromEntries(
+  Object.entries(imageCompressionDefaults).map(([key, value]) => [
+    imageCompressionPrefix + key,
+    value,
+  ])
+) as ImageCompressionOptions
 
 export type RetrySettings = {
   RetryTimes: number
@@ -44,9 +68,14 @@ export type FilteringSettings = Pick<
 export type RequestPolicySettings = RetrySettings &
   HealthSettings &
   FilteringSettings &
-  Pick<ChannelAffinitySettings, keyof ChannelAffinitySettings>
+  Pick<ChannelAffinitySettings, keyof ChannelAffinitySettings> &
+  ImageCompressionOptions &
+  typeof redactionDefaults & { 'global.pass_through_request_enabled': boolean }
 
 export const defaultRequestPolicySettings: RequestPolicySettings = {
+  ...imageCompressionOptions,
+  ...redactionDefaults,
+  'global.pass_through_request_enabled': false,
   RetryTimes: 0,
   AutomaticRetryStatusCodes:
     '100-199,300-399,401-407,409-499,500-503,505-523,525-599',

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,11 +12,15 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/redaction"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type tokenAutoGroupsInput struct {
@@ -37,11 +42,16 @@ type tokenRequest struct {
 	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
 	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
+	tokenRedactionInput
 }
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups        []string               `json:"auto_groups"`
+	RedactionEnabled  bool                   `json:"redaction_enabled"`
+	RedactionRevision int64                  `json:"redaction_revision"`
+	RedactionConfig   *redaction.Config      `json:"redaction_config,omitempty"`
+	RedactionSummary  *tokenRedactionSummary `json:"redaction_summary,omitempty"`
 }
 
 func maxTokenQuota() int {
@@ -68,7 +78,8 @@ func buildMaskedTokenResponse(token *model.Token) *tokenResponse {
 	if len(autoGroups) == 0 {
 		autoGroups = nil
 	}
-	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups}
+	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups, RedactionEnabled: token.RedactionEnabled,
+		RedactionRevision: token.RedactionRevision, RedactionSummary: summarizeTokenRedaction(token)}
 }
 
 func buildMaskedTokenResponses(tokens []*model.Token) []*tokenResponse {
@@ -130,6 +141,10 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 }
 
 func GetAllTokens(c *gin.Context) {
+	if c.Query("redaction_enabled") != "" {
+		SearchTokens(c)
+		return
+	}
 	userId := c.GetInt("id")
 	pageInfo := common.GetPageQuery(c)
 	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
@@ -149,8 +164,17 @@ func SearchTokens(c *gin.Context) {
 	token := c.Query("token")
 
 	pageInfo := common.GetPageQuery(c)
-
-	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	var redactionEnabled []bool
+	if filter := c.Query("redaction_enabled"); filter != "" {
+		switch filter {
+		case "true", "false":
+			redactionEnabled = append(redactionEnabled, filter == "true")
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "field": "redaction_enabled", "message": "Expected true or false"})
+			return
+		}
+	}
+	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), redactionEnabled...)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -172,7 +196,14 @@ func GetToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, buildMaskedTokenResponse(token))
+	response := buildMaskedTokenResponse(token)
+	c.Header("Cache-Control", "no-store")
+	if stored, err := token.RedactionConfigBytes(); err == nil {
+		if cfg, err := redaction.DecodeConfig(stored); err == nil {
+			response.RedactionConfig = &cfg
+		}
+	}
+	common.ApiSuccess(c, response)
 }
 
 func GetTokenAutoGroups(c *gin.Context) {
@@ -296,11 +327,25 @@ func GetTokenUsage(c *gin.Context) {
 	})
 }
 
+const maxTokenCreateBatch = 100
+
+var errTokenCreateLimit = errors.New("token creation limit reached")
+
 func AddToken(c *gin.Context) {
-	request := tokenRequest{}
-	err := c.ShouldBindJSON(&request)
-	if err != nil {
-		common.ApiError(c, err)
+	var request struct {
+		tokenRequest
+		Count *int `json:"count"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		common.ApiErrorT(c, "Invalid request")
+		return
+	}
+	count := 1
+	if request.Count != nil {
+		count = *request.Count
+	}
+	if count < 1 || count > maxTokenCreateBatch {
+		c.JSON(http.StatusOK, gin.H{"success": false, "field": "count", "message_key": "token.invalid_create_count", "message": "Token count must be between 1 and 100."})
 		return
 	}
 	token := request.Token
@@ -321,17 +366,6 @@ func AddToken(c *gin.Context) {
 			common.ApiErrorT(c, "Quota value exceeds valid range, maximum is {{max}}", map[string]any{"max": logger.FormatQuota(maxQuotaValue)})
 			return
 		}
-	}
-	// 检查用户令牌数量是否已达上限
-	maxTokens := operation_setting.GetMaxUserTokens()
-	count, err := model.CountUserTokens(c.GetInt("id"))
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	if int(count) >= maxTokens {
-		common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
-		return
 	}
 	if token.Group == "auto" {
 		if !setTokenAutoGroups(c, &token, request.AutoGroups.Groups) {
@@ -364,16 +398,85 @@ func AddToken(c *gin.Context) {
 		AutoGroups:         token.AutoGroups,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
-	err = cleanToken.Insert()
-	if err != nil {
-		common.ApiError(c, err)
+	if _, err := applyTokenRedaction(&cleanToken, request.tokenRedactionInput); err != nil {
+		rejectTokenRedaction(c, err)
 		return
 	}
-	params["id"] = cleanToken.Id
+	tokens, err := cloneTokenCreateBatch(cleanToken, count)
+	if err != nil {
+		common.ApiErrorT(c, "Failed to generate token")
+		return
+	}
+	maxTokens := operation_setting.GetMaxUserTokens()
+	if err := insertTokenCreateBatch(tokens, maxTokens); err != nil {
+		if errors.Is(err, errTokenCreateLimit) {
+			common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
+		} else if request.tokenRedactionInput.submitted() {
+			common.ApiErrorT(c, "Could not save request redaction policy")
+		} else {
+			common.ApiErrorT(c, "Could not create tokens")
+		}
+		return
+	}
+	if request.tokenRedactionInput.submitted() {
+		params["redaction_enabled"] = cleanToken.RedactionEnabled
+	}
+	if len(tokens) == 1 {
+		params["id"] = tokens[0].Id
+	} else {
+		params["count"] = len(tokens)
+	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
+	common.ApiSuccess(c, gin.H{"created": len(tokens), "redaction_enabled": cleanToken.RedactionEnabled})
+}
+
+func cloneTokenCreateBatch(first model.Token, count int) ([]model.Token, error) {
+	tokens := make([]model.Token, count)
+	tokens[0] = first
+	if count == 1 {
+		return tokens, nil
+	}
+	policy, err := first.RedactionConfigBytes()
+	if err != nil {
+		return nil, err
+	}
+	for index := 1; index < count; index++ {
+		token := first
+		token.Key, err = common.GenerateKey()
+		if err != nil {
+			return nil, err
+		}
+		if len(policy) > 0 {
+			if err := token.StoreRedactionConfig(policy); err != nil {
+				return nil, err
+			}
+		}
+		tokens[index] = token
+	}
+	return tokens, nil
+}
+
+func insertTokenCreateBatch(tokens []model.Token, maxTokens int) error {
+	if maxTokens < len(tokens) {
+		return errTokenCreateLimit
+	}
+	// Do not let a failed write include arguments from the insert in SQL logs.
+	return model.DB.Session(&gorm.Session{Logger: model.DB.Logger.LogMode(gormlogger.Silent)}).Transaction(func(tx *gorm.DB) error {
+		userID := tokens[0].UserId
+		if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+			var owner model.User
+			if err := tx.Select("id").Clauses(clause.Locking{Strength: "UPDATE"}).First(&owner, userID).Error; err != nil {
+				return err
+			}
+		}
+		var existing int64
+		if err := tx.Model(&model.Token{}).Where("user_id = ?", userID).Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing > int64(maxTokens-len(tokens)) {
+			return errTokenCreateLimit
+		}
+		return tx.Create(&tokens).Error
 	})
 }
 
@@ -470,7 +573,30 @@ func UpdateToken(c *gin.Context) {
 			}
 		}
 	}
-	err = cleanToken.Update()
+	policySubmitted := statusOnly == "" && request.submitted()
+	if policySubmitted {
+		if !request.matchesRevision(cleanToken) {
+			tokenRedactionConflict(c)
+			return
+		}
+		if _, err := applyTokenRedaction(cleanToken, request.tokenRedactionInput); err != nil {
+			rejectTokenRedaction(c, err)
+			return
+		}
+	}
+	if statusOnly != "" {
+		err = cleanToken.SelectUpdate()
+	} else {
+		err = cleanToken.UpdateWithRedaction(policySubmitted)
+	}
+	if errors.Is(err, model.ErrTokenRedactionConflict) {
+		tokenRedactionConflict(c)
+		return
+	}
+	if err != nil && policySubmitted {
+		common.ApiErrorT(c, "Could not save request redaction policy")
+		return
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -496,6 +622,8 @@ func UpdateToken(c *gin.Context) {
 			{"group", previous.Group != cleanToken.Group},
 			{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
 			{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+			{"redaction_enabled", previous.RedactionEnabled != cleanToken.RedactionEnabled},
+			{"redaction_config", previous.RedactionConfig != cleanToken.RedactionConfig},
 		} {
 			if field.changed {
 				changedFields = append(changedFields, field.name)

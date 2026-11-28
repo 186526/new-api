@@ -487,7 +487,11 @@ function buildMoonshotSearchSample(lang: Lang, ctx: SampleContext): string {
   const textQuery = 'bird routing daemon configuration'
   // The endpoint answers nine results unless the request caps it.
   const numResults = 5
-  const bodyJson = JSON.stringify({ text_query: textQuery, num_results: numResults }, null, 2)
+  const bodyJson = JSON.stringify(
+    { text_query: textQuery, num_results: numResults },
+    null,
+    2
+  )
 
   if (lang === 'curl') {
     return [

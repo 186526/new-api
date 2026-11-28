@@ -66,22 +66,35 @@ func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr 
 	latency := now.Sub(info.StartTime)
 	if !info.IsChannelTest {
 		appmetrics.ObserveRelay(appmetrics.RelayResult{
-			UserID:       info.UserId,
-			Username:     labels.Username,
-			ChannelID:    labels.ChannelID,
-			ChannelName:  labels.ChannelName,
-			Model:        info.OriginModelName,
-			Group:        info.UsingGroup,
-			Stream:       info.IsStream,
-			Outcome:      string(outcome),
-			Latency:      latency,
-			Ttft:         ttft,
-			HasTtft:      hasTtft,
-			OutputTokens: info.PerformanceOutputTokens,
+			UserID:           info.UserId,
+			Username:         labels.Username,
+			ChannelID:        labels.ChannelID,
+			ChannelName:      labels.ChannelName,
+			Model:            info.OriginModelName,
+			Group:            info.UsingGroup,
+			Stream:           info.IsStream,
+			Outcome:          string(outcome),
+			Latency:          latency,
+			Ttft:             ttft,
+			HasTtft:          hasTtft,
+			OutputTokens:     info.PerformanceOutputTokens,
 			RequestBodyBytes: labels.RequestBodyBytes,
 		})
 	}
+	if !perf_metrics_setting.GetSetting().Enabled {
+		return
+	}
+	var counts model.PerfMetricObservation
+	var distribution []model.PerfMetricDistributionEntry
+	if !info.IsChannelTest {
+		observed := info.RequestObservation()
+		counts = observationCounts(observed)
+		distribution = observationDistribution(observed)
+	}
 	if outcome == OutcomeIgnored {
+		if counts != (model.PerfMetricObservation{}) || len(distribution) != 0 {
+			Record(Sample{Model: info.OriginModelName, Group: info.UsingGroup, observation: counts, distribution: distribution, observationOnly: true})
+		}
 		return
 	}
 	ttftMs := ttft.Milliseconds()
@@ -102,6 +115,8 @@ func RecordRelayResult(ctx context.Context, info *relaycommon.RelayInfo, apiErr 
 		Success:      outcome == OutcomeSuccess,
 		OutputTokens: info.PerformanceOutputTokens,
 		GenerationMs: generationMs,
+		observation:  counts,
+		distribution: distribution,
 	})
 }
 
@@ -177,6 +192,9 @@ func Record(sample Sample) {
 	}
 	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
 	actual.(*atomicBucket).add(sample)
+	if sample.observationOnly {
+		return
+	}
 	gopool.Go(func() {
 		recordRedis(key, sample)
 	})

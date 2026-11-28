@@ -14,7 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -29,11 +30,25 @@ import (
 const alphaSearchAnswer = `{"id":"s_1","results":[{"type":"text_result","title":"t","url":"https://a.example/","snippet":"s"}],"future_field":{"nested":true}}`
 
 func TestAlphaSearchHandlerReturnsTheUpstreamAnswerVerbatim(t *testing.T) {
-	service.InitHttpClient()
-	gin.SetMode(gin.TestMode)
-	batch, logConsume := common.BatchUpdateEnabled, common.LogConsumeEnabled
-	common.BatchUpdateEnabled, common.LogConsumeEnabled = true, false
-	t.Cleanup(func() { common.BatchUpdateEnabled, common.LogConsumeEnabled = batch, logConsume })
+	assertAlphaSearchNativeAnswer(t, alphaSearchAnswer, true)
+}
+
+func TestAlphaSearchHandlerRefundsAnEmptyNativeAnswer(t *testing.T) {
+	assertAlphaSearchNativeAnswer(t, `{"id":"s_1","results":[],"future_field":true}`, false)
+}
+
+func TestAlphaSearchHandlerRefundsAnEmptyRenderedAnswer(t *testing.T) {
+	assertAlphaSearchAnswer(t, `{"results":[]}`, false, false)
+}
+
+func assertAlphaSearchNativeAnswer(t *testing.T, upstreamBody string, billable bool) {
+	t.Helper()
+	assertAlphaSearchAnswer(t, upstreamBody, billable, true)
+}
+
+func assertAlphaSearchAnswer(t *testing.T, upstreamBody string, billable, native bool) {
+	t.Helper()
+	initLegacyWebsearchTest(t)
 
 	var gotPath, gotBody string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,9 +56,22 @@ func TestAlphaSearchHandlerReturnsTheUpstreamAnswerVerbatim(t *testing.T) {
 		raw, _ := io.ReadAll(r.Body)
 		gotBody = string(raw)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, alphaSearchAnswer)
+		_, _ = io.WriteString(w, upstreamBody)
 	}))
 	t.Cleanup(upstream.Close)
+	if !native {
+		settings := config.GlobalConfig.Get("websearch_setting").(*websearch_setting.WebSearchSetting)
+		previous := *settings
+		t.Cleanup(func() {
+			*settings = previous
+			assert.NoError(t, websearch_setting.UpdateAndSync())
+		})
+		settings.ExaBaseURL = upstream.URL
+		settings.ExaAPIKey = "test-key"
+		settings.CandidateOrder = "exa"
+		settings.NativeFirst = false
+		require.NoError(t, websearch_setting.UpdateAndSync())
+	}
 
 	body := `{"id":"req_1","model":"gpt-5.1","commands":{"search_query":[{"q":"weather"}]},"future_field":true}`
 	recorder := httptest.NewRecorder()
@@ -68,10 +96,21 @@ func TestAlphaSearchHandlerReturnsTheUpstreamAnswerVerbatim(t *testing.T) {
 
 	apiErr := AlphaSearchHelper(c, info)
 	require.Nil(t, apiErr)
-	assert.Equal(t, "/backend-api/codex/alpha/search", gotPath)
-	assert.Equal(t, body, gotBody, "the Codex request body reaches the upstream untouched")
-	assert.Equal(t, alphaSearchAnswer, recorder.Body.String(), "the Codex answer reaches the client untouched")
-	assert.Len(t, settlement.settled, 1, "the call settles once at the routing name's request price")
+	if native {
+		assert.Equal(t, "/backend-api/codex/alpha/search", gotPath)
+		assert.Equal(t, body, gotBody, "the Codex request body reaches the upstream untouched")
+		assert.Equal(t, upstreamBody, recorder.Body.String(), "the Codex answer reaches the client untouched")
+	} else {
+		assert.Equal(t, "/search", gotPath)
+		assert.JSONEq(t, `{"id":"","results":[]}`, recorder.Body.String())
+	}
+	if !billable {
+		assert.Empty(t, settlement.settled)
+		assert.Equal(t, 1, settlement.refundCalls)
+		assert.Zero(t, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearchPreview].CallCount)
+		return
+	}
+	require.Len(t, settlement.settled, 1, "the call settles once at the routing name's request price")
 	assert.Greater(t, settlement.settled[0], 0)
 	assert.False(t, settlement.refunded)
 	assert.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearchPreview].CallCount)

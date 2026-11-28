@@ -227,6 +227,7 @@ export type ContentSettings = {
 }
 
 export type ModelSettings = {
+  'reasoning_setting.auto_effort_policy': string
   'global.pass_through_request_enabled': boolean
   'global.thinking_model_blacklist': string
   'global.chat_completions_to_responses_policy': string
@@ -396,6 +397,7 @@ export type OperationsSettings = {
   'perf_metrics_setting.retention_days': number
   'websearch_setting.candidate_order': string
   'websearch_setting.native_first': boolean
+  'websearch_setting.builtin_fallback_enabled': boolean
   'websearch_setting.search_cache_ttl_seconds': number
   'websearch_setting.fetch_cache_ttl_seconds': number
   'websearch_setting.redirect_cache_ttl_seconds': number

@@ -89,8 +89,10 @@ import {
   type TagRow,
 } from '../lib'
 import { parseUpstreamUpdateMeta } from '../lib/upstream-update-utils'
+import { isToolModel } from '../lib/websearch-setting'
 import type { Channel } from '../types'
 import { ChannelRowActionsLayoutContext } from './channel-row-actions-context'
+import { ChannelToolBadges } from './channel-tool-badges'
 import { TaskPluginChannelBadge } from './channel-type-badge'
 import { useChannels } from './channels-provider'
 import { DataTableRowActions } from './data-table-row-actions'
@@ -1136,17 +1138,24 @@ export function useChannelsColumns(
           const models = row.getValue('models') as string
           const modelArray = parseModelsList(models)
           return (
-            <BadgeListCell
-              items={modelArray.map((model) => (
-                <StatusBadge
-                  key={model}
-                  label={model}
-                  autoColor={model}
-                  size='sm'
-                  className='font-mono'
+            <div className='flex flex-wrap items-center gap-1'>
+              <ChannelToolBadges models={modelArray} />
+              {modelArray.some((model) => !isToolModel(model)) && (
+                <BadgeListCell
+                  items={modelArray
+                    .filter((model) => !isToolModel(model))
+                    .map((model) => (
+                      <StatusBadge
+                        key={model}
+                        label={model}
+                        autoColor={model}
+                        size='sm'
+                        className='font-mono'
+                      />
+                    ))}
                 />
-              ))}
-            />
+              )}
+            </div>
           )
         },
         size: 200,

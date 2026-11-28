@@ -27,7 +27,7 @@ import {
   protocolSummary,
   protocolTitle,
 } from '../lib/copy'
-import { resolveEndpointPath } from '../lib/models'
+import { resolveEndpointPath, withModelInPath } from '../lib/models'
 import { EndpointSamples } from './endpoint-samples'
 import { EndpointTable } from './endpoint-table'
 
@@ -35,8 +35,9 @@ type ProtocolSectionProps = {
   protocol: ApiProtocolDoc
   baseUrl: string
   model: string
+  alphaSearchModel?: string
   supportedEndpoint: Record<string, { path?: string }> | undefined
-  /** Extra content rendered after the note, before the endpoint table. */
+  /** Extra content rendered after the endpoint table, before the samples. */
   children?: ReactNode
 }
 
@@ -49,33 +50,42 @@ export function ProtocolSection(props: ProtocolSectionProps) {
 
   const endpoints = props.protocol.endpoints.map((endpoint) => ({
     ...endpoint,
-    path: resolveEndpointPath(
-      endpoint.path,
-      endpoint.endpointType,
-      props.supportedEndpoint
+    path: withModelInPath(
+      resolveEndpointPath(
+        endpoint.path,
+        endpoint.endpointType,
+        props.supportedEndpoint
+      ),
+      props.model
     ),
+    description: endpointDescription(t, endpoint.id),
   }))
 
   const note = protocolNote(t, props.protocol.id)
+  const headingId = `${props.protocol.id}-heading`
 
   return (
     <section
       id={props.protocol.id}
-      className='scroll-mt-24 border-b pb-10 last:border-b-0'
+      aria-labelledby={headingId}
+      tabIndex={-1}
+      className='flex min-w-0 scroll-mt-24 flex-col gap-5 border-b pb-10 last:border-b-0 last:pb-0'
     >
-      <h2 className='text-2xl font-semibold tracking-tight'>
-        {protocolTitle(t, props.protocol.id)}
-      </h2>
-      <p className='text-muted-foreground mt-2 text-sm'>
-        {protocolSummary(t, props.protocol.id)}
-      </p>
+      <header>
+        <h2 id={headingId} className='text-2xl font-semibold tracking-tight'>
+          {protocolTitle(t, props.protocol.id)}
+        </h2>
+        <p className='text-muted-foreground mt-2 text-sm leading-relaxed'>
+          {protocolSummary(t, props.protocol.id)}
+        </p>
+      </header>
 
-      <dl className='mt-4 grid gap-2 text-sm sm:grid-cols-[7rem_minmax(0,1fr)]'>
+      <dl className='grid gap-x-4 gap-y-1 text-sm sm:grid-cols-[max-content_minmax(0,1fr)] [&_dd]:mb-2 sm:[&_dd]:mb-0'>
         <dt className='text-muted-foreground'>
           {t('apiDocs.field.baseUrl', { defaultValue: 'Base URL' })}
         </dt>
         <dd>
-          <code className='font-mono text-[13px] break-all'>
+          <code className='font-mono text-[13px] wrap-anywhere'>
             {props.baseUrl}
           </code>
         </dd>
@@ -91,35 +101,28 @@ export function ProtocolSection(props: ProtocolSectionProps) {
         </dd>
       </dl>
 
-      {note ? (
-        <p className='bg-muted/40 mt-4 rounded-lg border px-3 py-2 text-sm'>
+      {note && (
+        <p className='text-muted-foreground border-border border-s-2 ps-3 text-sm leading-relaxed'>
           {note}
         </p>
-      ) : null}
+      )}
 
+      <EndpointTable rows={endpoints} labelledBy={headingId} />
       {props.children}
 
-      <div className='mt-6'>
-        <EndpointTable
-          rows={endpoints.map((endpoint) => ({
-            id: endpoint.id,
-            method: endpoint.method,
-            path: endpoint.path.replace('{model}', props.model),
-            description: endpointDescription(t, endpoint.id),
-          }))}
-        />
-      </div>
-
-      <div className='mt-6 space-y-8'>
+      <div className='flex min-w-0 flex-col gap-5'>
         {endpoints.map((endpoint) => (
           <EndpointSamples
             key={endpoint.id}
             baseUrl={props.baseUrl}
             endpointId={endpoint.id}
             method={endpoint.method}
-            model={props.model}
-            path={endpoint.path.replace('{model}', props.model)}
-            title={endpointDescription(t, endpoint.id)}
+            model={
+              endpoint.id === 'alpha-search'
+                ? (props.alphaSearchModel ?? 'YOUR_ALPHA_SEARCH_MODEL')
+                : props.model
+            }
+            path={endpoint.path}
           />
         ))}
       </div>

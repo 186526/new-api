@@ -1,38 +1,148 @@
 package request
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/service/redaction"
+	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 )
 
-// TestRetryableStatusClassifiesTheUpstreamAnswersARetryCanFix pins which status
-// codes are worth a second request: the two the upstreams use for "ask again
-// later", and every server error. A 4xx that names a fault in our own request
-// is not retried, because the same bytes would be refused again.
-func TestRetryableStatusClassifiesTheUpstreamAnswersARetryCanFix(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-		want   bool
+func TestForwardProtectedRequestsDoNotReuseSharedCache(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = writer.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+	build := func(ctx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, server.URL, nil)
+	}
+	policy, err := redaction.Compile(redaction.DefaultConfig(), 10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := policy.NewSession(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected := session.ProtectedContext(t.Context())
+	for _, example := range []struct {
+		ctx    context.Context
+		cached bool
+	}{{t.Context(), false}, {protected, false}, {protected, false}, {t.Context(), true}} {
+		answer, err := Forward(example.ctx, abstract.ChannelContext{}, build, ForwardOptions{CacheTTLSeconds: 60, TimeoutSeconds: 2})
+		if err != nil || answer.Cached != example.cached {
+			t.Fatalf("cached = %v, want %v, error = %v", answer.Cached, example.cached, err)
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", calls.Load())
+	}
+}
+
+func TestForwardCacheSeparatesTenantsAndBodies(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = writer.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+	for _, example := range []struct {
+		tenant int
+		body   string
+		cached bool
 	}{
-		{name: "request timeout is retried", status: http.StatusRequestTimeout, want: true},
-		{name: "too many requests is retried", status: http.StatusTooManyRequests, want: true},
-		{name: "internal server error is retried", status: http.StatusInternalServerError, want: true},
-		{name: "service unavailable is retried", status: http.StatusServiceUnavailable, want: true},
-		{name: "gateway timeout is retried", status: http.StatusGatewayTimeout, want: true},
-		{name: "bad request is not retried", status: http.StatusBadRequest},
-		{name: "unauthorized is not retried", status: http.StatusUnauthorized},
-		{name: "forbidden is not retried", status: http.StatusForbidden},
-		{name: "not found is not retried", status: http.StatusNotFound},
-		{name: "unprocessable entity is not retried", status: http.StatusUnprocessableEntity},
-		{name: "success is not retried", status: http.StatusOK},
+		{1, `{"q":"first"}`, false},
+		{1, `{"q":"first"}`, true},
+		{2, `{"q":"first"}`, false},
+		{2, `{"q":"second"}`, false},
+		{2, `{"q":"second"}`, true},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := retryableStatus(tc.status); got != tc.want {
-				t.Errorf("retryableStatus(%d) = %v, want %v", tc.status, got, tc.want)
+		ctx := abstract.WithCacheTenant(t.Context(), example.tenant)
+		build := func(ctx context.Context) (*http.Request, error) {
+			return http.NewRequestWithContext(ctx, http.MethodPost, server.URL, strings.NewReader(example.body))
+		}
+		answer, err := Forward(ctx, abstract.ChannelContext{}, build, ForwardOptions{CacheTTLSeconds: 60, TimeoutSeconds: 2})
+		if err != nil || answer.Cached != example.cached {
+			t.Fatalf("tenant %d body %q: cached = %v, want %v, error = %v", example.tenant, example.body, answer.Cached, example.cached, err)
+		}
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", calls.Load())
+	}
+}
+
+func TestForwardDoesNotRetryAnIncompleteUpstreamResponse(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Length", "10")
+		_, _ = w.Write([]byte("short"))
+	}))
+	defer server.Close()
+
+	_, err := Forward(t.Context(), abstract.ChannelContext{}, func(ctx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, server.URL, nil)
+	}, ForwardOptions{CacheTTLSeconds: -1, TimeoutSeconds: 2})
+	if !WasSent(err) || calls.Load() != 1 {
+		t.Fatalf("incomplete response: error = %v, attempts = %d; want a sent error and one attempt", err, calls.Load())
+	}
+}
+
+func TestForwardDoesNotRetryWhenTheUpstreamClosesBeforeHeaders(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	_, err := Forward(t.Context(), abstract.ChannelContext{}, func(ctx context.Context) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, http.MethodPost, server.URL, nil)
+	}, ForwardOptions{CacheTTLSeconds: -1, TimeoutSeconds: 2})
+	if !WasSent(err) || calls.Load() != 1 {
+		t.Fatalf("upstream closed before headers: error = %v, attempts = %d; want a sent error and one attempt", err, calls.Load())
+	}
+}
+
+func TestForwardDoesNotRetryAnUpstreamRefusal(t *testing.T) {
+	const refusal = `{"error":"upstream refusal"}`
+	for _, status := range []int{
+		http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusBadRequest,
+		http.StatusTemporaryRedirect, http.StatusSeeOther,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if calls.Add(1) > 1 || req.URL.Path != "/initial" {
+					_, _ = w.Write([]byte(`{"results":[]}`))
+					return
+				}
+				w.Header().Set("Location", "/next")
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(refusal))
+			}))
+			defer server.Close()
+
+			answer, err := Forward(t.Context(), abstract.ChannelContext{}, func(ctx context.Context) (*http.Request, error) {
+				return http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/initial", nil)
+			}, ForwardOptions{CacheTTLSeconds: -1, TimeoutSeconds: 2})
+			if err != nil || calls.Load() != 1 || answer.StatusCode != status || string(answer.Body) != refusal || answer.Header.Get("Retry-After") != "1" {
+				t.Fatalf("refusal: status = %d, body = %q, error = %v, attempts = %d; want original %d answer and one attempt", answer.StatusCode, answer.Body, err, calls.Load(), status)
 			}
 		})
 	}

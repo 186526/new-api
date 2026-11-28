@@ -35,6 +35,43 @@ import { channelSchema } from '../../types'
 import { WebSearchSetting } from '../websearch-setting'
 
 const CHANNEL_TYPE_DEEPSEEK = 43
+const operation = (supported: boolean) => ({
+  supported,
+  native_contracts: [],
+  mapping_required_contracts: [],
+})
+const toolCatalog = {
+  channel_types: {
+    [CHANNEL_TYPE_ANTIGRAVITY]: {
+      provider: 'antigravity',
+      search: operation(true),
+      fetch: operation(false),
+    },
+    [CHANNEL_TYPE_DEEPSEEK]: {
+      provider: 'deepseek',
+      search: operation(true),
+      fetch: operation(true),
+    },
+    25: {
+      provider: 'moonshot',
+      search: operation(true),
+      fetch: operation(true),
+    },
+    27: {
+      provider: 'perplexity',
+      search: operation(true),
+      fetch: operation(false),
+    },
+    99: {
+      provider: 'synthetic-provider',
+      search: operation(true),
+      fetch: { ...operation(true), mapping_required_contracts: ['tools/fetch'] },
+    },
+  },
+  fallbacks: [
+    { provider: 'local', search: operation(false), fetch: operation(true) },
+  ],
+}
 
 function createChannel(setting: string, type = CHANNEL_TYPE_ANTIGRAVITY) {
   return channelSchema.parse({
@@ -59,6 +96,7 @@ function SettingsForm(props: {
   const form = useForm<ChannelFormValues>({
     defaultValues: {
       ...CHANNEL_FORM_DEFAULT_VALUES,
+      models: 'tools-search,tools-fetch',
       ...props.defaultValues,
       type: props.channelType,
     },
@@ -67,7 +105,10 @@ function SettingsForm(props: {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(props.onSave)}>
-        <WebSearchSetting channelType={props.channelType} />
+        <WebSearchSetting
+          channelType={props.channelType}
+          toolCatalog={toolCatalog}
+        />
         <button type='submit'>Save</button>
       </form>
     </Form>
@@ -98,10 +139,36 @@ describe('Channel search and fetch settings visibility', () => {
     ).toBeVisible()
   })
 
+  test.each([
+    [25, 'Native search and fetch: Moonshot'],
+    [27, 'Native search: Perplexity. Fetch can use the built-in fetcher.'],
+  ])('channel type %s exposes its tool capabilities', async (type, hint) => {
+    const user = userEvent.setup()
+    const saved: ChannelFormValues[] = []
+    render(
+      <SettingsForm
+        channelType={type}
+        defaultValues={{ models: 'chat-model' }}
+        onSave={(values) => saved.push(values)}
+      />
+    )
+
+    await user.click(
+      screen.getByRole('switch', { name: 'Enable search middleware' })
+    )
+    expect(screen.getByText(hint)).toBeVisible()
+    await user.click(
+      screen.getByRole('button', { name: 'Enable fetch for Kimi Code' })
+    )
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(saved[0].models).toBe('chat-model,tools-search,tools-fetch')
+  })
+
   test('other channel types hide the group', () => {
     render(
       <SettingsForm
         channelType={CHANNEL_TYPE_OLLAMA}
+        defaultValues={{ models: 'ollama-model' }}
         onSave={() => undefined}
       />
     )
@@ -113,6 +180,27 @@ describe('Channel search and fetch settings visibility', () => {
 })
 
 describe('Channel search and fetch settings values', () => {
+  test('editing the fetch mapping preserves search and chat mappings', async () => {
+    const user = userEvent.setup()
+    const saved: ChannelFormValues[] = []
+    render(
+      <SettingsForm
+        channelType={99}
+        defaultValues={{ model_mapping: '{"tools-search":"search-model","chat":"upstream-chat"}' }}
+        onSave={(values) => saved.push(values)}
+      />
+    )
+
+    await user.type(screen.getByRole('textbox', { name: 'Upstream fetch model' }), 'fetch-model')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(JSON.parse(saved[0].model_mapping ?? '')).toEqual({
+      'tools-search': 'search-model',
+      'tools-fetch': 'fetch-model',
+      chat: 'upstream-chat',
+    })
+  })
+
   test('selecting a provider stores it in the setting JSON', async () => {
     const user = userEvent.setup()
     const saved: ChannelFormValues[] = []
@@ -190,15 +278,35 @@ describe('Channel search and fetch settings values', () => {
     expect(JSON.parse(setting).websearch_fetch_cache_ttl_seconds).toBe(0)
   })
 
-  test('a channel type that cannot search stores none of the four settings', () => {
+  test('missing metadata preserves settings even without selected tool models', () => {
     const setting = buildSettingJSON({
       ...CHANNEL_FORM_DEFAULT_VALUES,
       type: CHANNEL_TYPE_OLLAMA,
+      models: 'chat-model',
       websearch_provider: 'deepseek',
-      antigravity_web_search_model: 'gemini-3.5-flash-lite',
-      websearch_cache_ttl_seconds: 60,
-      websearch_fetch_cache_ttl_seconds: 60,
+      websearch_cache_ttl_seconds: -1,
+      websearch_fetch_cache_ttl_seconds: 0,
     })
+
+    expect(JSON.parse(setting)).toMatchObject({
+      websearch_provider: 'deepseek',
+      websearch_cache_ttl_seconds: -1,
+      websearch_fetch_cache_ttl_seconds: 0,
+    })
+  })
+
+  test('a confirmed unsupported channel without tool models stores none of the four settings', () => {
+    const setting = buildSettingJSON(
+      {
+        ...CHANNEL_FORM_DEFAULT_VALUES,
+        type: CHANNEL_TYPE_OLLAMA,
+        websearch_provider: 'deepseek',
+        antigravity_web_search_model: 'gemini-3.5-flash-lite',
+        websearch_cache_ttl_seconds: 60,
+        websearch_fetch_cache_ttl_seconds: 60,
+      },
+      toolCatalog
+    )
     const stored = JSON.parse(setting)
 
     expect(stored).not.toHaveProperty('websearch_provider')

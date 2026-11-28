@@ -58,7 +58,7 @@ func (r *codexRequester) Search(ctx context.Context, channel abstract.ChannelCon
 		return req, nil
 	}
 
-	upstream, err := Forward(ctx, channel, build, ForwardOptions{
+	upstream, err := forwardManaged(ctx, channel, query, build, ForwardOptions{
 		CacheKey:        cacheKey,
 		Search:          true,
 		CacheTTLSeconds: channel.Settings.WebSearchCacheTTLSeconds,

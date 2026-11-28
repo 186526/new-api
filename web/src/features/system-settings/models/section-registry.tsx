@@ -23,6 +23,7 @@ import { ClaudeSettingsCard } from './claude-settings-card'
 import { GeminiSettingsCard } from './gemini-settings-card'
 import { GlobalSettingsCard } from './global-settings-card'
 import { GrokSettingsCard } from './grok-settings-card'
+import { ReasoningSettingsCard } from './reasoning-settings-card'
 
 function formatJsonForEditor(value: string, fallback: string) {
   const raw = (value ?? '').toString().trim()
@@ -121,6 +122,15 @@ const MODELS_SECTIONS = [
     ),
   },
 
+  {
+    id: 'reasoning',
+    titleKey: 'Automatic reasoning',
+    build: (settings: ModelSettings) => (
+      <ReasoningSettingsCard
+        value={settings['reasoning_setting.auto_effort_policy']}
+      />
+    ),
+  },
   {
     id: 'model-deployment',
     titleKey: 'Model Deployment',

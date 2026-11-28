@@ -49,6 +49,10 @@ func registerChannelRoutes(apiRouter *gin.RouterGroup) {
 		controller.GetChannelKey,
 	)
 
+	handlePermissionRoute(channelRoute, http.MethodGet, "/:id/custom_tools", authz.ChannelRead, middleware.DisableCache(), controller.GetChannelCustomTools)
+	handlePermissionRoute(channelRoute, http.MethodPut, "/:id/custom_tools/:operation", authz.ChannelSensitiveWrite, middleware.DisableCache(), controller.SaveChannelCustomTool)
+	handlePermissionRoute(channelRoute, http.MethodPost, "/:id/custom_tools/:operation/verify", authz.ChannelWrite, middleware.CriticalRateLimit(), middleware.DisableCache(), controller.VerifyChannelCustomTool)
+
 	for _, route := range channelPermissionRoutes {
 		handlePermissionRoute(channelRoute, route.method, route.path, route.permission, route.handler)
 	}
@@ -61,6 +65,8 @@ var channelPermissionRoutes = []permissionRoute{
 	{method: http.MethodGet, path: "/search", permission: authz.ChannelRead, handler: controller.SearchChannels},
 	{method: http.MethodGet, path: "/models", permission: authz.ChannelRead, handler: controller.ChannelListModels},
 	{method: http.MethodGet, path: "/default_base_urls", permission: authz.ChannelRead, handler: controller.GetChannelDefaultBaseURLs},
+	{method: http.MethodGet, path: "/tool_capabilities", permission: authz.ChannelRead, handler: controller.GetChannelToolCapabilities},
+	{method: http.MethodPost, path: "/tool_capabilities/preflight", permission: authz.ChannelRead, handler: controller.PreflightChannelTools},
 	{method: http.MethodGet, path: "/models_enabled", permission: authz.ChannelRead, handler: controller.EnabledListModels},
 	{method: http.MethodGet, path: "/ops", permission: authz.ChannelRead, handler: controller.GetChannelOps},
 	{method: http.MethodGet, path: "/:id", permission: authz.ChannelRead, handler: controller.GetChannel},

@@ -134,11 +134,7 @@ function MistralUsageDetails(props: {
         </div>
       ) : (
         props.usage.budgets.map((budget) => (
-          <BudgetSection
-            key={budget.scope}
-            budget={budget}
-            percent={percent}
-          />
+          <BudgetSection key={budget.scope} budget={budget} percent={percent} />
         ))
       )}
       <div className='space-y-2'>

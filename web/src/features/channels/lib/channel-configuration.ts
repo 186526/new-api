@@ -25,9 +25,15 @@ import {
   OPENAI_FIELD_PASSTHROUGH_TYPES,
 } from '../constants'
 import { CHANNEL_TYPE_ADVANCED_CUSTOM } from './advanced-custom'
-import { channelFormSchema, type ChannelFormValues } from './channel-form'
+import { createChannelFormSchema, type ChannelFormValues } from './channel-form'
+import { parseModelsString } from './model-mapping-validation'
 import { supportsResponsesWebSocket } from './responses-websocket'
-import { supportsWebSearchSettings } from './websearch-setting'
+import {
+  CODEX_SEARCH_MAPPING_REQUIRED,
+  isToolModel,
+  getChannelToolAvailability,
+  type ChannelToolCatalog,
+} from './websearch-setting'
 
 export type ChannelProviderTarget =
   | { kind: 'builtin'; type: number }
@@ -102,7 +108,7 @@ const CONFIGURATION_BLOCKS = {
     ],
   },
   websearchSettings: {
-    section: 'other',
+    section: 'connection',
     fields: [
       'websearch_provider',
       'antigravity_web_search_model',
@@ -148,7 +154,8 @@ function hasConfiguredJson(value: string | undefined): boolean {
 export function getChannelConfigurationState(
   values: ChannelFormValues,
   errors: FieldErrors<ChannelFormValues>,
-  isEditing: boolean
+  isEditing: boolean,
+  catalog?: ChannelToolCatalog
 ) {
   const openaiPassthrough = OPENAI_FIELD_PASSTHROUGH_TYPES.has(values.type)
   const claudePassthrough = CLAUDE_FIELD_PASSTHROUGH_TYPES.has(values.type)
@@ -205,11 +212,13 @@ export function getChannelConfigurationState(
         values.upstream_model_update_ignored_models?.trim()
       ),
     websearchSettings: Boolean(
-      supportsWebSearchSettings(values.type) &&
-      (values.websearch_provider ||
-        values.antigravity_web_search_model?.trim() ||
-        values.websearch_cache_ttl_seconds != null ||
-        values.websearch_fetch_cache_ttl_seconds != null)
+      parseModelsString(values.models).some(isToolModel) ||
+      ((!catalog ||
+        getChannelToolAvailability(values.type, catalog).canConfigure) &&
+        (values.websearch_provider ||
+          values.antigravity_web_search_model?.trim() ||
+          values.websearch_cache_ttl_seconds != null ||
+          values.websearch_fetch_cache_ttl_seconds != null))
     ),
     internalNotes: Boolean(values.tag?.trim() || values.remark?.trim()),
   }
@@ -239,11 +248,12 @@ export function getChannelConfigurationState(
   }
 
   // Reuse provider-specific validation without displaying errors before submit.
-  const validation = channelFormSchema.safeParse(values)
+  const validation = createChannelFormSchema(catalog).safeParse(values)
   const connectionInvalid =
     !validation.success &&
     validation.error.issues.some(
       (issue) =>
+        issue.message === CODEX_SEARCH_MAPPING_REQUIRED ||
         getChannelConfigurationSection(String(issue.path[0])) === 'connection'
     )
   if (

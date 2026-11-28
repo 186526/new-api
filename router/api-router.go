@@ -28,6 +28,8 @@ func SetApiRouter(router *gin.Engine) {
 	if !common.RunsAdmin() {
 		return
 	}
+	RegisterToolsAdminRoutes(apiRouter)
+	RegisterQuotaReconciliationRoutes(apiRouter)
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()
 	{
 		apiRouter.GET("/setup", controller.GetSetup)
@@ -222,6 +224,10 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.GET("/waffo-pancake/subscription-product-options", controller.ListWaffoPancakeSubscriptionProductOptions)
 		}
 
+		requestPreviewRoute := apiRouter.Group("/system-settings", middleware.RootAuth(), middleware.DisableCache())
+		requestPreviewRoute.POST("/image-compression/preview", controller.PreviewImageCompression)
+		requestPreviewRoute.POST("/auto-reasoning/preview", controller.PreviewAutoReasoning)
+
 		// Custom OAuth provider management (root only)
 		customOAuthRoute := apiRouter.Group("/custom-oauth-provider")
 		customOAuthRoute.Use(middleware.RootAuth())
@@ -271,6 +277,9 @@ func SetApiRouter(router *gin.Engine) {
 		registerAuthzRoutes(apiRouter)
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())
+		tokenRedactionRoute := apiRouter.Group("/token/redaction", middleware.UserAuth(), middleware.DisableCache())
+		tokenRedactionRoute.GET("/guardrails", controller.GetTokenRedactionGuardrails)
+		tokenRedactionRoute.POST("/preview", controller.PreviewTokenRedaction)
 		tokenRoute.Use(middleware.TokenOperationAudit())
 		{
 			tokenRoute.GET("/", controller.GetAllTokens)
@@ -280,6 +289,7 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetTokenKey)
 			tokenRoute.POST("/", controller.AddToken)
 			tokenRoute.PUT("/", controller.UpdateToken)
+			tokenRoute.PUT("/redaction/batch", middleware.DisableCache(), controller.BatchUpdateTokenRedaction)
 			tokenRoute.DELETE("/:id", controller.DeleteToken)
 			tokenRoute.POST("/batch", controller.DeleteTokenBatch)
 			tokenRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.GetTokenKeysBatch)
@@ -323,7 +333,8 @@ func SetApiRouter(router *gin.Engine) {
 		systemInfoRoute.Use(middleware.RootAuth())
 		{
 			systemInfoRoute.GET("/instances", controller.ListSystemInstances)
-			systemInfoRoute.DELETE("/stale-instances", controller.DeleteStaleSystemInstances)
+			systemInfoRoute.DELETE("/expired-instances", controller.DeleteExpiredSystemInstances)
+			systemInfoRoute.DELETE("/stale-instances", controller.DeleteExpiredSystemInstances)
 			systemInfoRoute.DELETE("/instances/:node_name", controller.DeleteStaleSystemInstance)
 		}
 

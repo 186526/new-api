@@ -64,7 +64,8 @@ function curlRequest(url: string, headers: string[], body?: unknown): string {
     args.push(`  -H "${header}"`)
   }
   if (body !== undefined) {
-    args.push(`  -d '${indentedJson(body, '     ')}'`)
+    const json = indentedJson(body, '     ').replaceAll("'", "'\\''")
+    args.push(`  -d '${json}'`)
   }
   return args.join(' \\\n')
 }
@@ -330,138 +331,83 @@ function systemOneDecideSamples(
 // Moonshot Service
 // ---------------------------------------------------------------------------
 
-function moonshotSearchSamples(
-  lang: ApiSampleLanguage,
-  ctx: SampleContext
-): string {
-  // num_results is shown because the endpoint returns nine results by default
-  // and a caller that wants fewer has to ask for it.
-  const body = { text_query: 'BIRD routing daemon configuration', num_results: 5 }
-  const url = `${ctx.baseUrl}${ctx.path}`
+type ToolSample = {
+  body: Record<string, unknown>
+  pythonOutput: string[]
+  curlNote?: string
+}
 
+function toolSample(
+  lang: ApiSampleLanguage,
+  ctx: SampleContext,
+  sample: ToolSample
+): string {
+  const url = `${ctx.baseUrl}${ctx.path}`
   if (lang === 'curl') {
-    return curlRequest(url, bearerHeaders(ctx), body)
+    const command = curlRequest(url, bearerHeaders(ctx), sample.body)
+    return sample.curlNote ? `${sample.curlNote}\n${command}` : command
   }
   return [
     'import os',
     'import requests',
     '',
     'response = requests.post(',
-    `    "${url}",`,
+    `    ${JSON.stringify(url)},`,
     `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"text_query": "${body.text_query}", "num_results": ${body.num_results}},`,
+    `    json=${JSON.stringify(sample.body)},`,
     '    timeout=60,',
     ')',
-    'for result in response.json()["search_results"]:',
-    '    print(result["title"], result["url"])',
+    'response.raise_for_status()',
+    ...sample.pythonOutput,
   ].join('\n')
 }
 
-function moonshotFetchSamples(
-  lang: ApiSampleLanguage,
-  ctx: SampleContext
-): string {
-  const body = { url: 'https://example.com/article' }
-  const url = `${ctx.baseUrl}${ctx.path}`
+const SEARCH_QUERY = 'BIRD routing daemon configuration'
+const FETCH_URL = 'https://example.com/'
 
-  if (lang === 'curl') {
-    return [
-      '# The answer is text/markdown, not JSON: pipe it straight into a file.',
-      curlRequest(url, bearerHeaders(ctx), body),
-    ].join('\n')
-  }
-  return [
-    'import os',
-    'import requests',
-    '',
-    'response = requests.post(',
-    `    "${url}",`,
-    `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"url": "${body.url}"},`,
-    '    timeout=60,',
-    ')',
-    '# Content-Type is text/markdown; response.text is the extracted body.',
-    'print(response.text[:500])',
-  ].join('\n')
+function moonshotSearchSamples(lang: ApiSampleLanguage, ctx: SampleContext) {
+  return toolSample(lang, ctx, {
+    body: { text_query: SEARCH_QUERY, num_results: 5 },
+    pythonOutput: [
+      'for result in response.json()["search_results"]:',
+      '    print(result["title"], result["url"])',
+    ],
+  })
 }
 
-// ---------------------------------------------------------------------------
-// DeepSeek tools
-// ---------------------------------------------------------------------------
-
-function deepSeekSearchSamples(
-  lang: ApiSampleLanguage,
-  ctx: SampleContext
-): string {
-  const body = { query: 'BIRD routing daemon configuration', count: 10 }
-  const url = `${ctx.baseUrl}${ctx.path}`
-
-  if (lang === 'curl') {
-    return curlRequest(url, bearerHeaders(ctx), body)
-  }
-  return [
-    'import os',
-    'import requests',
-    '',
-    'response = requests.post(',
-    `    "${url}",`,
-    `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"query": "${body.query}", "count": 10},`,
-    '    timeout=60,',
-    ')',
-    'for result in response.json()["results"]:',
-    '    print(result["title"], result["url"])',
-  ].join('\n')
+function moonshotFetchSamples(lang: ApiSampleLanguage, ctx: SampleContext) {
+  return toolSample(lang, ctx, {
+    body: { url: FETCH_URL },
+    curlNote: '# The response is text/markdown, not JSON.',
+    pythonOutput: ['print(response.text[:500])'],
+  })
 }
 
-function deepSeekFetchSamples(
-  lang: ApiSampleLanguage,
-  ctx: SampleContext
-): string {
-  const body = { url: 'https://example.com/article' }
-  const url = `${ctx.baseUrl}${ctx.path}`
-
-  if (lang === 'curl') {
-    return curlRequest(url, bearerHeaders(ctx), body)
-  }
-  return [
-    'import os',
-    'import requests',
-    '',
-    'response = requests.post(',
-    `    "${url}",`,
-    `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"url": "${body.url}"},`,
-    '    timeout=60,',
-    ')',
-    'payload = response.json()',
-    'print(payload["title"])',
-    'print(payload["content"][:500])',
-  ].join('\n')
+function deepSeekSearchSamples(lang: ApiSampleLanguage, ctx: SampleContext) {
+  return toolSample(lang, ctx, {
+    body: { query: SEARCH_QUERY, count: 10 },
+    pythonOutput: [
+      'for result in response.json()["results"]:',
+      '    print(result["title"], result["url"])',
+    ],
+  })
 }
 
-function alphaSearchSamples(
-  lang: ApiSampleLanguage,
-  ctx: SampleContext
-): string {
-  const body = { query: 'BIRD routing daemon configuration' }
-  const url = `${ctx.baseUrl}${ctx.path}`
+function deepSeekFetchSamples(lang: ApiSampleLanguage, ctx: SampleContext) {
+  return toolSample(lang, ctx, {
+    body: { url: FETCH_URL },
+    pythonOutput: ['print(response.json()["content"][:500])'],
+  })
+}
 
-  if (lang === 'curl') {
-    return curlRequest(url, bearerHeaders(ctx), body)
-  }
-  return [
-    'import os',
-    'import requests',
-    '',
-    'response = requests.post(',
-    `    "${url}",`,
-    `    headers={"Authorization": f"Bearer {os.environ['${ctx.apiKeyEnv}']}"},`,
-    `    json={"query": "${body.query}"},`,
-    '    timeout=60,',
-    ')',
-    'print(response.json())',
-  ].join('\n')
+function alphaSearchSamples(lang: ApiSampleLanguage, ctx: SampleContext) {
+  return toolSample(lang, ctx, {
+    body: {
+      model: ctx.model,
+      commands: { search_query: [{ q: SEARCH_QUERY }] },
+    },
+    pythonOutput: ['print(response.json())'],
+  })
 }
 
 const SAMPLE_BUILDERS: Record<

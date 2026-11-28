@@ -6,12 +6,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	appmetrics "github.com/QuantumNous/new-api/pkg/metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
@@ -19,8 +17,10 @@ import (
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/service/websearch/request"
 	"github.com/QuantumNous/new-api/service/websearch/response"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -37,11 +37,8 @@ const (
 )
 
 // MoonshotServiceHelper answers the Kimi Code search and fetch endpoints through
-// the websearch pipeline. The client reads any non-200 as a failure, and a
-// failed fetch then falls back to fetching locally inside the client, so a
-// provider error is answered 200 with an empty body and logged here instead. A
-// contract no candidate can serve is reported as a request error, the same way
-// /v1/alpha/search and /v1/tools report one.
+// the websearch pipeline. Search returns the compatibility empty document for
+// an upstream failure; Fetch distinguishes an empty page from a failed fetch.
 func MoonshotServiceHelper(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	info.InitChannelMeta(c)
 
@@ -83,10 +80,18 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 		// to the rendered answer rather than sent to it.
 		Count: request_.ResultCount(),
 	}
-	prepareMoonshotCodexSearch(c, info, &query)
+	if query.Count == 0 && websearch_setting.Get().FallbackEnabled &&
+		!gjson.GetBytes(request_.RawBody, "num_results").Exists() &&
+		!gjson.GetBytes(request_.RawBody, "max_results").Exists() {
+		query.Count = websearch_setting.DefaultSearchResultCount
+	}
+	if apiErr := prepareWebsearchAttempt(c, info, &query); apiErr != nil {
+		return apiErr
+	}
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
 	answer, err := websearch.Search(c.Request.Context(), channel, query)
+	recordWebsearchResult(info, query.Contract, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			appmetrics.ObserveMoonshotServiceRequest(
@@ -102,14 +107,21 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 			// failure to report, but it is still unbilled.
 			outcome = moonshotServiceOutcomeEmpty
 		} else {
-			logger.LogWarn(c.Request.Context(), "moonshot service search failed for %q: %v", request_.TextQuery, err)
+			logger.LogWarn(c.Request.Context(), "moonshot service search failed")
 		}
 		moonshotServiceRefund(c, info, moonshotServiceOperationSearch, outcome, false)
 		writeMoonshotServiceEmptySearch(c)
 		return nil
 	}
 
-	if emptySearchBody(answer.Body) {
+	if !websearchOK(answer.StatusCode) {
+		logger.LogWarn(c.Request.Context(), "moonshot service search upstream returned status %d", answer.StatusCode)
+		moonshotServiceRefund(c, info, moonshotServiceOperationSearch, moonshotServiceOutcomeError, answer.Cached)
+		writeMoonshotServiceEmptySearch(c)
+		return nil
+	}
+
+	if !websearchHasResults(answer.Body, "search_results") {
 		moonshotServiceRefund(c, info, moonshotServiceOperationSearch, moonshotServiceOutcomeEmpty, answer.Cached)
 		writeMoonshotServiceEmptySearch(c)
 		return nil
@@ -125,40 +137,18 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 	return nil
 }
 
-func prepareMoonshotCodexSearch(c *gin.Context, info *relaycommon.RelayInfo, query *request.Query) {
-	if info.ChannelType != constant.ChannelTypeCodex {
-		return
-	}
-
-	alphaInfo := *info
-	channelMeta := *info.ChannelMeta
-	alphaInfo.ChannelMeta = &channelMeta
-	alphaInfo.RelayMode = relayconstant.RelayModeAlphaSearch
-	if err := helper.ModelMappedHelper(c, &alphaInfo, nil); err != nil {
-		logger.LogWarn(c.Request.Context(), "moonshot service: resolve Codex model for channel %d: %v", info.ChannelId, err)
-		return
-	}
-	model := strings.TrimSpace(alphaInfo.UpstreamModelName)
-	if !alphaInfo.IsModelMapped || model == "" || model == constant.ToolsSearchModel {
-		return
-	}
-
-	target, prepare, err := channelUpstream(c, &alphaInfo)
-	if err != nil {
-		logger.LogWarn(c.Request.Context(), "moonshot service: prepare Codex Alpha search for channel %d: %v", info.ChannelId, err)
-		return
-	}
-	query.Model, query.Endpoint, query.Prepare = model, target, prepare
-}
-
 func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel abstract.ChannelContext, request_ *dto.MoonshotServiceRequest) *types.NewAPIError {
 	query := request.Query{
 		Contract: abstract.ContractMoonshotFetch,
 		URL:      request_.URL,
 	}
+	if apiErr := prepareWebsearchAttempt(c, info, &query); apiErr != nil {
+		return apiErr
+	}
 	websearch.LogCandidates(c.Request.Context(), channel, query.Contract)
 
 	answer, err := websearch.Fetch(c.Request.Context(), channel, query)
+	recordWebsearchResult(info, query.Contract, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			appmetrics.ObserveMoonshotServiceRequest(
@@ -168,37 +158,32 @@ func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel a
 			)
 			return types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
-		moonshotServiceRefund(c, info, moonshotServiceOperationFetch, moonshotServiceOutcomeError, false)
 		if errors.Is(err, websearch.ErrEmptyContent) {
+			moonshotServiceRefund(c, info, moonshotServiceOperationFetch, moonshotServiceOutcomeEmpty, false)
 			// The page answered but held no extractable text, which is a real
 			// answer about a page that is empty rather than a failure to reach it.
 			writeMoonshotServicePage(c, "")
 			return nil
 		}
-		logger.LogWarn(c.Request.Context(), "moonshot service fetch failed for %q: %v", request_.URL, err)
-		// A target that answered with its own status keeps it: the caller then
-		// tells a mistyped URL from a host that could not be reached, which both
-		// used to read as the same gateway error.
-		if status, answered := request.FetchAnswerStatus(err); answered {
-			return types.NewErrorWithStatusCode(
-				err,
-				types.ErrorCodeBadResponseStatusCode,
-				status,
-				types.ErrOptionWithSkipRetry(),
-			)
+		appmetrics.ObserveMoonshotServiceRequest(moonshotServiceOperationFetch, moonshotServiceOutcomeError, moonshotServiceCacheLabel(false))
+		status, answered := request.FetchAnswerStatus(err)
+		logger.LogWarn(c.Request.Context(), "moonshot service fetch failed")
+		if !answered {
+			status = http.StatusBadGateway
 		}
-		// The page could not be read at all. Answering 200 with an empty body
-		// would tell the client the page is empty, which is a different fact, so
-		// the failure is reported the way every other upstream failure is.
-		return types.NewErrorWithStatusCode(
-			err,
-			types.ErrorCodeBadResponseStatusCode,
-			http.StatusBadGateway,
-			types.ErrOptionWithSkipRetry(),
-		)
+		apiErr := types.NewErrorWithStatusCode(err, types.ErrorCodeBadResponseStatusCode, status, types.ErrOptionWithSkipRetry())
+		if answered {
+			service.ResetStatusCode(apiErr, c.GetString("status_code_mapping"))
+		}
+		return apiErr
 	}
 
-	if len(answer.Body) == 0 {
+	if !websearchOK(answer.StatusCode) {
+		appmetrics.ObserveMoonshotServiceRequest(moonshotServiceOperationFetch, moonshotServiceOutcomeError, moonshotServiceCacheLabel(answer.Cached))
+		return websearchStatusError(c, answer)
+	}
+
+	if strings.TrimSpace(string(answer.Body)) == "" {
 		moonshotServiceRefund(c, info, moonshotServiceOperationFetch, moonshotServiceOutcomeEmpty, answer.Cached)
 		writeMoonshotServicePage(c, "")
 		return nil
@@ -219,9 +204,10 @@ func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel a
 // server.
 func moonshotServiceRefund(c *gin.Context, info *relaycommon.RelayInfo, operation, outcome string, cached bool) {
 	appmetrics.ObserveMoonshotServiceRequest(operation, outcome, moonshotServiceCacheLabel(cached))
-	if info.Billing != nil {
-		info.Billing.Refund(c)
+	if outcome == moonshotServiceOutcomeEmpty {
+		info.ToolExecution.Outcome = "empty"
 	}
+	requestWebsearchRefund(c, info)
 }
 
 // moonshotServiceCacheLabel names where the answer came from, which is how a
@@ -231,13 +217,6 @@ func moonshotServiceCacheLabel(cached bool) string {
 		return moonshotServiceCacheHit
 	}
 	return moonshotServiceCacheMiss
-}
-
-// emptySearchBody reports an answer that carries no hit. The renderer writes an
-// empty results array rather than an error, so the emptiness is read from the
-// rendered document, which is the same document the client reads.
-func emptySearchBody(body []byte) bool {
-	return len(body) <= len(emptyMoonshotSearchBody)
 }
 
 func writeMoonshotServiceBody(c *gin.Context, answer websearch.Answer, fallbackContentType string) {

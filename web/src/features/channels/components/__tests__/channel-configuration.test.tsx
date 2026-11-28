@@ -156,6 +156,39 @@ beforeEach(() => {
     },
   })
   vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url === '/api/channel/tool_capabilities') {
+      const operation = (supported: boolean, mapping: string[] = []) => ({
+        supported,
+        native_contracts: [],
+        mapping_required_contracts: mapping,
+      })
+      return {
+        data: {
+          success: true,
+          data: {
+            channel_types: {
+              43: {
+                provider: 'deepseek',
+                search: operation(true),
+                fetch: operation(true),
+              },
+              57: {
+                provider: 'codex',
+                search: operation(true, ['tools/search']),
+                fetch: operation(false),
+              },
+            },
+            fallbacks: [
+              {
+                provider: 'local',
+                search: operation(false),
+                fetch: operation(true),
+              },
+            ],
+          },
+        },
+      }
+    }
     if (url === '/api/channel/42') {
       return { data: { success: true, data: editingChannel } }
     }
@@ -2366,6 +2399,216 @@ test('closing an edited channel retains its left exit direction after the parent
   }
 })
 
+test('enabling catalogue search by keyboard adds only tools-search when the channel is saved', async () => {
+  editingChannel.type = 43
+  editingChannel.models = 'custom-model,tools-fetch'
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  const toggle = screen.getByRole('switch', {
+    name: 'Enable search middleware',
+  })
+  expect(toggle).not.toBeChecked()
+  toggle.focus()
+  await user.keyboard(' ')
+  expect(toggle).toBeChecked()
+  expect(put).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() =>
+    expect(put).toHaveBeenCalledWith(
+      '/api/channel/',
+      expect.objectContaining({
+        models: 'custom-model,tools-fetch,tools-search',
+      }),
+      expect.anything()
+    )
+  )
+})
+
+test('disabling search keeps its reusable mapping, fetch and unrelated mappings without a prompt to re-add search', async () => {
+  editingChannel.type = 57
+  editingChannel.models = 'tools-search,tools-fetch,custom-model'
+  editingChannel.model_mapping =
+    '{"tools-search":"search-upstream","tools-fetch":"fetch-upstream","custom-model":"other-upstream"}'
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  const toggle = screen.getByRole('switch', {
+    name: 'Enable search middleware',
+  })
+  expect(toggle).toBeChecked()
+  await user.click(toggle)
+  expect(toggle).not.toBeChecked()
+  expect(
+    screen.queryByRole('button', { name: 'Map search model' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  expect(
+    screen.queryByRole('button', { name: 'Add missing models' })
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() =>
+    expect(put).toHaveBeenCalledWith(
+      '/api/channel/',
+      expect.objectContaining({
+        models: 'tools-fetch,custom-model',
+        model_mapping: editingChannel.model_mapping,
+      }),
+      expect.anything()
+    )
+  )
+})
+
+test('saving another edit preserves channel tools when the capability endpoint fails', async () => {
+  editingChannel.type = 43
+  editingChannel.models = 'custom-model,tools-search,tools-fetch'
+  editingChannel.setting = JSON.stringify({
+    websearch_provider: 'deepseek',
+    websearch_cache_ttl_seconds: -1,
+    websearch_fetch_cache_ttl_seconds: 0,
+  })
+  const get = vi.mocked(api.get).getMockImplementation()
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/channel/tool_capabilities') {
+      return { data: { success: false, message: 'Unavailable' } }
+    }
+    return get?.(url, config)
+  })
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  const name = await screen.findByDisplayValue('Existing channel')
+  expect(
+    await screen.findByText('Channel tool capabilities are unavailable.')
+  ).toBeVisible()
+  await user.type(name, ' edited')
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/channel/tool_capabilities',
+    expect.anything()
+  )
+  const payload = put.mock.calls[0]?.[1] as {
+    name: string
+    models: string
+    setting: string
+  }
+  expect(payload.name).toBe('Existing channel edited')
+  expect(payload.models).toBe(editingChannel.models)
+  expect(JSON.parse(payload.setting)).toMatchObject(
+    JSON.parse(editingChannel.setting)
+  )
+})
+
+test('Codex search requires an inline upstream mapping before saving', async () => {
+  editingChannel.type = 57
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+  await user.click(screen.getByRole('tab', { name: 'JSON' }))
+  await user.click(screen.getByRole('tab', { name: /Connection & Models/ }))
+  await user.click(
+    screen.getByRole('switch', { name: 'Enable search middleware' })
+  )
+  const upstream = screen.getByRole('textbox', {
+    name: 'Codex upstream search model',
+  })
+  expect(upstream).toHaveValue('')
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+  await waitFor(() =>
+    expect(upstream).toHaveAccessibleDescription(
+      /Enter a valid upstream model for Codex search/
+    )
+  )
+  expect(upstream).toHaveAttribute('aria-invalid', 'true')
+  expect(put).not.toHaveBeenCalled()
+  await user.type(upstream, 'operator-selected-model')
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  const payload = put.mock.calls[0]?.[1] as {
+    models: string
+    model_mapping: string
+  }
+  expect(payload.models).toBe('custom-model,tools-search')
+  expect(JSON.parse(payload.model_mapping)).toEqual({
+    'tools-search': 'operator-selected-model',
+  })
+})
+
+test('ordinary presets, clearing and pasted models do not change tool capabilities', async () => {
+  editingChannel.type = 43
+  const originalGet = vi.mocked(api.get).getMockImplementation()
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/channel/models') {
+      return {
+        data: {
+          success: true,
+          data: [
+            { id: 'tools-search' },
+            { id: 'tools-fetch' },
+            { id: 'preset-model' },
+          ],
+        },
+      }
+    }
+    return originalGet?.(url, config)
+  })
+  const put = vi
+    .spyOn(api, 'put')
+    .mockResolvedValue({ data: { success: true } })
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+
+  const toggle = screen.getByRole('switch', {
+    name: 'Enable search middleware',
+  })
+  const preset = screen.getByRole('button', { name: 'Fill Related Models' })
+  await waitFor(() => expect(preset).toBeEnabled())
+  await user.click(preset)
+  expect(toggle).not.toBeChecked()
+  const fetchToggle = screen.getByRole('switch', { name: 'Enable web fetch' })
+  expect(fetchToggle).not.toBeChecked()
+  await user.click(toggle)
+  await user.click(preset)
+  expect(toggle).toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Clear All' }))
+  expect(toggle).toBeChecked()
+  const modelInput = screen.getByRole('combobox', {
+    name: 'Select models or add custom ones',
+  })
+  await user.click(modelInput)
+  await user.paste('tools-search,tools-fetch,manual-model')
+  await user.keyboard('{Escape}')
+  expect(toggle).toBeChecked()
+  expect(fetchToggle).not.toBeChecked()
+  await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+
+  await waitFor(() => expect(put).toHaveBeenCalled())
+  expect(put.mock.calls[0]?.[1]).toMatchObject({
+    models: 'manual-model,tools-search',
+  })
+})
+
 test('the model list summarizes redirects, counts them on the routing tab, and jumps to the mapping editor', async () => {
   editingChannel = {
     ...editingChannel,
@@ -2574,6 +2817,38 @@ test('on wide screens redirecting a fetched model opens the floating panel besid
   expect(
     screen.getByRole('combobox', { name: 'Request Model Name' })
   ).toHaveValue('upstream')
+})
+
+test('syncing another mapping in the floating editor does not re-enable search', async () => {
+  useWideScreen()
+  editingChannel.type = 43
+  editingChannel.models = 'custom-model,tools-search'
+  editingChannel.model_mapping = '{"tools-search":"search-upstream"}'
+  const user = userEvent.setup()
+  render(<ConfigurationHarness currentRow={editingChannel} />)
+  await screen.findByDisplayValue('Existing channel')
+  const toggle = screen.getByRole('switch', {
+    name: 'Enable search middleware',
+  })
+  await user.click(toggle)
+  await user.click(screen.getByRole('button', { name: 'Fetch from Upstream' }))
+  await screen.findByRole('checkbox', { name: 'upstream-model' })
+
+  await user.click(
+    screen.getByRole('button', { name: 'Redirect upstream-model' })
+  )
+  const panel = within(
+    await screen.findByRole('complementary', { name: 'Model redirects' })
+  )
+  const request = panel.getAllByRole('combobox', {
+    name: 'Request Model Name',
+  })[1]
+  await waitFor(() => expect(request).toHaveFocus())
+  await user.type(request, 'another-alias')
+  await user.keyboard('{Enter}')
+
+  expect(screen.getByRole('button', { name: 'another-alias' })).toBeVisible()
+  expect(toggle).not.toBeChecked()
 })
 
 test.each(['current session', 'saved preference'])(

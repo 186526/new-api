@@ -10,7 +10,9 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -126,4 +128,81 @@ func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(
 	assert.Equal(t, 2102, second.Id)
 	assert.Equal(t, "default", selectedGroup)
 	assert.Equal(t, "default", common.GetContextKeyString(ctx, constant.ContextKeyAutoGroup))
+}
+
+func applyWebSearchGroupPolicies(t *testing.T, raw string) {
+	t.Helper()
+	key := websearch_setting.GroupPoliciesOptionKey
+	previous := websearch_setting.Get().GroupPolicies
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{key: previous}))
+		require.NoError(t, websearch_setting.UpdateAndSync())
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{key: raw}))
+	require.NoError(t, websearch_setting.UpdateAndSync())
+}
+
+func TestWebSearchGroupPoliciesPreferOnlyAcrossSelectionStores(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "tools-search"
+	createChannelSelectAutoGroupsChannel(t, db, 2201, "default", modelName)
+	createChannelSelectAutoGroupsChannel(t, db, 2202, "default", modelName)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 2202).Update("type", constant.ChannelTypeDeepSeek).Error)
+	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", 2201).Update("priority", 9).Error)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 2201).Update("priority", 9).Error)
+	model.InitChannelCache()
+	for _, memory := range []bool{true, false} {
+		common.MemoryCacheEnabled = memory
+		for _, rule := range []struct {
+			mode, provider string
+			want           int
+		}{
+			{"prefer", "deepseek", 2202}, {"only", "deepseek", 2202}, {"only", "codex", 0},
+		} {
+			applyWebSearchGroupPolicies(t, fmt.Sprintf(`{"default":{"tools/search":{"mode":%q,"providers":[%q]}}}`, rule.mode, rule.provider))
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			param := &RetryParam{Ctx: ctx, TokenGroup: "default", ModelName: modelName, RequestPath: "/v1/tools/search"}
+			channel, _, err := CacheGetRandomSatisfiedChannel(param)
+			require.NoError(t, err)
+			if rule.want == 0 {
+				require.Nil(t, channel)
+			} else {
+				require.NotNil(t, channel)
+				require.Equal(t, rule.want, channel.Id)
+			}
+		}
+	}
+}
+
+func TestWebSearchGroupPoliciesRespectAutoPermissionsAndRetries(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "tools-search"
+	createChannelSelectAutoGroupsChannel(t, db, 2103, "vip", modelName)
+	createChannelSelectAutoGroupsChannel(t, db, 2104, "default", modelName)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", 2104).Update("type", constant.ChannelTypeDeepSeek).Error)
+	createChannelSelectAutoGroupsChannel(t, db, 2105, "private", modelName)
+	model.InitChannelCache()
+	applyWebSearchGroupPolicies(t, `{"vip":{"tools/search":{"mode":"disabled"}},"default":{"tools/search":{"mode":"prefer","providers":["exa"]}}}`)
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/tools/search", nil)
+	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+	common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "auto")
+	common.SetContextKey(ctx, constant.ContextKeyTokenAutoGroups, []string{"private", "vip", "default"})
+	common.SetContextKey(ctx, constant.ContextKeyTokenCrossGroupRetry, true)
+	param := &RetryParam{Ctx: ctx, TokenGroup: "auto", ModelName: modelName, RequestPath: ctx.Request.URL.Path}
+	channel, group, selectErr := SelectChannelForRequest(ctx, modelName, param)
+	require.Nil(t, selectErr)
+	require.NotNil(t, channel)
+	assert.Equal(t, 2104, channel.Id)
+	assert.Equal(t, "default", group)
+	assert.Equal(t, []string{"exa"}, WebSearchPreferredProviders(ctx))
+
+	common.SetContextKey(ctx, constant.ContextKeyTokenAutoGroups, []string{"default", "vip", "private"})
+	common.SetContextKey(ctx, constant.ContextKeyAutoGroupIndex, 1)
+	param.SetRetry(1)
+	channel, _, err := CacheGetRandomSatisfiedChannel(param)
+	require.ErrorIs(t, err, ErrWebSearchGroupDisabled)
+	assert.Nil(t, channel)
 }

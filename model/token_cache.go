@@ -20,10 +20,12 @@ func (token Token) cacheMAC() (string, error) {
 		token.AllowIps = nil
 	}
 	return authCacheMAC(key, struct {
-		Token          Token
-		AutoGroups     string
-		CacheExpiresAt int64
-	}{token, token.AutoGroups, token.CacheExpiresAt})
+		Token            Token
+		AutoGroups       string
+		CacheExpiresAt   int64
+		RedactionEnabled bool
+		RedactionConfig  string
+	}{token, token.AutoGroups, token.CacheExpiresAt, token.RedactionEnabled, token.RedactionConfig})
 }
 
 func getTokenCacheKey(key string) string {
@@ -73,6 +75,7 @@ func invalidateTokenCacheForMutation(key string) error {
 // republish produced, because the row's own balance is the pre-debit one under
 // batch accumulation.
 var errTokenCacheNeedsRepair = errors.New("token cache carries no signed quota ledger")
+var errTokenCacheIntegrity = errors.New("token cache integrity check failed")
 
 // cacheInitToken publishes database metadata when the hash is cold or fails
 // verification. Existing quota counters survive repairs because pre-consume
@@ -213,7 +216,8 @@ redis.call('HSET', KEYS[1],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'AllowUserQuotaQuery', ARGV[17],
-  'CacheExpiresAt', ARGV[19], 'CacheMAC', ARGV[20])
+  'CacheExpiresAt', ARGV[19], 'CacheMAC', ARGV[20],
+  'RedactionEnabled', ARGV[25], 'RedactionConfig', ARGV[26])
 -- UsedQuota is filled with the counter the seed signs, not the snapshot's. The
 -- two differ when the hash vanished while a batch debit was still queued: Go
 -- raises the signed used counter by the delta the accumulator owes, which the
@@ -273,6 +277,7 @@ return 1`
 		tokenCacheTTLSeconds(),
 		token.CacheExpiresAt, mac, strconv.FormatBool(repair), existing.CacheMAC,
 		string(ledgerArgs), strconv.FormatBool(liveLedgerHolds),
+		strconv.FormatBool(token.RedactionEnabled), token.RedactionConfig,
 	).Int()
 }
 
@@ -295,7 +300,7 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	token.Key = key
 	mac, err := token.cacheMAC()
 	if err != nil || !validAuthCacheMAC(mac, token.CacheMAC, token.CacheExpiresAt) {
-		return nil, fmt.Errorf("token cache integrity check failed")
+		return nil, errTokenCacheIntegrity
 	}
 	if ledger, result, ledgerErr := verifiedTokenQuotaLedger(token.Id, key); result == cacheQuotaOK && ledgerErr == nil {
 		token.RemainQuota = int(ledger.granted - ledger.used)

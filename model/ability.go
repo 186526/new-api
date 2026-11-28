@@ -105,26 +105,88 @@ func getChannelQuery(group string, model string, retry int) (*gorm.DB, error) {
 	return channelQuery, nil
 }
 
+type ChannelRouteAbility struct {
+	Channel  *Channel
+	Model    string
+	Priority int64
+	Weight   uint
+}
+
+func (ability Ability) ChannelRoute(channel *Channel, memory bool) ChannelRouteAbility {
+	route := ChannelRouteAbility{Channel: channel, Model: ability.Model, Weight: ability.Weight}
+	if memory {
+		route.Priority, route.Weight = channel.GetPriority(), uint(channel.GetWeight())
+	} else if ability.Priority != nil {
+		route.Priority = *ability.Priority
+	}
+	return route
+}
+
+func databaseChannelRouteAbilities(group string, models []string) ([]ChannelRouteAbility, error) {
+	var abilities []Ability
+	err := DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+		Where("model IN ? and enabled = ?", models, true).
+		Order("priority DESC, weight DESC").Find(&abilities).Error
+	if err != nil || len(abilities) == 0 {
+		return nil, err
+	}
+	ids := lo.Uniq(lo.Map(abilities, func(ability Ability, _ int) int { return ability.ChannelId }))
+	channels, err := GetChannelsByIds(ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[int]*Channel, len(channels))
+	for _, channel := range channels {
+		byID[channel.Id] = channel
+	}
+	routes := make([]ChannelRouteAbility, 0, len(abilities))
+	for _, ability := range abilities {
+		if channel := byID[ability.ChannelId]; channel != nil {
+			routes = append(routes, ability.ChannelRoute(channel, false))
+		}
+	}
+	return routes, nil
+}
+
 func GetChannel(
 	group string,
 	model string,
 	retry int,
 	filters []dto.ChannelFilter,
+	accept ...func(*Channel) bool,
 ) (*Channel, error) {
-	var abilities []Ability
-	err := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true).Order("priority DESC, weight DESC").Find(&abilities).Error
-	if err != nil {
-		return nil, err
-	}
-	abilities = filterAbilitiesByConstraints(abilities, model, filters)
-	// Like the memory cache, retry with the routing name (for example without
-	// @ modifiers) when no channel serves the exact name.
-	if normalized := ratio_setting.RoutingMatchModelName(model); len(abilities) == 0 && normalized != "" && normalized != model {
-		err = DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, normalized, true).Order("priority DESC, weight DESC").Find(&abilities).Error
+	eligible := func(name string) ([]Ability, error) {
+		var abilities []Ability
+		err := DB.Where(clause.Eq{Column: clause.Column{Name: "group"}, Value: group}).
+			Where("model = ? and enabled = ?", name, true).
+			Order("priority DESC, weight DESC").Find(&abilities).Error
 		if err != nil {
 			return nil, err
 		}
 		abilities = filterAbilitiesByConstraints(abilities, model, filters)
+		if len(accept) == 0 || len(abilities) == 0 {
+			return abilities, nil
+		}
+		ids := lo.Map(abilities, func(ability Ability, _ int) int { return ability.ChannelId })
+		channels, err := GetChannelsByIds(ids)
+		if err != nil {
+			return nil, err
+		}
+		accepted := make(map[int]bool, len(channels))
+		for _, channel := range channels {
+			accepted[channel.Id] = acceptsChannel(channel, accept)
+		}
+		return lo.Filter(abilities, func(ability Ability, _ int) bool { return accepted[ability.ChannelId] }), nil
+	}
+	abilities, err := eligible(model)
+	if err != nil {
+		return nil, err
+	}
+	if normalized := ratio_setting.RoutingMatchModelName(model); len(abilities) == 0 && normalized != "" && normalized != model {
+		abilities, err = eligible(normalized)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(abilities) > 0 {
 		priorities := make([]int64, 0)

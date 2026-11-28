@@ -23,7 +23,6 @@ import { ToolsProxySettingsSection } from '../integrations/tools-proxy-settings-
 import { WorkerSettingsSection } from '../integrations/worker-settings-section'
 import { LogSettingsSection } from '../maintenance/log-settings-section'
 import { PerformanceSection } from '../maintenance/performance-section'
-import { UpdateCheckerSection } from '../maintenance/update-checker-section'
 import type { OperationsSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
 
@@ -108,6 +107,8 @@ const OPERATIONS_SECTIONS = [
             settings['websearch_setting.candidate_order'],
           'websearch_setting.native_first':
             settings['websearch_setting.native_first'],
+          'websearch_setting.builtin_fallback_enabled':
+            settings['websearch_setting.builtin_fallback_enabled'],
           'websearch_setting.search_cache_ttl_seconds':
             settings['websearch_setting.search_cache_ttl_seconds'],
           'websearch_setting.fetch_cache_ttl_seconds':
@@ -171,28 +172,13 @@ const OPERATIONS_SECTIONS = [
       />
     ),
   },
-  {
-    id: 'update-checker',
-    titleKey: 'System maintenance',
-    build: (
-      _settings: OperationsSettings,
-      currentVersion?: string | null,
-      startTime?: number | null
-    ) => (
-      <UpdateCheckerSection
-        currentVersion={currentVersion}
-        startTime={startTime}
-      />
-    ),
-  },
 ] as const
 
 export type OperationsSectionId = (typeof OPERATIONS_SECTIONS)[number]['id']
 
 const operationsRegistry = createSectionRegistry<
   OperationsSectionId,
-  OperationsSettings,
-  [string | null | undefined, number | null | undefined]
+  OperationsSettings
 >({
   sections: OPERATIONS_SECTIONS,
   defaultSection: 'behavior',

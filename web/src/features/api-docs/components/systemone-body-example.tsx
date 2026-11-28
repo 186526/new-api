@@ -18,10 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
-import {
-  CodeBlock,
-  CodeBlockCopyButton,
-} from '@/components/ai-elements/code-block'
+import { DocsCode } from './docs-code'
 
 const SYSTEM_ONE_BODY = {
   model: 'jev-latest',
@@ -54,17 +51,17 @@ export function SystemOneBodyExample() {
   const { t } = useTranslation()
 
   return (
-    <div className='mt-4'>
-      <p className='text-muted-foreground mb-2 text-xs font-medium tracking-wide uppercase'>
-        {t('apiDocs.systemone.bodyTitle', { defaultValue: 'Request body' })}
-      </p>
-      <CodeBlock
+    <div className='flex min-w-0 flex-col gap-3'>
+      <DocsCode
         code={JSON.stringify(SYSTEM_ONE_BODY, null, 2)}
-        language='json'
-      >
-        <CodeBlockCopyButton />
-      </CodeBlock>
-      <ul className='text-muted-foreground mt-2 list-disc space-y-1 pl-5 text-xs'>
+        title={t('apiDocs.systemone.bodyTitle', {
+          defaultValue: 'Request body',
+        })}
+        copyLabel={t('apiDocs.systemone.copyBody', {
+          defaultValue: 'Copy request body',
+        })}
+      />
+      <ul className='text-muted-foreground flex list-disc flex-col gap-1 ps-5 text-sm'>
         <li>
           {t('apiDocs.systemone.fieldModel', {
             defaultValue: 'model: a jev-* decision model.',

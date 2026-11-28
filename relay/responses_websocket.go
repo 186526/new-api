@@ -27,6 +27,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/redaction"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -182,7 +183,6 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 }
 
 func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []byte, envelope responsesWSCreateEvent, streamID string, requestID string) {
-	create, parseErr := normalizeResponsesWSCreateEvent(message, envelope, streamID)
 	var apiErr *types.NewAPIError
 	var upstreamURLs []string
 	defer func() {
@@ -223,8 +223,32 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 	request.ContentLength = int64(len(message))
 	request.Header.Set("Content-Type", "application/json")
 	apiErr = s.runner(request, requestID, func(c *gin.Context) *types.NewAPIError {
-		if parseErr != nil {
-			return newResponsesWSInvalidRequestError(parseErr)
+		protected := redaction.IsProtectedRequest(c.Request.Context())
+		if protected {
+			var err error
+			message, err = io.ReadAll(c.Request.Body)
+			if err != nil {
+				return newResponsesWSInvalidRequestError(errors.New("could not read protected websocket request"))
+			}
+			envelope, streamID, err = parseResponsesWSEnvelope(message)
+			if err != nil {
+				return newResponsesWSInvalidRequestError(errors.New("invalid protected websocket event"))
+			}
+		}
+		create, err := normalizeResponsesWSCreateEvent(message, envelope, streamID)
+		if err != nil {
+			if protected {
+				err = errors.New("invalid protected response.create request")
+			}
+			return newResponsesWSInvalidRequestError(err)
+		}
+		if protected {
+			if len(create.Generate) != 0 && string(create.Generate) != "true" && string(create.Generate) != "false" {
+				return newResponsesWSInvalidRequestError(errors.New("generate must be a boolean on a protected websocket request"))
+			}
+			if err := middleware.CheckProtectedControlIdentifiers(c, create.StreamID, create.Request.PreviousResponseID); err != nil {
+				return newResponsesWSInvalidRequestError(errors.New("response.create identifiers cannot be sent under the request protection policy"))
+			}
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(create.Body))
 		c.Request.ContentLength = int64(len(create.Body))
@@ -277,19 +301,37 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())
 	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 
+	var preprocessing *RequestPreprocessing
+	preparePayload := func() ([]byte, *types.NewAPIError) {
+		restore, err := preprocessing.ApplyForAttempt(c, info)
+		if err != nil {
+			return nil, err
+		}
+		defer restore()
+		return buildResponsesWSCreatePayload(c, info, *info.Request.(*dto.OpenAIResponsesRequest), create.Generate, create.StreamID)
+	}
+	prepareBilling := func() *types.NewAPIError {
+		info = relaycommon.GenRelayInfoResponses(c, &create.Request)
+		info.IsStream = true
+		common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
+		preprocessing = NewRequestPreprocessing(info)
+		return PrepareRequestBilling(c, info)
+	}
+	defer func() {
+		if preprocessing != nil {
+			preprocessing.Close()
+		}
+	}()
 	if s.lockedChannelID != 0 {
 		if apiErr = s.restoreConnectionContext(c, modelName); apiErr != nil {
 			return apiErr
 		}
-		info = relaycommon.GenRelayInfoResponses(c, &create.Request)
-		info.IsStream = true
-		common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
-		if apiErr = PrepareRequestBilling(c, info); apiErr != nil {
+		if apiErr = prepareBilling(); apiErr != nil {
 			return apiErr
 		}
 		billingPrepared = true
 		var payload []byte
-		payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
+		payload, apiErr = preparePayload()
 		if apiErr != nil {
 			return apiErr
 		}
@@ -297,9 +339,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			state.closeCode = websocket.CloseInternalServerErr
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
+		info.AutoReasoning.ObserveOutboundJSON(payload)
+		info.ImageCompression.ObserveOutboundJSON(payload, types.RelayFormatOpenAIResponses)
 	} else {
 		retry := &service.RetryParam{Ctx: c, TokenGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), ModelName: modelName, RequestPath: c.Request.URL.Path, Retry: common.GetPointer(0)}
 		for ; retry.GetRetry() <= common.RetryTimes; retry.IncreaseRetry() {
+			if info != nil {
+				ResetRequestAttemptObservations(info)
+			}
 			var channel *appmodel.Channel
 			channel, apiErr = selectResponsesWSChannel(c, modelName, retry)
 			if apiErr != nil {
@@ -307,10 +354,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			}
 			service.AppendUsedChannel(c, channel.Id)
 			if info == nil {
-				info = relaycommon.GenRelayInfoResponses(c, &create.Request)
-				info.IsStream = true
-				common.SetContextKey(c, appconstant.ContextKeyIsStream, true)
-				if apiErr = PrepareRequestBilling(c, info); apiErr != nil {
+				if apiErr = prepareBilling(); apiErr != nil {
 					return apiErr
 				}
 				billingPrepared = true
@@ -323,7 +367,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			info.RetryIndex = retry.GetRetry()
 			policy.BeginAttempt(channel, info.UsingGroup)
 			var payload []byte
-			payload, apiErr = buildResponsesWSCreatePayload(c, info, create.Request, create.Generate, create.StreamID)
+			payload, apiErr = preparePayload()
 			if apiErr != nil {
 				return apiErr
 			}
@@ -349,6 +393,8 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				state.closeCode = websocket.CloseInternalServerErr
 				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
+			info.AutoReasoning.ObserveOutboundJSON(payload)
+			info.ImageCompression.ObserveOutboundJSON(payload, types.RelayFormatOpenAIResponses)
 			s.lockedModel, s.lockedChannelID, s.lockedGroup = modelName, channel.Id, info.UsingGroup
 			s.lockedKey, s.lockedKeyIndex = info.ApiKey, info.ChannelMultiKeyIndex
 			s.lockedRoute, _ = channel.GetOtherSettings().AdvancedCustom.MatchPathForModel(c.Request.URL.Path, modelName)
@@ -375,6 +421,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		}
 	}
 
+	restorer := middleware.NewResponseRedaction(c, redaction.Responses)
 	accumulator := service.NewResponsesUsageAccumulator(info)
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	info.StreamStatus.RequireTerminal()
@@ -386,7 +433,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	idle := time.NewTimer(timeout)
 	defer idle.Stop()
 	accepted := false
-	var pendingControl []byte
+	var pendingControl *responsesWSControl
 	var sentControl []byte
 	var responseID string
 	for {
@@ -475,6 +522,8 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					}
 				}
 				accumulator.Observe(&event.ResponsesStreamResponse, incoming.body)
+				// Usage and request routing must see the original upstream frame.
+				incoming = restoreResponsesWSClientFrame(restorer, incoming, event.Type)
 			}
 			switch event.Type {
 			case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
@@ -490,10 +539,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			if accepted && pendingControl != nil {
-				if err := s.writeTarget(websocket.TextMessage, pendingControl); err != nil {
-					s.shutdown(websocket.CloseInternalServerErr, "")
-				}
-				sentControl = pendingControl
+				sentControl = s.forwardControl(c, create.StreamID, responseID, *pendingControl)
 				pendingControl = nil
 			}
 		case control := <-state.controls:
@@ -502,13 +548,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				continue
 			}
 			if !accepted {
-				pendingControl = control.body
+				pendingControl = &control
 				continue
 			}
-			if err := s.writeTarget(websocket.TextMessage, control.body); err != nil {
-				s.shutdown(websocket.CloseInternalServerErr, "")
-			}
-			sentControl = control.body
+			sentControl = s.forwardControl(c, create.StreamID, responseID, control)
 		case <-idle.C:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)
 			state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream response timed out"
@@ -520,6 +563,31 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			return nil
 		}
 	}
+}
+
+func (s *responsesWSSession) forwardControl(c *gin.Context, streamID, responseID string, control responsesWSControl) []byte {
+	body := control.body
+	protected := redaction.IsProtectedRequest(c.Request.Context())
+	if !protected {
+		policy, err := appmodel.GetTokenRedaction(c.GetInt("token_id"))
+		if err != nil || policy.RedactionEnabled {
+			s.sendError(control.eventID, control.streamID, newResponsesWSInvalidRequestError(errors.New("response.cancel is unavailable under the current request protection policy")))
+			return nil
+		}
+	}
+	if protected {
+		var err error
+		body, err = protectedResponsesWSCancel(body, streamID, responseID, responsesWSControlIDCheck(c))
+		if err != nil {
+			s.sendError(control.eventID, control.streamID, newResponsesWSInvalidRequestError(err))
+			return nil
+		}
+	}
+	if err := s.writeTarget(websocket.TextMessage, body); err != nil {
+		s.shutdown(websocket.CloseInternalServerErr, "")
+		return nil
+	}
+	return body
 }
 
 // A single generation is active, but a cancel can fail independently. Correlate
@@ -631,6 +699,11 @@ func buildResponsesWSCreatePayload(c *gin.Context, info *relaycommon.RelayInfo, 
 	event, err := buildResponsesWSCreateEvent(jsonData, generate, streamID)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	if redaction.IsProtectedRequest(c.Request.Context()) {
+		if err := protectedResponsesWSCreateIDs(event, responsesWSControlIDCheck(c)); err != nil {
+			return nil, newResponsesWSInvalidRequestError(err)
+		}
 	}
 	return event, nil
 }

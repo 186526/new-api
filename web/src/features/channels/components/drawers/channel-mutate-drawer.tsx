@@ -106,6 +106,7 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { SecureVerificationDialog } from '@/features/auth/secure-verification'
 import { PluginIcon } from '@/features/task-plugins/components/plugin-icon'
+import { RouteSimulator } from '@/features/tools-api/components/RouteSimulator'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { useHiddenClickUnlock } from '@/hooks/use-hidden-click-unlock'
 import {
@@ -131,6 +132,7 @@ import {
   getAllModels,
   getChannel,
   getChannelDefaultBaseURLs,
+  getChannelToolCapabilities,
   getGroups,
   getPrefillGroups,
   getTaskPluginOptions,
@@ -170,7 +172,7 @@ import {
 import {
   CHANNEL_FORM_DEFAULT_VALUES,
   CHANNEL_TYPE_ADVANCED_CUSTOM,
-  channelFormSchema,
+  createChannelFormSchema,
   channelsQueryKeys,
   getAdvancedCustomStats,
   transformChannelToFormDefaults,
@@ -208,15 +210,22 @@ import {
   assessBaseUrlTrust,
   nextTaskPluginBaseUrl,
 } from '../../lib/task-plugin-base-url'
-import { supportsWebSearchSettings } from '../../lib/websearch-setting'
+import {
+  CODEX_SEARCH_MAPPING_REQUIRED,
+  isToolModel,
+  preserveToolModels,
+  getChannelToolAvailability,
+} from '../../lib/websearch-setting'
 import type { Channel } from '../../types'
 import { BalanceSourceSetting } from '../balance-source-setting'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelQuickOptions } from '../channel-quick-options'
+import { ChannelToolBadges } from '../channel-tool-badges'
 import { ChannelTypeLogo } from '../channel-type-badge'
 import { useChannels } from '../channels-provider'
 import { AdvancedCustomEditorDialog } from '../dialogs/advanced-custom-editor-dialog'
 import { ConfigureModelsDialog } from '../dialogs/configure-models-dialog'
+import { CustomToolsControl } from '../dialogs/custom-tools-dialog'
 import {
   MissingModelsConfirmationDialog,
   type MissingModelsAction,
@@ -527,6 +536,19 @@ export function ChannelMutateDrawer({
     null
   )
 
+  const { data: toolCatalog, isError: toolCatalogFailed } = useQuery({
+    queryKey: ['channels', 'tool-capabilities'],
+    queryFn: ({ signal }) => getChannelToolCapabilities(signal),
+    enabled: open,
+    staleTime: 5 * 60_000,
+    retry: false,
+    meta: { errorToast: false },
+  })
+  const toolAwareSchema = useMemo(
+    () => createChannelFormSchema(toolCatalog),
+    [toolCatalog]
+  )
+
   const { data: defaultBaseURLs } = useQuery({
     queryKey: channelsQueryKeys.defaultBaseURLs(),
     // Optional hints must not trigger the global error-page redirect.
@@ -581,7 +603,7 @@ export function ChannelMutateDrawer({
 
   // Form setup
   const form = useForm<ChannelFormValues>({
-    resolver: zodResolver(channelFormSchema),
+    resolver: zodResolver(toolAwareSchema),
     defaultValues: CHANNEL_FORM_DEFAULT_VALUES,
   })
 
@@ -730,7 +752,10 @@ export function ChannelMutateDrawer({
 
   // Get all models list
   const allModelsList = useMemo(
-    () => allModelsData?.data?.map((model) => model.id).filter(Boolean) || [],
+    () =>
+      allModelsData?.data
+        ?.map((model) => model.id)
+        .filter((model) => model && !isToolModel(model)) || [],
     [allModelsData]
   )
 
@@ -891,7 +916,8 @@ export function ChannelMutateDrawer({
   const configuration = getChannelConfigurationState(
     formValues,
     formErrors,
-    isEditing
+    isEditing,
+    toolCatalog
   )
 
   // Extract redirect models from model_mapping (target values)
@@ -936,7 +962,7 @@ export function ChannelMutateDrawer({
           entries
             .filter(
               (entry) =>
-                Boolean(entry.source) &&
+                !isToolModel(entry.source) &&
                 !currentModelsArray.includes(entry.source)
             )
             .map((entry) => entry.source)
@@ -994,16 +1020,18 @@ export function ChannelMutateDrawer({
       ...currentModelsArray,
       ...pluginExtensions.flatMap((plugin) => plugin.models),
     ])
-    return [...allModels].map((model) => {
-      const target = targetBySource.get(model)
-      return {
-        value: model,
-        label: model,
-        hint: target
-          ? t('Redirects to {{model}}', { model: target })
-          : undefined,
-      }
-    })
+    return [...allModels]
+      .filter((model) => !isToolModel(model))
+      .map((model) => {
+        const target = targetBySource.get(model)
+        return {
+          value: model,
+          label: model,
+          hint: target
+            ? t('Redirects to {{model}}', { model: target })
+            : undefined,
+        }
+      })
   }, [
     allModelsList,
     currentModelsArray,
@@ -1200,13 +1228,19 @@ export function ChannelMutateDrawer({
   // Unified function to update models
   const updateModels = useCallback(
     (newModels: string[], merge: boolean = false) => {
-      const finalModels = merge
-        ? formatModelsArray([...currentModelsArray, ...newModels])
-        : formatModelsArray(newModels)
-      form.setValue('models', finalModels)
-      return newModels.length
+      const current = form.getValues('models')
+      const ordinary = newModels.filter((model) => !isToolModel(model.trim()))
+      form.setValue(
+        'models',
+        preserveToolModels(
+          current,
+          merge ? [...parseModelsString(current), ...ordinary] : ordinary
+        ),
+        { shouldDirty: true }
+      )
+      return ordinary.length
     },
-    [currentModelsArray, form]
+    [form]
   )
 
   // Ordinary edits use the saved channel. Advanced Custom retains its existing
@@ -1285,7 +1319,6 @@ export function ChannelMutateDrawer({
     await fetchDiscoveredModels()
   }, [isEditing, canDiscoverModels, form, t, fetchDiscoveredModels])
 
-  // Handle model operations
   const handleFillRelatedModels = useCallback(() => {
     if (!basicModels.length) {
       toast.info(t('No related models available for this channel type'))
@@ -1298,9 +1331,9 @@ export function ChannelMutateDrawer({
   }, [basicModels, updateModels, t])
 
   const handleClearModels = useCallback(() => {
-    form.setValue('models', '')
+    updateModels([])
     toast.success(t('Cleared all models'))
-  }, [form, t])
+  }, [updateModels, t])
 
   const handleCopyModels = useCallback(async () => {
     const models = form.getValues('models')
@@ -1340,7 +1373,11 @@ export function ChannelMutateDrawer({
   // Handle model selection change from MultiSelect
   const handleModelsChange = useCallback(
     (selected: string[]) => {
-      form.setValue('models', selected.join(','))
+      form.setValue(
+        'models',
+        preserveToolModels(form.getValues('models'), selected),
+        { shouldDirty: true }
+      )
     },
     [form]
   )
@@ -1425,8 +1462,9 @@ export function ChannelMutateDrawer({
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
       for (const [from, to] of Object.entries(parsed)) {
         if (typeof to !== 'string' || !from.trim() || !to.trim()) continue
+        if (isToolModel(from.trim())) continue
         aliasSet.add(from.trim())
-        targetSet.add(to.trim())
+        if (!isToolModel(to.trim())) targetSet.add(to.trim())
       }
       let models = parseModelsString(form.getValues('models') || '')
       models = models.filter(
@@ -1486,14 +1524,19 @@ export function ChannelMutateDrawer({
     // Pre-existing mappings count as already synced, so opening the panel
     // never rewrites the model list on its own.
     const models = new Set(parseModelsString(form.getValues('models') || ''))
+    const entries = modelMappingGuardrail.entries.filter(
+      (entry) => !isToolModel(entry.source)
+    )
     syncedAliasesRef.current = new Set(
-      modelMappingGuardrail.entries
+      entries
         .filter((entry) => models.has(entry.source))
         .map((entry) => entry.source)
     )
     syncedTargetsRef.current = new Set(
-      modelMappingGuardrail.entries
-        .filter((entry) => !models.has(entry.target))
+      entries
+        .filter(
+          (entry) => !isToolModel(entry.target) && !models.has(entry.target)
+        )
         .map((entry) => entry.target)
     )
     setRedirectPanelOpen(true)
@@ -1612,6 +1655,7 @@ export function ChannelMutateDrawer({
     currentRow,
     isEditing,
     isMultiKeyChannel,
+    toolCatalog,
     onSuccess: handleSuccess,
   })
 
@@ -1758,7 +1802,12 @@ export function ChannelMutateDrawer({
     (errors) => {
       const field = Object.keys(errors)[0]
       if (field) {
-        setConfigurationSection(getChannelConfigurationSection(field))
+        setConfigurationSection(
+          field === 'model_mapping' &&
+            errors.model_mapping?.message === CODEX_SEARCH_MAPPING_REQUIRED
+            ? 'connection'
+            : getChannelConfigurationSection(field)
+        )
         setPendingErrorFocus(field)
       }
       toast.error(t('Please fix the highlighted fields before saving'))
@@ -2292,31 +2341,60 @@ export function ChannelMutateDrawer({
     />
   )
 
-  const websearchSettingsBlock = supportsWebSearchSettings(currentType) ? (
-    <div
-      role='group'
-      aria-label={t('Search and fetch')}
-      className={channelConfigurationBlockClassName(
-        configuration.blocks.websearchSettings,
-        'space-y-4'
-      )}
-    >
-      <CardHeading
-        status={configuration.blocks.websearchSettings}
-        title={t('Search and fetch')}
-        icon={<Settings className='size-4' />}
-      />
-      <fieldset
-        disabled={sensitiveLocked}
-        className='space-y-4 disabled:opacity-60'
+  const websearchSettingsBlock =
+    getChannelToolAvailability(currentType, toolCatalog).canConfigure ||
+    currentModelsArray.some(isToolModel) ? (
+      <div
+        role='group'
+        aria-label={t('Search and fetch')}
+        className={channelConfigurationBlockClassName(
+          configuration.blocks.websearchSettings,
+          'space-y-4'
+        )}
       >
+        <CardHeading
+          status={configuration.blocks.websearchSettings}
+          title={t('Search and fetch')}
+          icon={<Settings className='size-4' />}
+        />
+        {toolCatalogFailed && !toolCatalog && (
+          <p role='status' className='text-muted-foreground text-xs'>
+            {t('Channel tool capabilities are unavailable.')}
+          </p>
+        )}
         <WebSearchSetting
           channelType={currentType}
-          disabled={sensitiveLocked || isSubmitting}
+          toolCatalog={toolCatalog}
+          disabled={isSubmitting}
+          settingsLocked={sensitiveLocked}
         />
-      </fieldset>
-    </div>
-  ) : null
+        {open && currentType === CHANNEL_TYPE_ADVANCED_CUSTOM && (
+          <CustomToolsControl
+            key={channelId ?? 'new'}
+            channelId={channelId}
+            ready={
+              channelData?.data?.type === CHANNEL_TYPE_ADVANCED_CUSTOM &&
+              (channelData.data.base_url ?? '').trim() ===
+                (currentBaseUrl ?? '').trim()
+            }
+            disabled={isSubmitting}
+            canConfigure={canEditSensitive}
+            canVerify={hasPermission(
+              currentUser,
+              ADMIN_PERMISSION_RESOURCES.CHANNEL,
+              ADMIN_PERMISSION_ACTIONS.WRITE
+            )}
+          />
+        )}
+        {currentUser?.role === ROLE.SUPER_ADMIN && !!currentRow?.id && (
+          <RouteSimulator
+            groups={[...new Set([...(groupsData?.data ?? []), ...(currentGroups ?? [])])]}
+            selectedGroup={currentGroups?.[0] || groupsData?.data?.[0] || 'default'}
+            fixedChannelId={currentRow.id}
+          />
+        )}
+      </div>
+    ) : null
 
   const routingFields = (
     <div
@@ -3317,7 +3395,9 @@ export function ChannelMutateDrawer({
                   <FormControl>
                     <MultiSelect
                       options={modelOptions}
-                      selected={currentModelsArray}
+                      selected={currentModelsArray.filter(
+                        (model) => !isToolModel(model)
+                      )}
                       onChange={handleModelsChange}
                       placeholder={t('Select models or add custom ones')}
                       allowCreate
@@ -3326,6 +3406,9 @@ export function ChannelMutateDrawer({
                       copyChipOnClick
                     />
                   </FormControl>
+                  <div className='flex flex-wrap gap-1 empty:hidden'>
+                    <ChannelToolBadges models={currentModelsArray} />
+                  </div>
                   <div className='text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1 text-xs'>
                     <Route className='size-3.5 shrink-0' aria-hidden='true' />
                     {mappingCount > 0 && (
@@ -3368,7 +3451,9 @@ export function ChannelMutateDrawer({
                         )}
                         <ChannelPluginExtensions
                           plugins={pluginExtensions}
-                          selected={currentModelsArray}
+                          selected={currentModelsArray.filter(
+                            (model) => !isToolModel(model)
+                          )}
                           onConfigure={(pluginKey) =>
                             setModelConfiguration({ pluginKey })
                           }
@@ -3485,7 +3570,9 @@ export function ChannelMutateDrawer({
                     <div className='space-y-3'>
                       <UpstreamModelSelection
                         models={discovery.models}
-                        selected={currentModelsArray}
+                        selected={currentModelsArray.filter(
+                          (model) => !isToolModel(model)
+                        )}
                         existingModels={
                           isEditing
                             ? initialModelsRef.current
@@ -3567,6 +3654,7 @@ export function ChannelMutateDrawer({
                   )}
                 </p>
               </div>
+              {websearchSettingsBlock}
               <div className='flex flex-wrap gap-2'>
                 <Button
                   type='button'
@@ -4936,7 +5024,6 @@ export function ChannelMutateDrawer({
                 {mistralVibeAttributionFields}
               </fieldset>
             </div>
-            {websearchSettingsBlock}
             {upstreamModelDetectionFields}
             {notesFields}
           </>
@@ -5226,7 +5313,7 @@ export function ChannelMutateDrawer({
       {open && modelConfiguration && (
         <ConfigureModelsDialog
           open
-          models={currentModelsArray}
+          models={currentModelsArray.filter((model) => !isToolModel(model))}
           plugins={pluginExtensions}
           initialPluginKey={modelConfiguration.pluginKey}
           onOpenChange={(nextOpen) => {

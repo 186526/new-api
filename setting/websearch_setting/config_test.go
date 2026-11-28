@@ -65,17 +65,13 @@ func TestWebSearchSettingConfigToMapRoundTripsCandidateOrder(t *testing.T) {
 	assert.Equal(t, []string{"local", "exa"}, ProviderOrder())
 }
 
-func TestProviderOrderDropsUnknownAndDuplicateNames(t *testing.T) {
+func TestProviderOrderRejectsUnknownAndDuplicateNames(t *testing.T) {
 	saveAndRestore(t)
 
-	// Unknown names make UpdateAndSync report an error but still publish the
-	// order with those names removed, which is what the operator page shows.
-	err := apply(t, defaultSettingWith("exa, not-a-provider, local,exa,DeepSeek"))
-	require.ErrorContains(t, err, "not-a-provider")
-	assert.Equal(t, []string{"exa", "local", "deepseek"}, ProviderOrder())
-
-	err = apply(t, defaultSettingWith("  Local ,, EXA,local  "))
-	require.NoError(t, err)
+	require.NoError(t, apply(t, defaultSettingWith("  Local ,, EXA  ")))
+	assert.Equal(t, []string{"local", "exa"}, ProviderOrder())
+	require.ErrorContains(t, apply(t, defaultSettingWith("not-a-provider")), "not-a-provider")
+	require.ErrorContains(t, apply(t, defaultSettingWith("EXA,exa")), "duplicate provider")
 	assert.Equal(t, []string{"local", "exa"}, ProviderOrder())
 
 	require.NoError(t, apply(t, defaultSettingWith("")))
@@ -105,10 +101,9 @@ func TestUpdateAndSyncRejectsInvalidValuesAndKeepsServing(t *testing.T) {
 	invalid.ResponseHeaderTimeoutSeconds = -1
 	require.ErrorContains(t, apply(t, invalid), "response_header_timeout_seconds")
 
-	// The rejected value is still published, so readers keep a usable setting
-	// instead of failing after the operator wrote a bad value.
-	assert.Equal(t, "exa", Get().CandidateOrder)
-	assert.Equal(t, []string{"exa"}, ProviderOrder())
+	assert.Equal(t, "", Get().CandidateOrder)
+	assert.Equal(t, defaultResponseHeaderTimeoutSeconds, Get().ResponseHeaderTimeoutSeconds)
+	assert.Equal(t, defaultRetryAttempts, Get().RetryAttempts)
 }
 
 func TestGlobalProvidersFollowsTheExaKey(t *testing.T) {
@@ -142,6 +137,23 @@ func TestExaEndpointFallsBackAndTrimsTrailingSlash(t *testing.T) {
 	setting.ExaBaseURL = "https://exa.example/"
 	require.NoError(t, apply(t, setting))
 	assert.Equal(t, "https://exa.example", ExaEndpoint())
+}
+
+func TestWebSearchGroupPoliciesInvalidConfigKeepsLastSnapshot(t *testing.T) {
+	saveAndRestore(t)
+
+	const raw = `{"default":{"tools/search":{"mode":"prefer","providers":["exa"]}}}`
+	setting := defaultSettingWith("")
+	setting.GroupPolicies = raw
+	require.NoError(t, apply(t, setting))
+	setting.GroupPolicies = `{"default":{"tools/search":{"mode":null}}}`
+	require.Error(t, apply(t, setting))
+
+	assert.Equal(t, raw, Get().GroupPolicies)
+	providers := Get().PreferredProviders("default", "tools/search")
+	require.Equal(t, []string{"exa"}, providers)
+	providers[0] = "deepseek"
+	assert.Equal(t, []string{"exa"}, Get().PreferredProviders("default", "tools/search"))
 }
 
 // defaultSettingWith builds a setting that differs from the defaults only in

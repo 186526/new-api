@@ -205,7 +205,7 @@
 
 - 使用 Rsbuild，配置见 `rsbuild.config.ts`；脚本以 `package.json` 为准（如 `bun run dev`、`bun run build`、`bun check -b`、`bun run lint`、`bun run format`），包管理见 [3.15 依赖管理](#315-依赖管理)。
 - 代码分割与懒加载策略见 [3.4 性能](#34-性能)；资源使用合适格式与压缩，环境变量用 `.env` 且以 `VITE_` 前缀，不在代码中硬编码。
-- **发布前**：执行 typecheck、lint、format 检查，完成生产构建并检查产物体积与环境变量配置。
+- **浏览器兼容**：构建目标以 `.browserslistrc` 为准。调整目标后检查生产产物，并在目标浏览器验证样式与运行时 API；Tailwind CSS v4 官方要求 Safari 16.4，构建可以通过但旧版样式仍须实测。发布前执行 typecheck、lint、format 检查，并检查产物体积与环境变量配置。
 
 ---
 

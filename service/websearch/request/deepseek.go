@@ -74,7 +74,7 @@ func (r *deepSeekRequester) Search(ctx context.Context, channel abstract.Channel
 	}
 
 	cacheKey := deepSeekSearchCacheKey(query, native)
-	upstream, err := Forward(ctx, channel, build, ForwardOptions{
+	upstream, err := forwardManaged(ctx, channel, query, build, ForwardOptions{
 		CacheKey:        cacheKey,
 		Search:          true,
 		CacheTTLSeconds: channel.Settings.WebSearchCacheTTLSeconds,
@@ -104,7 +104,7 @@ func (r *deepSeekRequester) Fetch(ctx context.Context, channel abstract.ChannelC
 	if native {
 		cacheKey += "\x00raw\x00" + rawBodyCacheHash(query.Raw)
 	}
-	upstream, err := Forward(ctx, channel, build, ForwardOptions{
+	upstream, err := forwardManaged(ctx, channel, query, build, ForwardOptions{
 		CacheKey:        cacheKey,
 		Search:          false,
 		CacheTTLSeconds: channel.Settings.WebSearchFetchCacheTTLSeconds,

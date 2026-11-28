@@ -19,6 +19,9 @@ For commercial licensing, please contact support@quantumnous.com
 import { z } from 'zod'
 
 import {
+  CHANNEL_TYPE_CODEX,
+  TOOLS_FETCH_MODEL,
+  TOOLS_SEARCH_MODEL,
   CLAUDE_FIELD_PASSTHROUGH_TYPES,
   CHANNEL_TYPE_MISTRAL,
   CHANNEL_TYPE_NEW_API,
@@ -42,8 +45,15 @@ import {
   validateAdvancedCustomConfig,
 } from './advanced-custom'
 import { readTaskExtendPluginKeys } from './channel-plugin-extensions'
+import { parseModelsString } from './model-mapping-validation'
 import { supportsResponsesWebSocket } from './responses-websocket'
-import { supportsWebSearchSettings } from './websearch-setting'
+import {
+  CODEX_SEARCH_MAPPING_REQUIRED,
+  getChannelToolAvailability,
+  isToolModel,
+  type ChannelToolCatalog,
+  validToolModelMapping,
+} from './websearch-setting'
 
 // ============================================================================
 // Form Validation Schema
@@ -244,7 +254,7 @@ function addRequiredIssue(
   })
 }
 
-export const channelFormSchema = z
+const baseChannelFormSchema = z
   .object({
     name: z.string().min(1, ERROR_MESSAGES.REQUIRED_NAME),
     type: z.number().min(0, ERROR_MESSAGES.REQUIRED_TYPE),
@@ -416,7 +426,7 @@ export const channelFormSchema = z
       )
     }
 
-    if (data.type === 57) {
+    if (data.type === CHANNEL_TYPE_CODEX) {
       if (data.multi_key_mode && data.multi_key_mode !== 'single') {
         addRequiredIssue(
           ctx,
@@ -520,6 +530,31 @@ export const channelFormSchema = z
     }
   })
 
+export const createChannelFormSchema = (catalog?: ChannelToolCatalog) =>
+  baseChannelFormSchema.superRefine((data, ctx) => {
+    const availability = getChannelToolAvailability(data.type, catalog, data.websearch_provider)
+    const models = parseModelsString(data.models)
+    const mapping = data.model_mapping ?? ''
+    if (
+      availability.requiresSearchMapping &&
+      models.includes(TOOLS_SEARCH_MODEL) &&
+      !validToolModelMapping(mapping, TOOLS_SEARCH_MODEL)
+    ) {
+      const message = data.type === CHANNEL_TYPE_CODEX
+        ? CODEX_SEARCH_MAPPING_REQUIRED
+        : 'Enter a valid upstream search model.'
+      addRequiredIssue(ctx, 'model_mapping', message)
+    }
+    if (
+      availability.requiresFetchMapping &&
+      models.includes(TOOLS_FETCH_MODEL) &&
+      !validToolModelMapping(mapping, TOOLS_FETCH_MODEL)
+    ) {
+      addRequiredIssue(ctx, 'model_mapping', 'Enter a valid upstream fetch model.')
+    }
+  })
+
+export const channelFormSchema = createChannelFormSchema()
 export type ChannelFormValues = z.infer<typeof channelFormSchema>
 
 // ============================================================================
@@ -784,7 +819,10 @@ export function transformChannelToFormDefaults(
 /**
  * Build the setting JSON string from form extra settings
  */
-export function buildSettingJSON(formData: ChannelFormValues): string {
+export function buildSettingJSON(
+  formData: ChannelFormValues,
+  catalog?: ChannelToolCatalog
+): string {
   const settingObj: Record<string, unknown> = {
     task_plugin_key:
       formData.type === CHANNEL_TYPE_TASK_PLUGIN
@@ -830,7 +868,11 @@ export function buildSettingJSON(formData: ChannelFormValues): string {
   // Web search and fetch settings are opt-in; omit them so the backend keeps
   // its defaults (provider from channel type, built-in cache TTLs). Only a
   // channel whose type can search or fetch stores them.
-  if (supportsWebSearchSettings(formData.type)) {
+  if (
+    !catalog ||
+    getChannelToolAvailability(formData.type, catalog).canConfigure ||
+    parseModelsString(formData.models).some(isToolModel)
+  ) {
     const webSearchProvider = readWebSearchProvider(formData.websearch_provider)
     if (webSearchProvider) {
       settingObj.websearch_provider = webSearchProvider
@@ -1023,7 +1065,10 @@ function normalizeBaseUrl(value: string | undefined): string {
 /**
  * Transform form data to API payload for creating channel
  */
-export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
+export function transformFormDataToCreatePayload(
+  formData: ChannelFormValues,
+  catalog?: ChannelToolCatalog
+): {
   mode: 'single' | 'batch' | 'multi_to_single'
   multi_key_mode?: 'random' | 'polling'
   batch_add_set_key_prefix_2_name?: boolean
@@ -1048,7 +1093,7 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
     status_code_mapping: formData.status_code_mapping || null,
     tag: formData.tag || null,
     remark: formData.remark || '',
-    setting: buildSettingJSON(formData),
+    setting: buildSettingJSON(formData, catalog),
     param_override: formData.param_override || null,
     header_override: formData.header_override || null,
     settings: buildSettingsJSON(formData),
@@ -1077,7 +1122,8 @@ export function transformFormDataToCreatePayload(formData: ChannelFormValues): {
  */
 export function transformFormDataToUpdatePayload(
   formData: ChannelFormValues,
-  channelId: number
+  channelId: number,
+  catalog?: ChannelToolCatalog
 ): Partial<Channel> {
   const payload: Partial<Channel> = {
     id: channelId,
@@ -1095,7 +1141,7 @@ export function transformFormDataToUpdatePayload(
     status_code_mapping: formData.status_code_mapping || null,
     tag: formData.tag || null,
     remark: formData.remark || '',
-    setting: buildSettingJSON(formData),
+    setting: buildSettingJSON(formData, catalog),
     param_override: formData.param_override || null,
     header_override: formData.header_override || null,
     settings: buildSettingsJSON(formData),

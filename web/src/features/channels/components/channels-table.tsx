@@ -41,6 +41,13 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -57,6 +64,8 @@ import {
   DEFAULT_PAGE_SIZE,
   CHANNEL_STATUS,
   CHANNEL_STATUS_OPTIONS,
+  TOOLS_FETCH_MODEL,
+  TOOLS_SEARCH_MODEL,
 } from '../constants'
 import { useChannelPriorityDrag } from '../hooks/use-channel-priority-drag'
 import { useChannelPriorityOrder } from '../hooks/use-channel-priority-order'
@@ -181,6 +190,7 @@ export function ChannelsTable() {
   const {
     value: modelFilter,
     inputValue: modelFilterInput,
+    setInputValue: setModelFilterInput,
     onChange: onModelFilterInputChange,
     onCompositionStart: onModelFilterCompositionStart,
     onCompositionEnd: onModelFilterCompositionEnd,
@@ -555,14 +565,55 @@ export function ChannelsTable() {
               resetModelFilterInput()
             },
             additionalSearch: (
-              <Input
-                placeholder={t('Filter by model...')}
-                value={modelFilterInput}
-                onChange={onModelFilterInputChange}
-                onCompositionStart={onModelFilterCompositionStart}
-                onCompositionEnd={onModelFilterCompositionEnd}
-                className='w-full sm:w-[150px] lg:w-[180px]'
-              />
+              <>
+                <Input
+                  placeholder={t('Filter by model...')}
+                  value={modelFilterInput}
+                  onChange={onModelFilterInputChange}
+                  onCompositionStart={onModelFilterCompositionStart}
+                  onCompositionEnd={onModelFilterCompositionEnd}
+                  className='w-full sm:w-[150px] lg:w-[180px]'
+                />
+                <Select
+                  items={[
+                    { value: 'all', label: t('All tools') },
+                    { value: TOOLS_SEARCH_MODEL, label: t('Search enabled') },
+                    { value: TOOLS_FETCH_MODEL, label: t('Fetch enabled') },
+                  ]}
+                  value={
+                    modelFilterInput === TOOLS_SEARCH_MODEL ||
+                    modelFilterInput === TOOLS_FETCH_MODEL
+                      ? modelFilterInput
+                      : 'all'
+                  }
+                  onValueChange={(value) => {
+                    if (
+                      value === TOOLS_SEARCH_MODEL ||
+                      value === TOOLS_FETCH_MODEL
+                    ) {
+                      setModelFilterInput(value)
+                    } else if (
+                      modelFilterInput === TOOLS_SEARCH_MODEL ||
+                      modelFilterInput === TOOLS_FETCH_MODEL
+                    ) {
+                      setModelFilterInput('')
+                    }
+                  }}
+                >
+                  <SelectTrigger aria-label={t('Filter by configured tool')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value='all'>{t('All tools')}</SelectItem>
+                    <SelectItem value={TOOLS_SEARCH_MODEL}>
+                      {t('Search enabled')}
+                    </SelectItem>
+                    <SelectItem value={TOOLS_FETCH_MODEL}>
+                      {t('Fetch enabled')}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </>
             ),
             filters: [
               {

@@ -157,29 +157,51 @@ func TestExaSearchSendsAPIKeyHeader(t *testing.T) {
 	}
 }
 
-func TestExaSearchRetriesOnceAfter429(t *testing.T) {
-	stub := newExaStub(t, func(w http.ResponseWriter, _ *http.Request, call int32) {
-		if call == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
-			return
-		}
-		_, _ = w.Write([]byte(exaSearchAnswer))
+func TestExaSearchDoesNotRetryAfter429(t *testing.T) {
+	const errorBody = `{"error":"rate limited"}`
+	stub := newExaStub(t, func(w http.ResponseWriter, _ *http.Request, _ int32) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(errorBody))
 	})
 
-	query := Query{Contract: abstract.ContractToolsSearch, Text: "a query that is rate limited once", Endpoint: stub.server.URL}
+	query := Query{Contract: abstract.ContractToolsSearch, Text: "a rate limited query", Endpoint: stub.server.URL}
 	upstream, err := exaRequesterFor(t).Search(context.Background(), exaTestChannel(), query)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
+	if got := stub.calls.Load(); got != 1 {
+		t.Fatalf("upstream called %d times, want 1", got)
+	}
+	if upstream.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode = %d, want 429", upstream.StatusCode)
+	}
+	if string(upstream.Body) != errorBody {
+		t.Fatalf("body = %s, want %s", upstream.Body, errorBody)
+	}
+}
+
+func TestExaSearchCacheSeparatesNeedContent(t *testing.T) {
+	stub := newExaStub(t, func(w http.ResponseWriter, _ *http.Request, call int32) {
+		if call == 2 {
+			_, _ = io.WriteString(w, exaSearchAnswer)
+			return
+		}
+		_, _ = io.WriteString(w, `{"results":[{"url":"https://go.dev"}]}`)
+	})
+	requester := exaRequesterFor(t)
+	query := Query{Contract: abstract.ContractToolsSearch, Text: t.Name(), Count: 2, Endpoint: stub.server.URL}
+	for _, needContent := range []bool{false, true, false, true} {
+		query.NeedContent = needContent
+		answer, err := requester.Search(t.Context(), exaTestChannel(), query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(answer.Body), `"text"`) != needContent {
+			t.Fatalf("NeedContent=%t: got %s", needContent, answer.Body)
+		}
+	}
 	if got := stub.calls.Load(); got != 2 {
-		t.Fatalf("upstream called %d times, want 2 (429 then 200)", got)
-	}
-	if upstream.StatusCode != http.StatusOK {
-		t.Fatalf("StatusCode = %d, want 200 after the retry succeeded", upstream.StatusCode)
-	}
-	if !strings.Contains(string(upstream.Body), "go.dev") {
-		t.Fatalf("body does not carry the successful answer: %s", upstream.Body)
+		t.Fatalf("upstream called %d times, want 2", got)
 	}
 }
 
@@ -199,7 +221,7 @@ func TestExaWithoutAnyKeyIsNotSent(t *testing.T) {
 
 func TestExaFetchSendsURLToContents(t *testing.T) {
 	stub := newExaStub(t, func(w http.ResponseWriter, _ *http.Request, _ int32) {
-		_, _ = w.Write([]byte(`{"results":[{"title":"Go","text":"fetched body"}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go","url":"https://go.dev/doc","text":"fetched body"}]}`))
 	})
 
 	query := Query{Contract: abstract.ContractToolsFetch, URL: "https://go.dev/doc", Endpoint: stub.server.URL}

@@ -11,4 +11,5 @@ type ReasoningConversionState struct {
 	Effort          string
 	BudgetTokens    *int
 	IncludeThoughts *bool
+	Source          string
 }

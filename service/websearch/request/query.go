@@ -24,8 +24,10 @@ type Query struct {
 	// Endpoint and Prepare are injected by the relay layer: only a channel's
 	// adaptor knows the URL it routes to and the auth it signs with. Without
 	// them, only providers with a standalone endpoint can send the request.
-	Endpoint string
-	Prepare  func(*http.Request) error
+	Endpoint         string
+	EndpointProvider string
+	Prepare          func(*http.Request) error
+	CustomOperation  *abstract.CustomToolOperation
 }
 
 // Upstream is one raw answer. Family names the parser that reads Body; it is the

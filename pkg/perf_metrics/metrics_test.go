@@ -213,8 +213,8 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			sqlDB, err := db.DB()
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
-			require.NoError(t, db.Migrator().DropTable(&model.PerfMetric{}))
-			require.NoError(t, db.AutoMigrate(&model.PerfMetric{}))
+			require.NoError(t, db.Migrator().DropTable(&model.PerfMetric{}, &model.PerfMetricDistributionRow{}))
+			require.NoError(t, db.AutoMigrate(&model.PerfMetric{}, &model.PerfMetricDistributionRow{}))
 			versionQuery := "SELECT version()"
 			if dialect.name == "sqlite" {
 				versionQuery = "SELECT sqlite_version()"
@@ -243,7 +243,16 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			assert.Equal(t, 100.0, businessRejected.Summary.SuccessRate)
 
 			failure := &atomicBucket{}
-			failure.add(Sample{LatencyMs: 2000})
+			info := &relaycommon.RelayInfo{
+				ToolExecution:    &relaycommon.ToolExecutionMeta{Contract: "tools/search", Provider: "exa", Outcome: "empty", Refund: "requested", CacheHit: true},
+				ImageCompression: &relaycommon.ImageCompressionMeta{Processed: 3, SavedBytes: 150, OutboundCompressed: common.GetPointer(2), OutboundSavedBytes: common.GetPointer(100)},
+				AutoReasoning:    &relaycommon.AutoReasoningMeta{Reason: "applied", OutboundStatus: "observed"},
+				RequestRedaction: &relaycommon.RequestRedactionMeta{Matches: 3, Categories: 2},
+			}
+			observation := info.RequestObservation()
+			observed := observationCounts(observation)
+			assert.Equal(t, model.PerfMetricObservation{ToolRequests: 1, ToolCacheHits: 1, ToolSearches: 1, ToolEmpty: 1, ImagesCompressed: 2, ImageBytesSaved: 100, ImageCountSamples: 1, ImageSavingsSamples: 1, AutomaticReasoning: 1, ReasoningObserved: 1, RedactedRequests: 1, RedactionMatches: 3, RedactionCategories: 2}, observed)
+			failure.add(Sample{LatencyMs: 2000, observation: observed, distribution: observationDistribution(observation)})
 			hotBuckets.Store(bucketKey{model: "test-model", group: "b", bucketTs: hour}, failure)
 			before, err := Query(QueryParams{Model: "test-model", Hours: 24, AllowedGroups: groups})
 			require.NoError(t, err)
@@ -266,8 +275,47 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			assert.NotContains(t, string(encoded), "request_count")
 			assert.NotContains(t, string(encoded), "success_count")
 
+			assertObservations := func() {
+				t.Helper()
+				counts, err := QueryRequestObservations(start, now.Unix(), []string{"b"})
+				require.NoError(t, err)
+				require.NotNil(t, counts)
+				assert.Equal(t, observed, *counts)
+				distribution, err := QueryObservationDistribution(start, now.Unix(), []string{"b"})
+				require.NoError(t, err)
+				assert.Equal(t, []model.PerfMetricDistributionEntry{
+					{PerfMetricDimension: model.PerfMetricDimension{Kind: "reasoning", Name: "unknown", Variant: "unknown", Outcome: "applied"}, Count: 1},
+					{PerfMetricDimension: model.PerfMetricDimension{Kind: "tool", Name: "tools/search", Variant: "exa", Outcome: "empty"}, Count: 1, CacheHits: 1},
+				}, distribution)
+				for _, excluded := range [][]string{{"a"}, {}} {
+					distribution, err = QueryObservationDistribution(start, now.Unix(), excluded)
+					require.NoError(t, err)
+					assert.Empty(t, distribution)
+				}
+				counts, err = QueryRequestObservations(start, now.Unix(), []string{"a"})
+				require.NoError(t, err)
+				assert.Nil(t, counts)
+			}
+			assertObservations()
+			observationOnly := model.PerfMetricObservation{ImagesPreprocessed: 3, ImagePreprocessingRuns: 1, ImageCountSamples: 1, ImageSavingsUnknown: 1, ReasoningOutboundUnknown: 1}
+			observationBucket := &atomicBucket{}
+			observationBucket.add(Sample{observation: observationOnly, observationOnly: true})
+			hotBuckets.Store(bucketKey{model: "observation-only", group: "observation-group", bucketTs: hour}, observationBucket)
+			assertObservationOnly := func() {
+				t.Helper()
+				actual, err := QueryRequestObservations(start, now.Unix(), []string{"observation-group"})
+				require.NoError(t, err)
+				require.NotNil(t, actual)
+				assert.Equal(t, observationOnly, *actual)
+				result, err := Query(QueryParams{Model: "observation-only", AllowedGroups: []string{"observation-group"}})
+				require.NoError(t, err)
+				assert.Nil(t, result.Summary)
+			}
+			assertObservationOnly()
 			flushCompletedBuckets()
 			flushCompletedBuckets()
+			assertObservations()
+			assertObservationOnly()
 			after, err := Query(QueryParams{Model: "test-model", Hours: 24, AllowedGroups: groups})
 			require.NoError(t, err)
 			assert.Equal(t, before.Summary, after.Summary)

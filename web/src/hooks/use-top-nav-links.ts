@@ -43,7 +43,9 @@ export type TopNavLink = {
  *   about: true
  * }
  */
-export function useTopNavLinks(): TopNavLink[] {
+export function useTopNavLinks(options?: {
+  includeApiReference?: boolean
+}): TopNavLink[] {
   const { t } = useTranslation()
   const { status } = useStatus()
   const { auth } = useAuthStore()
@@ -86,8 +88,9 @@ export function useTopNavLinks(): TopNavLink[] {
     links.push({ title: t('Rankings'), href: '/rankings', requiresAuth })
   }
 
-  // Docs (supports external links)
-  if (modules?.docs !== false) {
+  if (options?.includeApiReference) {
+    links.push({ title: t('Docs'), href: '/docs' })
+  } else if (modules.docs) {
     if (docsLink) {
       links.push({ title: t('Docs'), href: docsLink, external: true })
     } else {

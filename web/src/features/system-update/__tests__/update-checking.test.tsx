@@ -36,7 +36,6 @@ import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
-import { UpdateCheckerSection } from '@/features/system-settings/maintenance/update-checker-section'
 import { api } from '@/lib/api'
 import { createAppQueryClient } from '@/lib/query-client'
 import { ROLE } from '@/lib/roles'
@@ -146,15 +145,12 @@ describe('administrator update entry', () => {
     }
   )
 
-  test('shares results with maintenance, opens release details by keyboard and returns focus on Escape', async () => {
+  test('shares results across update controls, opens release details by keyboard and returns focus on Escape', async () => {
     const user = userEvent.setup()
     render(
       <>
         <SystemUpdateAction presentation='version' />
-        <UpdateCheckerSection
-          currentVersion='v1.0.0-rc.35'
-          startTime={1_700_000_000}
-        />
+        <SystemUpdateAction compact={false} />
       </>,
       { wrapper: Wrapper }
     )

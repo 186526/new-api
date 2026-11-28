@@ -50,7 +50,9 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { useStatus } from '@/hooks/use-status'
 import { api } from '@/lib/api'
+import { formatTimestamp } from '@/lib/format'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import {
@@ -187,8 +189,15 @@ type PerformanceStats = {
 
 export function PerformanceSection(props: Props) {
   const { t } = useTranslation()
+  const { status } = useStatus()
   const updateOption = useUpdateOption()
   const [stats, setStats] = useState<PerformanceStats | null>(null)
+
+  const startTime = status?.start_time
+  const uptime =
+    typeof startTime === 'number' && startTime > 0
+      ? formatTimestamp(startTime)
+      : t('Unknown')
 
   const formDefaults = useMemo(
     () => buildFormDefaults(props.defaultValues),
@@ -325,6 +334,10 @@ export function PerformanceSection(props: Props) {
 
   return (
     <SettingsSection title={t('Performance Settings')}>
+      <dl className='rounded-lg border p-4'>
+        <dt className='text-muted-foreground text-sm'>{t('Uptime since')}</dt>
+        <dd className='text-lg font-semibold'>{uptime}</dd>
+      </dl>
       <Form {...form}>
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)}>
           <SettingsPageFormActions

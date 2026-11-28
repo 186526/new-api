@@ -20,18 +20,20 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { PublicLayout } from '@/components/layout'
-import { PageTransition } from '@/components/page-transition'
+import { Footer } from '@/components/layout/components/footer'
 import { usePricingData } from '@/features/pricing/hooks'
 import { useStatus } from '@/hooks/use-status'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { DocsNav } from './components/docs-nav'
+import { KimiCodeConfig } from './components/kimi-code-config'
 import { ProtocolSection } from './components/protocol-section'
+import { QuickStart } from './components/quick-start'
 import { SystemOneBodyExample } from './components/systemone-body-example'
-import { API_PROTOCOLS } from './constants'
+import { ALPHA_SEARCH_ENDPOINT_TYPE, API_PROTOCOLS } from './constants'
 import { pickModelsByProtocol, resolveBaseUrl } from './lib/models'
 
-export function ApiDocs() {
+export function ApiDocs({ initialGroup }: { initialGroup?: string } = {}) {
   const { t } = useTranslation()
   const { status } = useStatus()
   const { auth } = useAuthStore()
@@ -47,43 +49,53 @@ export function ApiDocs() {
     [models]
   )
 
+  const alphaSearchModel = models?.find((model) =>
+    model.supported_endpoint_types?.includes(ALPHA_SEARCH_ENDPOINT_TYPE)
+  )?.model_name
+
   return (
     <PublicLayout showMainContainer={false}>
-      <PageTransition className='mx-auto w-full max-w-[1200px] px-3 pt-16 pb-12 sm:px-6 sm:pt-20 xl:px-8'>
-        <header className='border-b pb-6'>
-          <h1 className='text-[clamp(1.75rem,4vw,2.75rem)] leading-tight font-bold tracking-tight'>
-            {t('apiDocs.title', { defaultValue: 'API Reference' })}
-          </h1>
-          <p className='text-muted-foreground mt-2 max-w-2xl text-sm'>
-            {t('apiDocs.subtitle', {
-              defaultValue:
-                'One gateway, several wire protocols. Every example calls this site with your API key.',
-            })}
-          </p>
+      <main className='mx-auto w-full max-w-6xl px-4 pt-24 pb-16 sm:px-6 lg:px-8'>
+        <header className='grid gap-6 border-b pb-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:gap-12'>
+          <div>
+            <h1 className='text-3xl leading-tight font-semibold tracking-tight sm:text-4xl'>
+              {t('apiDocs.title', { defaultValue: 'API Reference' })}
+            </h1>
+            <p className='text-muted-foreground mt-3 max-w-md text-sm leading-relaxed'>
+              {t('apiDocs.subtitle', {
+                defaultValue:
+                  'One gateway, several wire protocols. Every example calls this site with your API key.',
+              })}
+            </p>
+          </div>
+          <QuickStart baseUrl={baseUrl} />
         </header>
 
-        <div className='mt-6 grid gap-8 xl:grid-cols-[200px_minmax(0,1fr)]'>
-          <aside className='hover-scrollbar sticky top-20 hidden max-h-[calc(100dvh-6rem)] self-start overflow-y-auto xl:block'>
-            <DocsNav />
-          </aside>
+        <div className='grid grid-cols-1 gap-8 pt-8 lg:grid-cols-[12rem_minmax(0,1fr)] lg:gap-10'>
+          <DocsNav />
 
-          <main className='min-w-0 space-y-10'>
+          <div className='flex min-w-0 flex-col gap-10'>
             {API_PROTOCOLS.map((protocol) => (
               <ProtocolSection
                 key={protocol.id}
                 baseUrl={baseUrl}
                 model={modelsByProtocol[protocol.id] ?? protocol.fallbackModel}
                 protocol={protocol}
+                alphaSearchModel={alphaSearchModel}
                 supportedEndpoint={
                   endpointMap as Record<string, { path?: string }>
                 }
               >
-                {protocol.id === 'systemone' ? <SystemOneBodyExample /> : null}
+                {protocol.id === 'systemone' && <SystemOneBodyExample />}
+                {protocol.id === 'moonshot-service' && (
+                  <KimiCodeConfig baseUrl={baseUrl} initialGroup={initialGroup} />
+                )}
               </ProtocolSection>
             ))}
-          </main>
+          </div>
         </div>
-      </PageTransition>
+      </main>
+      <Footer />
     </PublicLayout>
   )
 }

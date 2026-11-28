@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/service/websearch"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/service/websearch/request"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 
@@ -145,11 +146,7 @@ func TestPipelineRendersANonNativeAnswer(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&hits))
 }
 
-// TestPipelineSkipsACandidateThatNeverSentTheRequest requires a candidate whose
-// failure provably happened before its request left to be skipped so the next
-// one may serve the client. The Antigravity upstream publishes no fetch at all,
-// so its refusal is reported as never sent; the in-process fetcher then answers.
-func TestPipelineSkipsACandidateThatNeverSentTheRequest(t *testing.T) {
+func TestPipelineExcludesProvidersWithoutFetchCapability(t *testing.T) {
 	initLegacyWebsearchTest(t)
 
 	// The fetcher refuses a loopback address through the SSRF guard, and a test
@@ -173,19 +170,17 @@ func TestPipelineSkipsACandidateThatNeverSentTheRequest(t *testing.T) {
 
 	candidates, err := websearch.Candidates(channel, abstract.ContractToolsFetch)
 	require.NoError(t, err)
-	require.Len(t, candidates, 2, "the channel's own upstream and the in-process fetcher")
-	assert.Equal(t, websearch_setting.ProviderAntigravity, candidates[0].Provider)
-	assert.Equal(t, websearch_setting.ProviderLocal, candidates[1].Provider)
+	require.Len(t, candidates, 1)
+	assert.Equal(t, websearch_setting.ProviderLocal, candidates[0].Provider)
 
 	answer, err := websearch.Fetch(t.Context(), channel, request.Query{
 		Contract: abstract.ContractToolsFetch,
 		URL:      page.URL,
 	})
-	require.NoError(t, err, "the second candidate must be tried once the first one was never sent")
+	require.NoError(t, err)
 
 	body := string(answer.Body)
-	assert.Contains(t, body, "Fetched body.",
-		"the answer comes from the local fetcher, which is the candidate that ran second")
+	assert.Contains(t, body, "Fetched body.")
 	assert.Equal(t, "application/json", answer.ContentType)
 }
 
@@ -272,6 +267,8 @@ func TestPipelineCachesARepeatedQuery(t *testing.T) {
 		"the second query must be answered from the cache, not from the upstream")
 	assert.False(t, first.Cached, "the call that reached the upstream is not a cache hit")
 	assert.True(t, second.Cached, "the caller must be able to count the hit")
+	assert.Equal(t, websearch_setting.ProviderDeepSeek, first.Provider)
+	assert.Equal(t, first.Provider, second.Provider)
 	assert.Equal(t, string(first.Body), string(second.Body))
 }
 
@@ -307,13 +304,7 @@ func TestPipelineDisablesTheCacheOnANegativeTTL(t *testing.T) {
 	assert.Equal(t, int32(2), atomic.LoadInt32(&hits))
 }
 
-// TestPipelineAnswersALeftoverRefusalWithItsOwnStatusCode requires a refusal the
-// retry budget could not clear to be handed back as an answer rather than as a
-// local error: the handler turns the status into the client's reply, so a local
-// error would replace the upstream's 429 with a 500. The refusal body is a
-// document the provider's parser can read, because an answer is rendered before
-// it is written.
-func TestPipelineAnswersALeftoverRefusalWithItsOwnStatusCode(t *testing.T) {
+func TestPipelineReturnsUpstreamRefusalWithoutRetry(t *testing.T) {
 	initLegacyWebsearchTest(t)
 
 	const refusal = `{"results":[{"title":"refused","url":"https://a.example/"}]}`
@@ -333,11 +324,11 @@ func TestPipelineAnswersALeftoverRefusalWithItsOwnStatusCode(t *testing.T) {
 		Raw:      []byte(`{"query":"rate limited"}`),
 		Endpoint: upstream.URL + "/v1/tools/search",
 	})
-	require.NoError(t, err, "a spent retry budget is an answer, not an error")
-	assert.Equal(t, http.StatusTooManyRequests, answer.StatusCode,
-		"the client reads the upstream's own status, which status_code_mapping then rewrites")
-	assert.Equal(t, int32(websearch_setting.RetryAttempts()), atomic.LoadInt32(&attempts),
-		"the retry budget belongs to one request and is spent on the candidate that owns it")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusTooManyRequests, answer.StatusCode)
+	assert.Equal(t, websearch_setting.ProviderDeepSeek, answer.Provider)
+	assert.Equal(t, refusal, string(answer.Body))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&attempts))
 }
 
 // TestAlphaSearchRoutesThroughThePipelineToItsNativeUpstream requires the Codex
@@ -370,4 +361,62 @@ func TestAlphaSearchRoutesThroughThePipelineToItsNativeUpstream(t *testing.T) {
 	assert.Equal(t, "/backend-api/codex/alpha/search", gotPath)
 	assert.Equal(t, raw, gotBody, "the client's Codex body must reach the upstream untouched")
 	assert.Equal(t, alphaSearchAnswer, string(answer.Body), "and the upstream's document must reach the client untouched")
+}
+
+func TestPipelinePreferenceReordersOnlyReachableProviders(t *testing.T) {
+	channel := pipelineChannel(constant.ChannelTypeDeepSeek, "")
+	channel.PreferredProviders = []string{"local", "codex", "deepseek"}
+	candidates, err := websearch.Candidates(channel, abstract.ContractToolsFetch)
+	require.NoError(t, err)
+	require.Len(t, candidates, 2)
+	assert.Equal(t, "deepseek", candidates[0].Provider)
+	assert.Equal(t, "local", candidates[1].Provider)
+}
+
+func TestPipelinePreferredGlobalProviderDoesNotReceiveChannelCredentials(t *testing.T) {
+	initLegacyWebsearchTest(t)
+	previous := websearch_setting.Get()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+			"websearch_setting.exa_base_url": previous.ExaBaseURL, "websearch_setting.exa_api_key": previous.ExaAPIKey,
+		}))
+		require.NoError(t, websearch_setting.UpdateAndSync())
+	})
+	var exaHits, channelHits atomic.Int32
+	exa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		exaHits.Add(1)
+		assert.Equal(t, "/search", req.URL.Path)
+		assert.Equal(t, "global-test-key", req.Header.Get("X-API-Key"))
+		assert.Empty(t, req.Header.Get("Authorization"))
+		// A refusal proves that the pipeline must not switch to the channel once
+		// the preferred provider has received the request.
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"message":"rejected"}`)
+	}))
+	t.Cleanup(exa.Close)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		channelHits.Add(1)
+		_, _ = io.WriteString(w, richToolsSearchAnswer)
+	}))
+	t.Cleanup(upstream.Close)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"websearch_setting.exa_base_url": exa.URL, "websearch_setting.exa_api_key": "global-test-key",
+	}))
+	require.NoError(t, websearch_setting.UpdateAndSync())
+	channel := pipelineChannel(constant.ChannelTypeDeepSeek, upstream.URL)
+	channel.PreferredProviders = []string{"exa"}
+	answer, err := websearch.Search(t.Context(), channel, request.Query{
+		Contract: abstract.ContractToolsSearch,
+		Text:     uniqueText(t),
+		Raw:      []byte(`{"query":"test"}`),
+		Endpoint: upstream.URL + "/v1/tools/search",
+		Prepare: func(req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer channel-key")
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, answer.StatusCode)
+	assert.EqualValues(t, 1, exaHits.Load())
+	assert.Zero(t, channelHits.Load())
 }

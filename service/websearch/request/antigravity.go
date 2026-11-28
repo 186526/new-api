@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,7 +16,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/pkg/cachex"
+	"github.com/QuantumNous/new-api/pkg/toolcatalog"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/redaction"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 
@@ -27,7 +28,7 @@ import (
 
 const (
 	antigravityGenerateContentPath = "/v1internal:generateContent"
-	antigravityDefaultSearchModel  = "gemini-3.5-flash-lite"
+	antigravityDefaultSearchModel  = toolcatalog.AntigravitySearchModel
 	antigravityEnvelopeUserAgent   = "antigravity"
 	antigravityRequestTypeSearch   = "web_search"
 
@@ -36,7 +37,7 @@ const (
 	// citation against the grounding service.
 	antigravityRedirectLimit = 8
 
-	redirectCacheNamespace = "websearch:redirect:v1"
+	redirectCacheNamespace = "websearch:redirect:v3"
 	redirectCacheCapacity  = 5000
 	// defaultRedirectCacheTTLSeconds mirrors the setting's own default, so a
 	// zero setting keeps the built-in lifetime rather than making the cache
@@ -72,7 +73,7 @@ func (r *antigravityRequester) Search(ctx context.Context, channel abstract.Chan
 		return Upstream{}, notSent(fmt.Errorf("websearch: antigravity credential: %w", err))
 	}
 
-	model := antigravitySearchModel(channel)
+	model := antigravityDefaultSearchModel
 	instruction := antigravitySearchInstruction(query.Text)
 	payload, err := antigravityEnvelope(model, credential.ProjectID, instruction)
 	if err != nil {
@@ -91,49 +92,25 @@ func (r *antigravityRequester) Search(ctx context.Context, channel abstract.Chan
 		return req, nil
 	}
 
-	// Forward is the one place the cache, the concurrent-request merge and the
-	// 408/429/5xx retry live, so a search is cached and deduplicated like every
-	// other provider's. The envelope carries a random requestId, so the cache key
-	// is the model and the instruction rather than the body.
-	upstream, err := Forward(ctx, channel, build, ForwardOptions{
-		CacheKey:        model + "\x00" + instruction,
+	// The envelope carries a random requestId, so the cache key uses the
+	// model and instruction rather than the body.
+	upstream, err := forwardManaged(ctx, channel, query, build, ForwardOptions{
+		CacheKey:        model + "\x00" + credential.ProjectID + "\x00" + instruction,
+		stableBodyKey:   true,
 		Search:          true,
 		CacheTTLSeconds: channel.Settings.WebSearchCacheTTLSeconds,
+		normalize: func(ctx context.Context, entry forwardEntry) (forwardEntry, error) {
+			return normalizeAntigravitySearch(ctx, channel, entry)
+		},
 	})
-	if err != nil {
-		return Upstream{}, err
-	}
-	upstream.Family = r.Name()
-
-	// A refusal is the upstream's own document, which the renderer hands to the
-	// client unread; only a success is unwrapped from the envelope.
-	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
-		return upstream, nil
-	}
-	unwrapped, err := unwrapAntigravityResponse(upstream.Body)
-	if err != nil {
-		return Upstream{}, sentError{err}
-	}
-	upstream.Body = unwrapped
-	return upstream, nil
+	upstream.Family = antigravityResultFamily
+	return upstream, err
 }
 
 // Fetch refuses the call because Antigravity publishes no fetch endpoint; its
 // channel fetches through the in-process extractor instead.
 func (*antigravityRequester) Fetch(context.Context, abstract.ChannelContext, Query) (Upstream, error) {
 	return Upstream{}, notSent(abstract.ErrUnsupportedChannel)
-}
-
-// antigravitySearchModel resolves the model a search is sent to: the channel
-// setting, then the global setting, then the upstream default.
-func antigravitySearchModel(channel abstract.ChannelContext) string {
-	if model := strings.TrimSpace(channel.Settings.AntigravityWebSearchModel); model != "" {
-		return model
-	}
-	if model := websearch_setting.AntigravityModel(); model != "" {
-		return model
-	}
-	return antigravityDefaultSearchModel
 }
 
 // antigravitySearchInstruction turns a query into the text the model is asked.
@@ -289,9 +266,13 @@ func ResolveSearchRedirects(ctx context.Context, channel abstract.ChannelContext
 // whole TTL.
 func resolveRedirect(ctx context.Context, client *http.Client, target string) string {
 	ttl := redirectCacheTTL()
-	key := redirectCacheKey(target)
-	if ttl > 0 {
-		if location, found := lookupRedirect(key); found {
+	if redaction.IsProtectedRequest(ctx) || ttl <= 0 {
+		return resolveRedirectUncached(ctx, client, target)
+	}
+	key, keyErr := redirectManagedKey(ctx, target)
+	cacheable := keyErr == nil
+	if cacheable {
+		if location, found := lookupRedirect(key); found && isGroundingLandingURL(location) {
 			return location
 		}
 	}
@@ -300,7 +281,7 @@ func resolveRedirect(ctx context.Context, client *http.Client, target string) st
 	if location == "" {
 		return ""
 	}
-	if ttl > 0 {
+	if cacheable {
 		storeRedirect(key, location, ttl)
 	}
 	return location
@@ -324,7 +305,6 @@ func resolveRedirectUncached(ctx context.Context, client *http.Client, target st
 		return ""
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 
 	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
 		return ""
@@ -342,10 +322,17 @@ func resolveRedirectUncached(ctx context.Context, client *http.Client, target st
 		// that redirected.
 		parsed = req.URL.ResolveReference(parsed)
 	}
-	if parsed.Host == "" {
+	location = parsed.String()
+	if !isGroundingLandingURL(location) {
 		return ""
 	}
-	return parsed.String()
+	return location
+}
+
+func isGroundingLandingURL(target string) bool {
+	parsed, err := url.Parse(target)
+	return err == nil && parsed.Hostname() != "" && parsed.User == nil &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https") && !isGroundingRedirect(target)
 }
 
 // isGroundingRedirect reports whether a citation points at the grounding

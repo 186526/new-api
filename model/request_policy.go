@@ -14,7 +14,10 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/image_compression_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/reasoning"
+	"github.com/QuantumNous/new-api/setting/redaction_setting"
 	"gorm.io/gorm"
 )
 
@@ -22,15 +25,16 @@ import (
 // settings API. It is rebuilt from the option map on every option write, so
 // the runtime globals updated by the same write never disagree with it.
 type RequestPolicySnapshot struct {
-	Affinity        operation_setting.ChannelAffinitySetting
-	RetryTimes      int
-	RetryCodes      []operation_setting.StatusCodeRange
-	DisableCodes    []operation_setting.StatusCodeRange
-	DisableKeywords []string
-	CheckText       bool
-	TextKeywords    []string
-	AutoDisable     bool
-	Options         map[string]string
+	Affinity         operation_setting.ChannelAffinitySetting
+	RetryTimes       int
+	RetryCodes       []operation_setting.StatusCodeRange
+	DisableCodes     []operation_setting.StatusCodeRange
+	DisableKeywords  []string
+	CheckText        bool
+	TextKeywords     []string
+	AutoDisable      bool
+	Options          map[string]string
+	imageCompression image_compression_setting.Settings
 }
 
 var requestPolicySnapshot atomic.Pointer[RequestPolicySnapshot]
@@ -40,8 +44,9 @@ var requestPolicyDefaults = requestPolicyDefaultOptions()
 func requestPolicyDefaultOptions() map[string]string {
 	defaults := make(map[string]string)
 	for prefix, value := range map[string]any{
-		"channel_affinity_setting.": operation_setting.GetChannelAffinitySetting(),
-		"monitor_setting.":          operation_setting.GetMonitorSetting(),
+		"channel_affinity_setting.":      operation_setting.GetChannelAffinitySetting(),
+		"monitor_setting.":               operation_setting.GetMonitorSetting(),
+		image_compression_setting.Prefix: new(image_compression_setting.Defaults()),
 	} {
 		fields, err := config.ConfigToMap(value)
 		if err != nil {
@@ -51,6 +56,14 @@ func requestPolicyDefaultOptions() map[string]string {
 			defaults[prefix+field] = value
 		}
 	}
+	defaults["redaction_setting.enabled"] = "true"
+	defaults["redaction_setting.max_custom_rules_per_key"] = strconv.Itoa(redaction_setting.MaxRules)
+	defaults["redaction_setting.allow_response_restore"] = "true"
+	autoEffort, err := json.Marshal(reasoning.DefaultAutoEffortPolicy())
+	if err != nil {
+		panic(err)
+	}
+	defaults[reasoning.AutoEffortOptionKey] = string(autoEffort)
 	defaults["RetryTimes"] = strconv.Itoa(common.RetryTimes)
 	defaults["AutomaticRetryStatusCodes"] = operation_setting.AutomaticRetryStatusCodesToString()
 	defaults["AutomaticDisableStatusCodes"] = operation_setting.AutomaticDisableStatusCodesToString()
@@ -64,8 +77,13 @@ func requestPolicyDefaultOptions() map[string]string {
 	return defaults
 }
 
+func isRequestPreprocessingOption(key string) bool {
+	return strings.HasPrefix(key, image_compression_setting.Prefix) ||
+		strings.HasPrefix(key, "redaction_setting.") || key == reasoning.AutoEffortOptionKey
+}
+
 func IsRequestPolicyOption(key string) bool {
-	if strings.HasPrefix(key, "channel_affinity_setting.") {
+	if isRequestPreprocessingOption(key) || strings.HasPrefix(key, "channel_affinity_setting.") {
 		return true
 	}
 	switch key {
@@ -199,23 +217,74 @@ func BuildRequestPolicy(options map[string]string) (*RequestPolicySnapshot, erro
 			return nil, fmt.Errorf("negative affinity TTL")
 		}
 	}
+	snapshot.imageCompression, err = image_compression_setting.DecodeOptions(raw)
+	if err != nil {
+		return nil, err
+	}
+	for key := range raw {
+		if isRequestPreprocessingOption(key) {
+			if _, ok := defaults[key]; !ok {
+				return nil, fmt.Errorf("unknown request preprocessing option: %s", key)
+			}
+		}
+	}
+	for _, key := range []string{"redaction_setting.enabled", "redaction_setting.allow_response_restore"} {
+		if raw[key] != "true" && raw[key] != "false" {
+			return nil, fmt.Errorf("invalid boolean: %s", key)
+		}
+	}
+	limit, err := strconv.Atoi(raw["redaction_setting.max_custom_rules_per_key"])
+	if err != nil || limit < 0 || limit > redaction_setting.MaxRules {
+		return nil, fmt.Errorf("redaction rule limit must be between 0 and %d", redaction_setting.MaxRules)
+	}
+	if _, err := reasoning.ParseAutoEffortOption(raw[reasoning.AutoEffortOptionKey]); err != nil {
+		return nil, err
+	}
 	return snapshot, nil
 }
 
-func refreshRequestPolicySnapshot() error {
+func publishRequestPolicy(snapshot *RequestPolicySnapshot) error {
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	options := snapshot.Options
+	if err := reasoning.LoadAutoEffortOption(options[reasoning.AutoEffortOptionKey]); err != nil {
+		return err
+	}
+	redactionFields := make(map[string]string, 3)
+	for key, value := range options {
+		if name, ok := strings.CutPrefix(key, "redaction_setting."); ok {
+			redactionFields[name] = value
+		}
+	}
+	if err := config.UpdateConfigFromMap(config.GlobalConfig.Get("redaction_setting"), redactionFields); err != nil {
+		return err
+	}
+	redaction_setting.UpdateAndSync()
+	image_compression_setting.Publish(snapshot.imageCompression)
+	for key, value := range options {
+		if isRequestPreprocessingOption(key) {
+			common.OptionMap[key] = value
+		}
+	}
+	requestPolicySnapshot.Store(snapshot)
+	return nil
+}
+
+func refreshRequestPolicySnapshot(preprocessing map[string]string) error {
 	common.OptionMapRWMutex.RLock()
 	options := make(map[string]string)
 	for key, value := range common.OptionMap {
-		if IsRequestPolicyOption(key) {
+		if IsRequestPolicyOption(key) && !isRequestPreprocessingOption(key) {
 			options[key] = value
 		}
 	}
 	common.OptionMapRWMutex.RUnlock()
+	maps.Copy(options, preprocessing)
 	snapshot, err := BuildRequestPolicy(options)
-	if err == nil {
-		requestPolicySnapshot.Store(snapshot)
+	if err != nil {
+		return err
 	}
-	return err
+	return publishRequestPolicy(snapshot)
 }
 
 // UpdateRequestPolicyOptions validates the entire resulting policy before any
@@ -249,10 +318,12 @@ func UpdateRequestPolicyOptions(values map[string]string) error {
 		return err
 	}
 	for key, value := range values {
+		if isRequestPreprocessingOption(key) {
+			continue
+		}
 		if err := updateOptionMap(key, value); err != nil {
 			return err
 		}
 	}
-	requestPolicySnapshot.Store(snapshot)
-	return nil
+	return publishRequestPolicy(snapshot)
 }

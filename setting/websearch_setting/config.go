@@ -2,27 +2,31 @@ package websearch_setting
 
 import (
 	"fmt"
+	"math"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/QuantumNous/new-api/pkg/toolcatalog"
 	"github.com/QuantumNous/new-api/setting/config"
 )
 
-// Provider names a search or fetch implementation. The same list is what the
-// channel setting and the global candidate order accept.
 const (
-	ProviderAntigravity = "antigravity"
-	ProviderCodex       = "codex"
-	ProviderDeepSeek    = "deepseek"
-	ProviderExa         = "exa"
-	ProviderLocal       = "local"
+	ProviderAntigravity = toolcatalog.Antigravity
+	ProviderCodex       = toolcatalog.Codex
+	ProviderDeepSeek    = toolcatalog.DeepSeek
+	ProviderExa         = toolcatalog.Exa
+	ProviderLocal       = toolcatalog.Local
+	ProviderMoonshot    = toolcatalog.Moonshot
+	ProviderPerplexity  = toolcatalog.Perplexity
+	ProviderZhipu       = toolcatalog.Zhipu
+	ProviderBaiduV2     = toolcatalog.BaiduV2
 )
 
-// KnownProviders lists every provider name this build registers. A name outside
-// this list is dropped from CandidateOrder rather than failing the update, so a
-// typo costs the wrong order and not the whole chain.
 func KnownProviders() []string {
-	return []string{ProviderAntigravity, ProviderCodex, ProviderDeepSeek, ProviderExa, ProviderLocal}
+	return toolcatalog.IDs()
 }
 
 // WebSearchSetting is the global default for every channel. A channel setting
@@ -32,10 +36,15 @@ type WebSearchSetting struct {
 	// separated. Empty keeps the built-in ordering. It reorders the candidates a
 	// channel can reach; it never adds one that has no credential.
 	CandidateOrder string `json:"candidate_order"`
+	GroupPolicies  string `json:"group_policies"`
+	groupPolicies  map[string]map[string]groupPolicy
 	// NativeFirst keeps the provider whose upstream speaks the client's own
 	// contract ahead of the rest. Turning it off leaves the ordering to
 	// CandidateOrder and the registration order.
-	NativeFirst bool `json:"native_first"`
+	NativeFirst            bool `json:"native_first"`
+	BuiltinFallbackEnabled bool `json:"builtin_fallback_enabled"`
+	FallbackEnabled        bool `json:"fallback_enabled"`
+	LocalFetchMaxBytes     int  `json:"local_fetch_max_bytes"`
 
 	SearchCacheTTLSeconds        int `json:"search_cache_ttl_seconds"`
 	FetchCacheTTLSeconds         int `json:"fetch_cache_ttl_seconds"`
@@ -56,7 +65,10 @@ type WebSearchSetting struct {
 
 // Defaults for the numeric fields. Zero in the setting means "keep this".
 const (
+	DefaultSearchResultCount            = 5
 	defaultSearchCacheTTLSeconds        = 600
+	defaultLocalFetchMaxBytes           = 2 << 20
+	maxLocalFetchMaxBytes               = 8 << 20
 	defaultFetchCacheTTLSeconds         = 3600
 	defaultRedirectCacheTTLSeconds      = 86400
 	defaultResponseHeaderTimeoutSeconds = 25
@@ -66,7 +78,9 @@ const (
 )
 
 var webSearchSetting = WebSearchSetting{
+	GroupPolicies:                "{}",
 	NativeFirst:                  true,
+	LocalFetchMaxBytes:           defaultLocalFetchMaxBytes,
 	SearchCacheTTLSeconds:        defaultSearchCacheTTLSeconds,
 	FetchCacheTTLSeconds:         defaultFetchCacheTTLSeconds,
 	RedirectCacheTTLSeconds:      defaultRedirectCacheTTLSeconds,
@@ -112,47 +126,111 @@ func GlobalProviders() []string {
 	return []string{ProviderExa}
 }
 
-// UpdateAndSync validates the value that was just written into the struct and
-// publishes it. A bad order is reported but still published with the unknown
-// names dropped, so the operator sees the warning without losing the rest.
+const optionPrefix = "websearch_setting."
+
+func IsOption(key string) bool {
+	return strings.HasPrefix(key, optionPrefix)
+}
+
+// UpdateAndSync publishes a validated snapshot from the staged settings.
 func UpdateAndSync() error {
-	if err := validate(webSearchSetting); err != nil {
-		published.Store(webSearchSetting)
+	next := webSearchSetting
+	if next.LocalFetchMaxBytes == 0 {
+		next.LocalFetchMaxBytes = defaultLocalFetchMaxBytes
+	}
+	if next.GroupPolicies == "" {
+		next.GroupPolicies = "{}"
+	}
+	previous := Get()
+	next.groupPolicies = previous.groupPolicies
+	if next.GroupPolicies != previous.GroupPolicies {
+		policies, err := parseGroupPolicies(next.GroupPolicies)
+		if err != nil {
+			webSearchSetting = previous
+			return err
+		}
+		next.groupPolicies = policies
+	}
+	options, err := config.ConfigToMap(&next)
+	if err == nil {
+		for field, value := range options {
+			if field == "group_policies" {
+				continue
+			}
+			if err = ValidateOption(optionPrefix+field, value); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		webSearchSetting = previous
 		return err
 	}
-	published.Store(webSearchSetting)
+	webSearchSetting = next
+	published.Store(next)
 	return nil
 }
 
-func validate(setting WebSearchSetting) error {
-	known := make(map[string]struct{}, len(KnownProviders()))
-	for _, provider := range KnownProviders() {
-		known[provider] = struct{}{}
+func ValidateOption(key, value string) error {
+	field := strings.TrimPrefix(key, optionPrefix)
+	switch field {
+	case "group_policies":
+		return ValidateGroupPolicies(value)
+	case "candidate_order":
+		return validateProviderOrder(value)
+	case "native_first", "builtin_fallback_enabled", "fallback_enabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return fmt.Errorf("%s must be a boolean", field)
+		}
+	case "local_fetch_max_bytes":
+		return validateOptionInteger(field, value, 1, maxLocalFetchMaxBytes)
+	case "search_cache_ttl_seconds", "fetch_cache_ttl_seconds", "redirect_cache_ttl_seconds":
+		return validateOptionInteger(field, value, -1, math.MaxInt64/int64(time.Second))
+	case "response_header_timeout_seconds":
+		return validateOptionInteger(field, value, 0, math.MaxInt64/int64(time.Second))
+	case "retry_attempts":
+		return validateOptionInteger(field, value, 0, 5)
+	case "retry_base_delay_milliseconds":
+		return validateOptionInteger(field, value, 0, math.MaxInt64/int64(time.Millisecond)/16)
+	case "exa_base_url":
+		if endpoint := strings.TrimSpace(value); endpoint != "" {
+			parsed, err := url.Parse(endpoint)
+			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+				return fmt.Errorf("%s must be an absolute HTTP or HTTPS base URL without credentials, query, or fragment", field)
+			}
+		}
+	case "exa_api_key", "antigravity_search_model":
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("%s must not contain line breaks or NUL bytes", field)
+		}
+	default:
+		return fmt.Errorf("unknown web search option %q", key)
 	}
-	var unknown []string
-	for _, provider := range strings.Split(setting.CandidateOrder, ",") {
+	return nil
+}
+
+func validateOptionInteger(field, raw string, min, max int64) error {
+	value, err := strconv.ParseInt(raw, 10, strconv.IntSize)
+	if err != nil || value < min || value > max {
+		return fmt.Errorf("%s must be an integer between %d and %d", field, min, max)
+	}
+	return nil
+}
+
+func validateProviderOrder(raw string) error {
+	seen := make(map[string]struct{})
+	for _, provider := range strings.Split(raw, ",") {
 		name := strings.ToLower(strings.TrimSpace(provider))
 		if name == "" {
 			continue
 		}
-		if _, ok := known[name]; !ok {
-			unknown = append(unknown, name)
+		if !ChannelProviderIsKnown(name) {
+			return fmt.Errorf("candidate_order names unknown provider %q", name)
 		}
-	}
-	if len(unknown) > 0 {
-		return fmt.Errorf("candidate_order names unknown providers: %s", strings.Join(unknown, ", "))
-	}
-	if setting.SearchCacheTTLSeconds < -1 || setting.FetchCacheTTLSeconds < -1 || setting.RedirectCacheTTLSeconds < -1 {
-		return fmt.Errorf("cache ttl must be -1 or greater")
-	}
-	if setting.ResponseHeaderTimeoutSeconds < 0 {
-		return fmt.Errorf("response_header_timeout_seconds must not be negative")
-	}
-	if setting.RetryAttempts < 0 || setting.RetryAttempts > 10 {
-		return fmt.Errorf("retry_attempts must be between 0 and 10")
-	}
-	if setting.RetryBaseDelayMilliseconds < 0 {
-		return fmt.Errorf("retry_base_delay_milliseconds must not be negative")
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("candidate_order names duplicate provider %q", name)
+		}
+		seen[name] = struct{}{}
 	}
 	return nil
 }

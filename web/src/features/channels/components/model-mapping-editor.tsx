@@ -226,21 +226,26 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
 
   useEffect(() => {
     focusPendingRow()
-  }, [rows])
+  }, [rows, mode, filter])
 
   const applyDraftRequest = useEffectEvent(() => {
     const request = props.draftRequest
     if (!request) return
+    setMode('visual')
+    setFilter('')
     const existing = request.from
       ? rows.find((row) => row.from === request.from)
       : undefined
     if (existing) {
+      const field = request.focus ?? 'to'
       const input = document.querySelector(
-        `[id="${rowInputId(existing.id, request.focus ?? 'to')}"]`
+        `[id="${rowInputId(existing.id, field)}"]`
       )
       if (input instanceof HTMLInputElement) {
         input.focus()
         input.scrollIntoView({ block: 'center' })
+      } else {
+        pendingRowFocusRef.current = { rowId: existing.id, field }
       }
     } else {
       const rowId = createRowId()

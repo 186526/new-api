@@ -18,8 +18,9 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
+import { isAxiosError } from 'axios'
 import { ChevronDown, KeyRound, Settings2, WalletCards } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useForm, type SubmitErrorHandler } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -87,11 +88,17 @@ import {
   transformFormDataToPayload,
   transformApiKeyToFormDefaults,
 } from '../lib'
-import type { ApiKey } from '../types'
+import {
+  attachRedactionError,
+  needsRedactionRevision,
+  redactionErrorMessage,
+} from '../lib/redaction-feedback'
+import type { ApiKey, ApiResponse } from '../types'
 import {
   ApiKeyGroupCombobox,
   type ApiKeyGroupOption,
 } from './api-key-group-combobox'
+import { ApiKeyRedactionSection } from './api-key-redaction-section'
 import { useApiKeys } from './api-keys-provider'
 import { AutoGroupOrderEditor } from './auto-group-order-editor'
 
@@ -111,7 +118,10 @@ export function ApiKeysMutateDrawer({
   const currentRowId = currentRow?.id
   const { triggerRefresh } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
+  const formId = useId()
+  const submitting = useRef(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [createUnconfirmed, setCreateUnconfirmed] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
     null
@@ -236,6 +246,7 @@ export function ApiKeysMutateDrawer({
             maxAutoGroups
           )
         )
+        setPolicyState({ target, revision: apiKeyData.data.redaction_revision })
         setInitializedTarget(target)
       }
     } else {
@@ -287,57 +298,109 @@ export function ApiKeysMutateDrawer({
     }
   }, [groups, form, selectedGroup])
 
+  const { dirtyFields } = form.formState
+  const [policyState, setPolicyState] = useState<{
+    target: string
+    revision?: number
+    conflict?: ApiKey | true
+  } | null>(null)
+  const [reviewingPolicy, setReviewingPolicy] = useState(false)
+  const policy = open && policyState?.target === formTarget ? policyState : null
+
+  useEffect(() => {
+    if (open) return
+    setPolicyState(null)
+    setCreateUnconfirmed(false)
+  }, [open])
+
+  function reportSaveError(result: ApiResponse, fallback: string) {
+    if (result.field === 'count' && result.message_key === 'token.invalid_create_count') {
+      form.setError('tokenCount', { message: t('Token count must be between 1 and 100.') }, { shouldFocus: true })
+      return
+    }
+    const message = redactionErrorMessage(t, result, fallback)
+    if (attachRedactionError(form.setError, result, message)) return
+    if (result.message_key?.startsWith('redaction.') || message !== fallback) {
+      toast.error(message)
+    } else {
+      handleServerError(result, fallback)
+    }
+  }
+
+  async function reviewLatestPolicy() {
+    if (!currentRow) return
+    setReviewingPolicy(true)
+    try {
+      const result = requireServerSuccess(await getApiKey(currentRow.id))
+      if (result.data?.redaction_revision === undefined) {
+        throw new Error(t('Could not load the latest redaction policy'))
+      }
+      setPolicyState({ target: formTarget, conflict: result.data })
+    } catch (error) {
+      handleServerError(error, t('Could not load the latest redaction policy'))
+    } finally {
+      setReviewingPolicy(false)
+    }
+  }
+
+  function leaveCreationUnconfirmed() {
+    setCreateUnconfirmed(true)
+    triggerRefresh()
+  }
+
   const onSubmit = async (data: ApiKeyFormValues) => {
+    if (submitting.current || policy?.conflict || createUnconfirmed) return
+    submitting.current = true
     setIsSubmitting(true)
     try {
-      const basePayload = transformFormDataToPayload(data)
+      const basePayload = transformFormDataToPayload(data, {
+        enabled: !isUpdate || dirtyFields.redaction_enabled === true,
+        config: !isUpdate || !!dirtyFields.redaction_config,
+      })
 
-      if (isUpdate && currentRow) {
+      if (currentRow) {
         const result = await updateApiKey({
           ...basePayload,
           id: currentRow.id,
+          ...(needsRedactionRevision(basePayload) && {
+            redaction_revision: policy?.revision,
+          }),
         })
-        if (result.success) {
-          toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
-          onOpenChange(false)
-          triggerRefresh()
-        } else {
-          handleServerError(result, t(ERROR_MESSAGES.UPDATE_FAILED))
+        if (!result.success) {
+          reportSaveError(result, t(ERROR_MESSAGES.UPDATE_FAILED))
+          return
         }
+        toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
       } else {
-        // Create mode - handle batch creation
-        const count = data.tokenCount || 1
-        let successCount = 0
-
-        for (let i = 0; i < count; i++) {
-          const result = await createApiKey({
-            ...basePayload,
-            name:
-              i === 0 && data.name
-                ? data.name
-                : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
-          })
-          if (result.success) {
-            successCount++
-          } else {
-            handleServerError(result, t(ERROR_MESSAGES.CREATE_FAILED))
-            break
-          }
+        const count = data.tokenCount ?? 1
+        const result = await createApiKey({ ...basePayload, count })
+        if (result?.success === false) {
+          reportSaveError(result, t(ERROR_MESSAGES.CREATE_FAILED))
+          return
         }
-
-        if (successCount > 0) {
-          toast.success(
-            t('Successfully created {{count}} API Key(s)', {
-              count: successCount,
-            })
-          )
-          onOpenChange(false)
-          triggerRefresh()
+        if (result?.success !== true || result.data?.created !== count) {
+          leaveCreationUnconfirmed()
+          return
         }
+        toast.success(t('Successfully created {{count}} API Key(s)', { count }))
       }
+      triggerRefresh()
+      onOpenChange(false)
     } catch (error) {
-      handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
+      const response = isAxiosError<ApiResponse & { code?: string }>(error)
+        ? error.response
+        : undefined
+      if (isUpdate && response?.status === 409 && response.data?.code === 'redaction_revision_conflict') {
+        setPolicyState({ target: formTarget, conflict: true })
+      } else if (!isUpdate && (!response || response.status === 408 || response.status >= 500)) {
+        leaveCreationUnconfirmed()
+      } else if (response?.data?.success === false) {
+        reportSaveError(response.data, t(isUpdate ? ERROR_MESSAGES.UPDATE_FAILED : ERROR_MESSAGES.CREATE_FAILED))
+      } else {
+        handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
+      }
     } finally {
+      submitting.current = false
       setIsSubmitting(false)
     }
   }
@@ -371,7 +434,12 @@ export function ApiKeysMutateDrawer({
   const unlimitedQuota = form.watch('unlimited_quota')
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!submitting.current) onOpenChange(nextOpen)
+      }}
+    >
       <SheetContent
         className={sideDrawerContentClassName('max-w-none sm:!max-w-[620px]')}
       >
@@ -387,9 +455,11 @@ export function ApiKeysMutateDrawer({
         </SheetHeader>
         <Form {...form}>
           <form
-            id='api-key-form'
+            id={formId}
+            method='post'
+            noValidate
             onSubmit={form.handleSubmit(onSubmit, onInvalid)}
-            aria-busy={!isFormInitialized}
+            aria-busy={!isFormInitialized || isSubmitting}
             inert={!isFormInitialized || isSubmitting ? true : undefined}
             className={sideDrawerFormClassName('gap-5')}
           >
@@ -583,19 +653,18 @@ export function ApiKeysMutateDrawer({
                         <Input
                           {...field}
                           type='number'
-                          min='1'
+                          min={1}
+                          max={100}
+                          step={1}
+                          value={Number.isNaN(field.value) ? '' : field.value ?? ''}
                           placeholder={t('Number of keys to create')}
-                          onChange={(e) =>
-                            field.onChange(
-                              Number.parseInt(e.target.value, 10) || 1
-                            )
+                          onChange={(event) =>
+                            field.onChange(event.target.valueAsNumber)
                           }
                         />
                       </FormControl>
                       <FormDescription>
-                        {t(
-                          'Create multiple API keys at once (random suffix will be added to names)'
-                        )}
+                        {t('All keys in the batch share the same name and settings.')}
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
@@ -668,6 +737,35 @@ export function ApiKeysMutateDrawer({
               />
             </SideDrawerSection>
 
+            {open && (
+              <ApiKeyRedactionSection open={open}>
+                {policy?.conflict && (
+                  <div role='alert' className='flex flex-col items-start gap-2 text-sm'>
+                    <p>{t('Redaction policy changed. Your draft was kept.')}</p>
+                    {policy.conflict === true ? (
+                      <Button type='button' variant='outline' disabled={reviewingPolicy} onClick={() => void reviewLatestPolicy()}>
+                        {t('Review latest policy')}
+                      </Button>
+                    ) : (
+                      <>
+                        <p>{policy.conflict.redaction_enabled ? t('Redaction enabled') : t('Redaction disabled')}</p>
+                        <pre className='max-h-48 max-w-full overflow-auto rounded border p-2 whitespace-pre-wrap break-all'>
+                          {JSON.stringify(policy.conflict.redaction_config ?? {}, null, 2)}
+                        </pre>
+                        <Button type='button' variant='outline' onClick={() => {
+                          const latest = policy.conflict
+                          if (latest && latest !== true) {
+                            setPolicyState({ target: formTarget, revision: latest.redaction_revision })
+                          }
+                        }}>
+                          {t('Keep my redaction draft')}
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </ApiKeyRedactionSection>
+            )}
             <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
               <SideDrawerSection>
                 <CollapsibleTrigger
@@ -778,16 +876,22 @@ export function ApiKeysMutateDrawer({
             </Collapsible>
           </form>
         </Form>
+        <div role='status' className={cn(createUnconfirmed && 'px-6 text-sm')}>
+          {createUnconfirmed &&
+            t('Creation could not be confirmed. Check the key list before submitting again.')}
+        </div>
         <SheetFooter className={sideDrawerFooterClassName()}>
           <SheetClose
-            render={<Button variant='outline' className='w-full sm:w-auto' />}
+            render={<Button type='button' variant='outline' disabled={isSubmitting} className='w-full sm:w-auto' />}
           >
             {t('Close')}
           </SheetClose>
           <Button
-            type='button'
-            onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={!isFormInitialized || isSubmitting}
+            type='submit'
+            form={formId}
+            disabled={
+              !isFormInitialized || isSubmitting || !!policy?.conflict || createUnconfirmed
+            }
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

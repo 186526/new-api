@@ -24,14 +24,15 @@ func ListSystemInstances(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    responses,
+		"success":          true,
+		"message":          "",
+		"data":             responses,
+		"reporter_enabled": common.SystemInstanceReporterEnabled(),
 	})
 }
 
-func DeleteStaleSystemInstances(c *gin.Context) {
-	deletedCount, err := model.DeleteStaleSystemInstances(common.GetTimestamp())
+func DeleteExpiredSystemInstances(c *gin.Context) {
+	deletedCount, err := model.DeleteExpiredSystemInstances(c.Request.Context(), common.GetTimestamp())
 	if err != nil {
 		common.ApiError(c, err)
 		return

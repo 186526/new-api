@@ -1,6 +1,9 @@
 package relay
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -62,11 +65,7 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
-	rawBody, bodyError := systemOneForwardableBody(c, request.RawBody)
-	if bodyError != nil {
-		return bodyError
-	}
-
+	rawBody := request.RawBody
 	longContext := HeadersEnabled(c.GetHeader(SystemOneLongContextHeader))
 	imagesEnabled := HeadersEnabled(c.GetHeader(SystemOneImagesHeader))
 	if problems := ValidateSystemOneBody(rawBody, longContext, imagesEnabled); len(problems) > 0 {
@@ -111,12 +110,12 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	defer httpResp.Body.Close()
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return systemOneFailure(c, info, httpResp, statusCodeMappingStr)
+		return systemOneFailure(c, httpResp, statusCodeMappingStr)
 	}
 
-	responseBody, err := io.ReadAll(httpResp.Body)
+	responseBody, err := readSystemOneSuccessBody(httpResp)
 	if err != nil {
-		return types.NewError(err, types.ErrorCodeReadResponseBodyFailed, types.ErrOptionWithSkipRetry())
+		return types.NewErrorWithStatusCode(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 
 	usage := systemOneUsage(responseBody)
@@ -127,10 +126,6 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	} else {
 		c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	}
-	// The upstream may answer compressed. The body was read and rewritten here,
-	// so the encoding it arrived in no longer describes what is written.
-	c.Writer.Header().Del("Content-Encoding")
-	c.Writer.Header().Del("Transfer-Encoding")
 	c.Writer.WriteHeader(httpResp.StatusCode)
 	if _, err := c.Writer.Write(responseBody); err != nil {
 		return types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithSkipRetry())
@@ -140,13 +135,49 @@ func SystemOneHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	return nil
 }
 
+func readSystemOneSuccessBody(response *http.Response) ([]byte, error) {
+	payload, err := readSystemOneUpstreamBody(response)
+	if err != nil {
+		return nil, err
+	}
+	if trimmed := bytes.TrimSpace(payload); len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+		return nil, errors.New("System One upstream response is not a JSON object")
+	}
+	return payload, nil
+}
+
+func readSystemOneUpstreamBody(response *http.Response) ([]byte, error) {
+	var body io.Reader = response.Body
+	switch strings.ToLower(strings.TrimSpace(strings.Join(response.Header.Values("Content-Encoding"), ","))) {
+	case "", "identity":
+	case "gzip", "x-gzip":
+		decoded, err := gzip.NewReader(body)
+		if err != nil {
+			return nil, err
+		}
+		defer decoded.Close()
+		body = decoded
+	default:
+		return nil, errors.New("unsupported System One upstream response encoding")
+	}
+	const maxResponseBytes = 32 << 20
+	payload, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxResponseBytes {
+		return nil, errors.New("System One upstream response exceeds 32 MiB")
+	}
+	return payload, nil
+}
+
 // systemOneFailure answers a non-2xx upstream. A status the caller can act on
 // keeps its own value and document; anything else leaves the retry loop to
 // decide, so a transient upstream fault still retries.
-func systemOneFailure(c *gin.Context, info *relaycommon.RelayInfo, httpResp *http.Response, statusCodeMappingStr string) *types.NewAPIError {
-	body, readErr := readSystemOneUpstreamBody(httpResp)
-	if readErr != nil {
-		return service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+func systemOneFailure(c *gin.Context, httpResp *http.Response, statusCodeMappingStr string) *types.NewAPIError {
+	body, err := readSystemOneUpstreamBody(httpResp)
+	if err != nil {
+		body = nil
 	}
 
 	if apiError := systemOneUpstreamError(httpResp.StatusCode, body, httpResp.Header.Get("Retry-After")); apiError != nil {
@@ -160,7 +191,9 @@ func systemOneFailure(c *gin.Context, info *relaycommon.RelayInfo, httpResp *htt
 		return apiError
 	}
 
-	apiError := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+	// The generic handler reads to EOF; expose only the bounded, decoded bytes.
+	decoded := &http.Response{StatusCode: httpResp.StatusCode, Body: io.NopCloser(bytes.NewReader(body))}
+	apiError := service.RelayErrorHandler(c.Request.Context(), decoded, false)
 	service.ResetStatusCode(apiError, statusCodeMappingStr)
 	return apiError
 }
@@ -187,20 +220,6 @@ func systemOneValidationRefusal(problems []systemone.ValidationError) *types.New
 	)
 	apiError.Metadata = document
 	return apiError
-}
-
-// systemOneForwardableBody answers the JSON to validate and forward. A multipart
-// request is folded into the JSON shape first, because that is the only shape the
-// rest of the path reads.
-func systemOneForwardableBody(c *gin.Context, rawBody []byte) ([]byte, *types.NewAPIError) {
-	if !common.IsMultipartFormContentType(c.GetHeader("Content-Type")) {
-		return rawBody, nil
-	}
-	joined, problems := systemone.MultipartBody(c.GetHeader("Content-Type"), rawBody)
-	if len(problems) > 0 {
-		return nil, systemOneValidationRefusal(problems)
-	}
-	return joined, nil
 }
 
 // systemOneValidationSummary is the one-line message the error log records for a

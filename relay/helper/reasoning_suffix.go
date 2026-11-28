@@ -9,7 +9,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	hostreasoning "github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/gin-gonic/gin"
 )
@@ -26,8 +25,15 @@ func ApplyReasoningModelSuffix(c *gin.Context, info *relaycommon.RelayInfo, outb
 	if info == nil {
 		return nil
 	}
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled ||
-		info.ChannelMeta != nil && info.ChannelSetting.PassThroughBodyEnabled {
+	PrepareAutoReasoning(info)
+	var settings dto.ChannelSettings
+	if info.ChannelMeta != nil {
+		settings = info.ChannelSetting
+	}
+	if RequestPassesThrough(c, info, settings) {
+		if info.AutoReasoning != nil {
+			info.AutoReasoning.Reason, info.AutoReasoning.Effort = "passthrough", ""
+		}
 		return nil
 	}
 
@@ -69,6 +75,19 @@ func ApplyReasoningModelSuffix(c *gin.Context, info *relaycommon.RelayInfo, outb
 			selected.intent.IncludeThoughts = explicit.IncludeThoughts
 		}
 		info.ReasoningConversion = reasoning.StateFromIntent(selected.intent)
+		if info.AutoReasoning != nil {
+			info.AutoReasoning.Reason, info.AutoReasoning.Effort = "model_modifier", ""
+		}
+	} else {
+		intent, automaticDiagnostics, err := autoReasoningIntent(info, selected.base)
+		if err != nil {
+			return reasoning.AsClientError(err)
+		}
+		if intent.HasStrength() {
+			selected.intent, selected.hasThinking = intent, true
+			info.ReasoningConversion = reasoning.StateFromIntent(intent)
+			diagnostics = append(diagnostics, automaticDiagnostics...)
+		}
 	}
 	if info.ChannelMeta != nil {
 		info.UpstreamModelName = selected.base

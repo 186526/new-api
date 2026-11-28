@@ -106,6 +106,11 @@ async function renderOverview() {
   )
 }
 
+function getSetupGuidePanel(toggle: HTMLElement): Element | null {
+  const panelId = toggle.getAttribute('aria-controls')
+  return panelId ? document.querySelector(`[id="${panelId}"]`) : null
+}
+
 describe('overview setup guide', () => {
   it('shows usage first and only a header entry when setup is complete', async () => {
     await renderOverview()
@@ -120,9 +125,7 @@ describe('overview setup guide', () => {
     for (const name of ['API Keys', 'Channels', 'Usage Logs', 'Pricing']) {
       expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
     }
-    const panel = document.getElementById(
-      toggle.getAttribute('aria-controls') ?? ''
-    )
+    const panel = getSetupGuidePanel(toggle)
     expect(panel).toBeInTheDocument()
     expect(panel).not.toBeVisible()
   })
@@ -136,9 +139,7 @@ describe('overview setup guide', () => {
     expect(toggle).toHaveFocus()
     await user.keyboard('{Enter}')
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
-    expect(
-      document.getElementById(toggle.getAttribute('aria-controls') ?? '')
-    ).toBeVisible()
+    expect(getSetupGuidePanel(toggle)).toBeVisible()
     expect(
       screen.getByRole('heading', {
         name: 'Build on your API gateway in minutes',

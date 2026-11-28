@@ -47,6 +47,7 @@ type Channel struct {
 	OtherInfo         string  `json:"other_info"`
 	Tag               *string `json:"tag" gorm:"index"`
 	Setting           *string `json:"setting" gorm:"type:text"` // 渠道额外设置
+	CustomTools       *string `json:"-" gorm:"type:text"`
 	ParamOverride     *string `json:"param_override" gorm:"type:text"`
 	HeaderOverride    *string `json:"header_override" gorm:"type:text"`
 	Remark            *string `json:"remark" gorm:"type:varchar(255)" validate:"max=255"`
@@ -56,7 +57,8 @@ type Channel struct {
 	OtherSettings string `json:"settings" gorm:"column:settings"` // 其他设置，存储azure版本等不需要检索的信息，详见dto.ChannelOtherSettings
 
 	// cache info
-	Keys []string `json:"-" gorm:"-"`
+	Keys             []string `json:"-" gorm:"-"`
+	clearCustomTools bool
 }
 
 const ChannelStatusReasonAllKeysDisabled = "All keys are disabled"
@@ -599,14 +601,16 @@ func (channel *Channel) Update() error {
 			}
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
+	update := DB.Model(channel)
+	if !channel.clearCustomTools {
+		update = update.Omit("CustomTools")
+	}
+	if err := update.Updates(channel).Error; err != nil {
 		return err
 	}
+	channel.clearCustomTools = false
 	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	return channel.UpdateAbilities(nil)
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {

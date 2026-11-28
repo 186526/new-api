@@ -451,6 +451,10 @@ func PinTaskPluginEndpoint() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if requestIsRedacted(c) {
+			rejectRequestRedaction(c, http.StatusForbidden, "This plugin cannot enforce request redaction.")
+			return
+		}
 		if claimedModel != pinnedEndpoint.Model {
 			if rewriteErr := rewriteTaskPluginJSONModel(c, pinnedEndpoint.Model); rewriteErr != nil {
 				abortWithOpenAiMessage(c, http.StatusBadRequest, "Invalid task protocol request")

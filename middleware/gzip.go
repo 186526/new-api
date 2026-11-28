@@ -8,6 +8,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -73,7 +74,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 			return http.MaxBytesReader(c.Writer, body, maxBytes)
 		}
 
-		codings := normalizeContentCoding(c.GetHeader("Content-Encoding"))
+		codings := normalizeContentCoding(strings.Join(c.Request.Header.Values("Content-Encoding"), ","))
 		// "identity" names no compression, so a client that spells it out reads
 		// as one that sent no header.
 		if len(codings) == 1 && codings[0] == "identity" {
@@ -83,8 +84,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		// need every layer unwound in order, and no client of this gateway sends
 		// one, so it is refused rather than misread as the outermost coding.
 		if len(codings) > 1 {
-			_ = origBody.Close()
-			c.AbortWithStatus(http.StatusUnsupportedMediaType)
+			abortDecompressionWithStatus(c, http.StatusUnsupportedMediaType, "Stacked Content-Encoding values are not supported")
 			return
 		}
 
@@ -96,8 +96,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		case "gzip":
 			gzipReader, err := gzip.NewReader(origBody)
 			if err != nil {
-				_ = origBody.Close()
-				c.AbortWithStatus(http.StatusBadRequest)
+				abortDecompressionWithStatus(c, http.StatusBadRequest, "Invalid gzip request body")
 				return
 			}
 			// Replace the request body with the decompressed data, and enforce a max size (post-decompression).
@@ -121,8 +120,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		case "zstd":
 			reader, err := zstd.NewReader(origBody)
 			if err != nil {
-				_ = origBody.Close()
-				c.AbortWithStatus(http.StatusBadRequest)
+				abortDecompressionWithStatus(c, http.StatusBadRequest, "Invalid zstd request body")
 				return
 			}
 			c.Request.Body = wrapMaxBytes(&readCloser{
@@ -134,10 +132,12 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 			})
 			decompressed = true
 		default:
-			// An unsupported coding is refused rather than read as the body it
-			// claims to wrap: the bytes would be handed to the relay as if they
-			// were the request.
 			_ = origBody.Close()
+			if isSystemOneDecisionRoute(c) {
+				common.WriteTypeSafeError(c, http.StatusUnsupportedMediaType, "Unsupported Content-Encoding")
+				c.Abort()
+				return
+			}
 			abortWithOpenAiMessage(c, http.StatusUnsupportedMediaType, common.LogText("unsupported Content-Encoding: %s", c.GetHeader("Content-Encoding")))
 			return
 		}
@@ -149,6 +149,28 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		// Continue processing the request
 		c.Next()
 	}
+}
+
+func isSystemOneDecisionRoute(c *gin.Context) bool {
+	if c.Request.Method != http.MethodPost {
+		return false
+	}
+	switch c.FullPath() {
+	case relayconstant.SystemOneContractPathPrefix + "/systemone", relayconstant.SystemOneUpstreamPath:
+		return true
+	default:
+		return false
+	}
+}
+
+func abortDecompressionWithStatus(c *gin.Context, status int, message string) {
+	_ = c.Request.Body.Close()
+	if isSystemOneDecisionRoute(c) {
+		common.WriteTypeSafeError(c, status, message)
+		c.Abort()
+		return
+	}
+	c.AbortWithStatus(status)
 }
 
 func firstCoding(codings []string) string {

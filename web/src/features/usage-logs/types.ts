@@ -55,6 +55,7 @@ export interface CommonLogFilters extends CommonFilters {
   username?: string
   requestId?: string
   upstreamRequestId?: string
+  toolContract?: string
 }
 
 /**
@@ -114,8 +115,44 @@ export interface ToolSurchargeItem {
   price: number
 }
 
+type ToolExecution = {
+  contract: string
+  provider?: string
+  outcome?: 'success' | 'empty' | 'upstream_error' | 'unavailable'
+  cache_hit: boolean
+  refund?: 'requested' | 'completed' | 'failed'
+}
+
+type ImageCompressionWork = {
+  processed: number
+  saved_bytes: number
+  elapsed_ms: number
+  skipped: number
+  failed: number
+}
+
 export interface LogOtherData {
+  tool_execution?: ToolExecution
+  image_compression?: ImageCompressionWork & {
+    reason?: string
+    outbound_status?: string
+    outbound_compressed?: number
+    outbound_saved_bytes?: number
+    preprocessing?: ImageCompressionWork
+  }
+  request_redaction?: { matches: number; categories: number }
+  automatic_reasoning?: {
+    effort: string
+    scale: number
+    reason: string
+    conflict_resolution?: string
+    policy_effort?: string
+    tier?: number
+    outbound_status?: string
+    outbound_fields?: Record<string, string | number | boolean>
+  }
   admin_info?: {
+    tool_execution?: ToolExecution
     request_policy?: PolicyEvent[]
     is_multi_key?: boolean
     multi_key_index?: number
@@ -439,6 +476,7 @@ export interface GetLogsParams {
   group?: string
   request_id?: string
   upstream_request_id?: string
+  tool_contract?: string
 }
 
 export interface GetLogsResponse {

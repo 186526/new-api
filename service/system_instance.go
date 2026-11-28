@@ -2,23 +2,22 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"runtime"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 
-	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/google/uuid"
 )
 
-const systemInstanceReportInterval = 30 * time.Second
-
-var systemInstanceReporterOnce sync.Once
+const (
+	systemInstanceReportInterval    = 30 * time.Second
+	systemInstanceDBTimeout         = 5 * time.Second
+	defaultSystemInstanceTTLSeconds = 180
+)
 
 type SystemInstanceInfo struct {
 	SchemaVersion int                       `json:"schema_version"`
@@ -64,37 +63,87 @@ type SystemInstanceStorageMetrics struct {
 	UsedPercent float64 `json:"used_percent"`
 }
 
-func StartSystemInstanceReporter() {
-	systemInstanceReporterOnce.Do(func() {
-		gopool.Go(func() {
-			reportSystemInstanceWithLog()
-
-			ticker := time.NewTicker(systemInstanceReportInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				reportSystemInstanceWithLog()
+func StartSystemInstanceReporter() func() {
+	hostname, _ := os.Hostname()
+	identity := common.GetSystemInstanceIdentity(hostname)
+	if common.SystemInstanceReporterEnabled() && identity.Key == "" {
+		logger.LogWarn(context.Background(), "system instance report disabled: node name is empty")
+	}
+	report := common.SystemInstanceReporterEnabled() && identity.Key != ""
+	cleanup := common.RunsAdmin()
+	if !report && !cleanup {
+		return func() {}
+	}
+	ttl := int64(common.GetEnvOrDefault("SYSTEM_INSTANCE_AUTO_EXPIRE_SECONDS", defaultSystemInstanceTTLSeconds))
+	if ttl <= model.SystemInstanceStaleAfterSeconds || ttl > 86400 {
+		ttl = defaultSystemInstanceTTLSeconds
+	}
+	reporter := systemInstanceReporter{identity: identity, hostname: hostname, processID: uuid.NewString(), ttl: ttl}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(systemInstanceReportInterval)
+		defer ticker.Stop()
+		for ctx.Err() == nil {
+			if report {
+				runSystemInstanceDBOperation(ctx, "report", reporter.report)
 			}
-		})
-	})
+			if cleanup {
+				runSystemInstanceDBOperation(ctx, "cleanup", func(dbCtx context.Context) error {
+					_, err := model.DeleteExpiredSystemInstances(dbCtx, common.GetTimestamp())
+					return err
+				})
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), systemInstanceDBTimeout)
+		defer waitCancel()
+		select {
+		case <-done:
+		case <-waitCtx.Done():
+			logger.LogWarn(context.Background(), "system instance reporter did not stop before deadline; skipped unregister")
+			return
+		}
+		if report {
+			runSystemInstanceDBOperation(waitCtx, "unregister", func(dbCtx context.Context) error {
+				return model.UnregisterSystemInstance(dbCtx, reporter.identity.Key, reporter.processID)
+			})
+		}
+	}
 }
 
-func ReportCurrentSystemInstance() error {
-	identity := common.GetNodeIdentity()
-	hostname, hostnameErr := os.Hostname()
-	if strings.TrimSpace(identity.Name) == "" {
-		if hostnameErr != nil || strings.TrimSpace(hostname) == "" {
-			return fmt.Errorf("system instance node name is empty")
-		}
-		identity.Name = hostname
-		identity.Source = common.NodeNameSourceHostname
-		identity.ManuallyConfigured = false
-		identity.ShouldConfigureManually = true
+func runSystemInstanceDBOperation(parent context.Context, operation string, run func(context.Context) error) {
+	if parent.Err() != nil {
+		return
 	}
+	ctx, cancel := context.WithTimeout(parent, systemInstanceDBTimeout)
+	defer cancel()
+	if err := run(ctx); err != nil && parent.Err() == nil {
+		logger.LogWarn(parent, common.LogText("system instance %s failed: %v", operation, err))
+	}
+}
+
+type systemInstanceReporter struct {
+	identity  common.SystemInstanceIdentity
+	hostname  string
+	processID string
+	ttl       int64
+}
+
+func (reporter systemInstanceReporter) report(ctx context.Context) error {
 	systemStatus := common.GetSystemStatus()
 	diskInfo := common.GetDiskSpaceInfo()
 	info := SystemInstanceInfo{
 		SchemaVersion: 1,
-		Node:          identity,
+		Node:          reporter.identity.NodeIdentity,
 		Role: SystemInstanceRoleInfo{
 			IsMaster:   common.IsMasterNode,
 			ServerRole: common.ServerRole,
@@ -107,7 +156,7 @@ func ReportCurrentSystemInstance() error {
 			StartedAt: common.StartTime,
 		},
 		Host: SystemInstanceHostInfo{
-			Hostname: hostname,
+			Hostname: reporter.hostname,
 		},
 		Resources: SystemInstanceResources{
 			CPU: SystemInstanceResourceUsage{
@@ -124,11 +173,14 @@ func ReportCurrentSystemInstance() error {
 			},
 		},
 	}
-	return model.UpsertSystemInstance(identity.Name, info, common.StartTime, common.GetTimestamp())
-}
-
-func reportSystemInstanceWithLog() {
-	if err := ReportCurrentSystemInstance(); err != nil {
-		logger.LogWarn(context.Background(), common.LogText("system instance report failed: %v", err))
+	now := common.GetTimestamp()
+	var expiresAt int64
+	if reporter.identity.Ephemeral {
+		expiresAt = now + reporter.ttl
 	}
+	return model.UpsertSystemInstance(ctx, model.SystemInstanceHeartbeat{
+		NodeName: reporter.identity.Key, Info: info, StartedAt: common.StartTime,
+		LastSeenAt: now, ProcessID: reporter.processID, ExpiresAt: expiresAt,
+		HostNodeName: reporter.identity.HostNodeName,
+	})
 }

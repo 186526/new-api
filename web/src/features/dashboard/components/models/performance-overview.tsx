@@ -35,6 +35,8 @@ import type { PerfModelSummary } from '@/features/performance-metrics/types'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
 
+import { RequestObservationSummary } from '../request-observation-summary'
+
 const PERFORMANCE_WINDOW_HOURS = 24
 const TOP_MODEL_LIMIT = 6
 
@@ -131,6 +133,13 @@ export function PerformanceOverview() {
           </div>
         )}
       </div>
+      {metricsQuery.data?.data.request_observations && (
+        <div className='border-t px-4 py-2.5 sm:px-5'>
+          <RequestObservationSummary
+            data={metricsQuery.data.data.request_observations}
+          />
+        </div>
+      )}
     </div>
   )
 }

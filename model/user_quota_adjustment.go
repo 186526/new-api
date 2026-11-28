@@ -22,7 +22,17 @@ type UserQuotaAdjustment struct {
 	After    int
 }
 
+type UserQuotaAdjustmentActor struct {
+	ID        int
+	Role      int
+	RequestID string
+}
+
 func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuotaAdjustment, error) {
+	return AdjustUserQuotaWithActor(userID, mode, value, UserQuotaAdjustmentActor{Role: operatorRole})
+}
+
+func AdjustUserQuotaWithActor(userID int, mode string, value int, actor UserQuotaAdjustmentActor) (*UserQuotaAdjustment, error) {
 	if userID <= 0 || (mode != "add" && mode != "subtract" && mode != "override") {
 		return nil, ErrInvalidUserQuotaAdjustment
 	}
@@ -34,13 +44,27 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 	}
 
 	var adjustment UserQuotaAdjustment
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err := nonRequestQuotaTransaction(func(tx *gorm.DB) error {
 		var user User
 		if err := lockForUpdate(tx).First(&user, userID).Error; err != nil {
 			return err
 		}
-		if operatorRole != common.RoleRootUser && operatorRole <= user.Role {
+		if actor.Role != common.RoleRootUser && actor.Role <= user.Role {
 			return ErrUserQuotaPermission
+		}
+		if SQLQuotaLedgerWriterEnabled() {
+			if actor.ID <= 0 || actor.RequestID == "" {
+				return ErrInvalidUserQuotaAdjustment
+			}
+			receipt := NonRequestQuotaReceipt{
+				Kind: "admin_adjustment", SourceID: actor.RequestID, RequestID: actor.RequestID,
+				UserID: userID, ActorID: actor.ID, ActorRole: actor.Role, Mode: mode, Amount: value,
+			}
+			if err := receipt.applyOnce(tx, user, nil, ErrWalletQuotaLimitExceeded); err != nil {
+				return err
+			}
+			adjustment = UserQuotaAdjustment{UserID: user.Id, Username: user.Username, Before: receipt.Before, After: receipt.After}
+			return nil
 		}
 		if user.Quota > common.MaxWalletQuota || user.Quota < -common.MaxWalletQuota {
 			return ErrWalletQuotaLimitExceeded
@@ -77,7 +101,7 @@ func AdjustUserQuota(userID, operatorRole int, mode string, value int) (*UserQuo
 	// Apply only the committed difference, preserving outstanding reservations.
 	// Both balances are bounded above, so their difference fits in int64.
 	delta := int64(adjustment.After) - int64(adjustment.Before)
-	if delta != 0 {
+	if delta != 0 && !SQLQuotaLedgerWriterEnabled() {
 		// The transaction already wrote the row, so the ledger moves by the
 		// committed difference without ever being rebuilt from that row.
 		if err := syncRowCommittedUserQuota(userID, delta); err != nil {

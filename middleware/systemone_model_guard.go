@@ -25,16 +25,34 @@ func SystemOneModelGuard() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		request := &dto.SystemOneRequest{}
-		if err := common.UnmarshalBodyReusable(c, request); err != nil {
-			// The body is validated later, where a failure is reported with the
-			// field locations a client reads; this check only needs a name.
-			c.Next()
-			return
+		var modelName string
+		if common.IsMultipartFormContentType(c.GetHeader("Content-Type")) {
+			request, problems, err := common.ReadSystemOneMultipart(c)
+			switch {
+			case common.IsRequestBodyTooLargeError(err):
+				common.WriteTypeSafeError(c, http.StatusRequestEntityTooLarge, "Request body is larger than the 32 MiB the upstream accepts")
+			case err != nil:
+				common.WriteTypeSafeError(c, http.StatusBadRequest, "Could not read the request body")
+			case len(problems) > 0:
+				common.WriteTypeSafeValidationError(c, http.StatusUnprocessableEntity, problems)
+			default:
+				modelName = request.Model
+			}
+			if modelName == "" {
+				c.Abort()
+				return
+			}
+		} else {
+			request := &dto.SystemOneRequest{}
+			if err := common.UnmarshalBodyReusable(c, request); err != nil {
+				c.Next()
+				return
+			}
+			modelName = request.Model
 		}
-		if request.Model != "" && !common.IsSystemOneModel(request.Model) {
+		if modelName != "" && !common.IsSystemOneModel(modelName) {
 			common.WriteTypeSafeError(c, http.StatusBadRequest,
-				"The model '"+request.Model+"' is not served by the System One endpoint")
+				"The model '"+modelName+"' is not served by the System One endpoint")
 			c.Abort()
 			return
 		}

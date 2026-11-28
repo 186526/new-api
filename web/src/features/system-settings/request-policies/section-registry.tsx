@@ -16,24 +16,61 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useMemo } from 'react'
+
 import { createSectionRegistry } from '../utils/section-registry'
 import { ChannelHealthSection } from './channel-health-section'
 import type { RequestPolicySettings } from './defaults'
+import { ImageCompressionSection } from './image-compression-section'
+import { readImageCompressionSettings } from './image-compression-settings'
+import { RedactionGuardrailsSection } from './redaction-guardrails-section'
 import { RequestChecksSection } from './request-checks-section'
 import { RoutingPolicySection } from './routing-section'
+
+function ImageCompressionPolicy(props: { settings: RequestPolicySettings }) {
+  const values = useMemo(
+    () => readImageCompressionSettings(props.settings),
+    [props.settings]
+  )
+  return (
+    <ImageCompressionSection
+      defaultValues={values}
+      passthrough={props.settings['global.pass_through_request_enabled']}
+    />
+  )
+}
 
 const POLICY_SECTIONS = [
   {
     id: 'filtering',
     titleKey: 'Request checks',
     build: (settings: RequestPolicySettings) => (
-      <RequestChecksSection
-        defaultValues={{
-          CheckSensitiveEnabled: settings.CheckSensitiveEnabled,
-          CheckSensitiveOnPromptEnabled: settings.CheckSensitiveOnPromptEnabled,
-          SensitiveWords: settings.SensitiveWords,
-        }}
-      />
+      <>
+        <RequestChecksSection
+          defaultValues={{
+            CheckSensitiveEnabled: settings.CheckSensitiveEnabled,
+            CheckSensitiveOnPromptEnabled:
+              settings.CheckSensitiveOnPromptEnabled,
+            SensitiveWords: settings.SensitiveWords,
+          }}
+        />
+        <RedactionGuardrailsSection
+          enabled={settings['redaction_setting.enabled']}
+          maxCustomRules={
+            settings['redaction_setting.max_custom_rules_per_key']
+          }
+          allowResponseRestore={
+            settings['redaction_setting.allow_response_restore']
+          }
+        />
+      </>
+    ),
+  },
+  {
+    id: 'image-compression',
+    titleKey: 'Image compression',
+    build: (settings: RequestPolicySettings) => (
+      <ImageCompressionPolicy settings={settings} />
     ),
   },
   {

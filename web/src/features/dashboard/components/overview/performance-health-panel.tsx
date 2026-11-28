@@ -34,6 +34,9 @@ import {
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
 
+import { RequestObservationDistribution } from '../request-observation-distribution'
+import { RequestObservationSummary } from '../request-observation-summary'
+
 const PERFORMANCE_WINDOW_HOURS = 24
 const TOP_MODEL_LIMIT = 6
 
@@ -99,6 +102,13 @@ export function PerformanceHealthPanel() {
             tone='info'
           />
         </div>
+
+        <RequestObservationSummary
+          data={metricsQuery.data?.data.request_observations}
+        />
+        <RequestObservationDistribution
+          data={metricsQuery.data?.data.request_observation_distribution}
+        />
 
         {loading ? (
           <div className='space-y-1'>

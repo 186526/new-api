@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	kitreasoning "github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service/redaction"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
@@ -125,6 +126,10 @@ type RelayInfo struct {
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState
+	AutoReasoning       *AutoReasoningMeta
+	ImageCompression    *ImageCompressionMeta
+	ToolExecution       *ToolExecutionMeta
+	RequestRedaction    *RequestRedactionMeta
 	UserSetting         dto.UserSetting
 	UserEmail           string
 	UserQuota           int
@@ -351,6 +356,9 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 		delete(info.ResponsesUsageInfo.BuiltInTools, info.requestInferredToolKey)
 	}
 	info.requestInferredToolKey = ""
+	if info.AutoReasoning != nil {
+		info.AutoReasoning.ResetAttempt()
+	}
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || channelMeta.ChannelSetting.PassThroughBodyEnabled {
 		info.ReasoningEffort = ""
 		info.ReasoningConversion = nil
@@ -660,6 +668,10 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 			//promptTokens: common.GetContextKeyInt(c, constant.ContextKeyPromptTokens),
 			estimatePromptTokens: common.GetContextKeyInt(c, constant.ContextKeyEstimatedTokens),
 		},
+	}
+
+	if observation, protected := redaction.ObserveRequest(c.Request.Context()); protected {
+		info.RequestRedaction = &RequestRedactionMeta{Matches: observation.Matches, Categories: observation.Categories}
 	}
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {

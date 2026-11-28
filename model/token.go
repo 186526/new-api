@@ -32,6 +32,9 @@ type Token struct {
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool   `json:"allow_user_quota_query"`
+	RedactionEnabled    bool   `json:"-" gorm:"not null;default:false"`
+	RedactionConfig     string `json:"-" gorm:"type:text"`
+	RedactionRevision   int64  `json:"-" gorm:"not null;default:0"`
 	CacheExpiresAt      int64  `json:"-" gorm:"-"`
 	CacheMAC            string `json:"-" gorm:"-"`
 }
@@ -160,7 +163,7 @@ func validateLikePattern(input string) error {
 
 const searchHardLimit = 100
 
-func SearchUserTokens(userId int, keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
+func SearchUserTokens(userId int, keyword string, token string, offset int, limit int, redactionEnabled ...bool) (tokens []*Token, total int64, err error) {
 	// model 层强制截断
 	if limit <= 0 || limit > searchHardLimit {
 		limit = searchHardLimit
@@ -188,6 +191,9 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	}
 
 	baseQuery := DB.Model(&Token{}).Where("user_id = ?", userId)
+	if len(redactionEnabled) != 0 {
+		baseQuery = baseQuery.Where("redaction_enabled = ?", redactionEnabled[0])
+	}
 
 	// 非空才加 LIKE 条件，空则跳过（不过滤该字段）
 	if keyword != "" {
@@ -283,14 +289,14 @@ func GetTokenById(id int) (*Token, error) {
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	needsRepair := false
+	invalidMetadata := false
 	if !fromDB && common.RedisEnabled {
-		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
 			return token, nil
 		}
 		needsRepair = errors.Is(err, errTokenCacheNeedsRepair)
-		// Don't return error - fall through to DB
+		invalidMetadata = errors.Is(err, errTokenCacheIntegrity)
 	}
 	token = &Token{}
 	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
@@ -301,6 +307,14 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// 初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
+		}
+		if invalidMetadata {
+			// A policy edit invalidates metadata without deleting the quota ledger.
+			// Use the database identity to verify the independent ledger signature.
+			if ledger, result, ledgerErr := verifiedTokenQuotaLedger(token.Id, key); result == cacheQuotaOK && ledgerErr == nil {
+				token.RemainQuota = int(ledger.granted - ledger.used)
+				token.UsedQuota = int(ledger.used)
+			}
 		}
 		if needsRepair {
 			// The row's own counters are the pre-debit ones under batch
@@ -340,7 +354,14 @@ func (token *Token) Insert() error {
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
-func (token *Token) Update() (err error) {
+func (token *Token) Update() error {
+	return token.UpdateWithRedaction(false)
+}
+
+func (token *Token) UpdateWithRedaction(policySubmitted bool) error {
+	if policySubmitted {
+		return token.updateRedactionPolicy(true)
+	}
 	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
 		common.SysLog(common.LogText("failed to invalidate token cache before update: %s", cacheErr.Error()))

@@ -141,6 +141,48 @@ describe('buildEndpointSample', () => {
     expect(sample).not.toContain('json.loads')
   })
 
+  it.each([
+    [
+      'tools-search',
+      '/v1/tools/search',
+      { query: expect.any(String), count: 10 },
+    ],
+    ['tools-fetch', '/v1/tools/fetch', { url: 'https://example.com/' }],
+    [
+      'alpha-search',
+      '/v1/alpha/search',
+      {
+        model: 'test-model',
+        commands: { search_query: [{ q: expect.any(String) }] },
+      },
+    ],
+    [
+      'moonshot-search',
+      '/moonshot.service/v1/search',
+      { text_query: expect.any(String), num_results: 5 },
+    ],
+    [
+      'moonshot-fetch',
+      '/moonshot.service/v1/fetch',
+      { url: 'https://example.com/' },
+    ],
+  ] as const)(
+    'builds matching curl and Python requests for %s',
+    (id, path, body) => {
+      const context = { ...sampleContext, path }
+      const curl = buildEndpointSample(id, 'curl', context)
+      const python = buildEndpointSample(id, 'python', context)
+      const url = `${sampleContext.baseUrl}${path}`
+      expect(curl).toContain(url)
+      expect(python).toContain(url)
+      expect(python).toContain('response.raise_for_status()')
+      expect(JSON.parse(curl?.match(/-d '([\s\S]*)'$/)?.[1] ?? '')).toEqual(
+        body
+      )
+      expect(JSON.parse(python?.match(/json=(.*),/)?.[1] ?? '')).toEqual(body)
+    }
+  )
+
   it('returns null for an endpoint without a written sample', () => {
     expect(
       buildEndpointSample('unknown-endpoint', 'curl', sampleContext)

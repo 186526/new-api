@@ -14,6 +14,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service/websearch/abstract"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -123,6 +127,10 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	var channel *model.Channel
 	var err error
 	selectGroup := param.TokenGroup
+	policy := requestWebSearchGroupPolicy(param.Ctx, param.RequestPath)
+	if policy.disabled(selectGroup) {
+		return nil, selectGroup, ErrWebSearchGroupDisabled
+	}
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
 	filters := GetChannelConstraints(param.Ctx).Filters
 	// The first attempt uses the channel the distributor already picked, so
@@ -140,6 +148,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	if param.TokenGroup == "auto" {
 		autoGroups := GetRequestAutoGroups(param.Ctx, userGroup)
 		if len(autoGroups) == 0 {
+			if policy.contract != "" {
+				return nil, selectGroup, ErrWebSearchGroupDisabled
+			}
 			return nil, selectGroup, errors.New("auto groups is not enabled")
 		}
 
@@ -154,8 +165,15 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 		}
 
+		disabledGroup := ""
+		enabledGroupTried := false
 		for i := startGroupIndex; i < len(autoGroups); i++ {
 			autoGroup := autoGroups[i]
+			if policy.disabled(autoGroup) {
+				disabledGroup = autoGroup
+				continue
+			}
+			enabledGroupTried = true
 			// Calculate priorityRetry for current group
 			// 计算当前分组的 priorityRetry
 			groupRetry := param.GetRetry()
@@ -166,12 +184,15 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			priorityRetry := max(groupRetry-affinityRetryOffset, 0)
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(
+			channel, err = policy.selectChannel(
 				autoGroup,
 				param.ModelName,
 				priorityRetry,
 				filters,
 			)
+			if err != nil && policy.contract != "" {
+				return nil, autoGroup, err
+			}
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -211,8 +232,11 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			}
 			break
 		}
+		if channel == nil && disabledGroup != "" && !enabledGroupTried {
+			return nil, disabledGroup, ErrWebSearchGroupDisabled
+		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(
+		channel, err = policy.selectChannel(
 			param.TokenGroup,
 			param.ModelName,
 			max(param.GetRetry()-affinityRetryOffset, 0),
@@ -303,6 +327,11 @@ type ChannelSelectError struct {
 // filters. The group the channel was chosen from is returned for auto-group
 // callers. The caller still applies SetupContextForSelectedChannel.
 func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam) (*model.Channel, string, *ChannelSelectError) {
+	usingGroup := retry.TokenGroup
+	policy := requestWebSearchGroupPolicy(c, retry.RequestPath)
+	if policy.disabled(usingGroup) {
+		return nil, usingGroup, webSearchGroupDenied()
+	}
 	constraints := GetChannelConstraints(c)
 	if pin, found, overridden := constraints.ResolvedPin(); found {
 		for _, lost := range overridden {
@@ -310,6 +339,14 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				"channel pin overridden: winning_source=%s winning_channel_id=%d overridden_source=%s overridden_channel_id=%d",
 				pin.Source, pin.ChannelId, lost.Source, lost.ChannelId,
 			))
+		}
+		selectGroup := ""
+		if usingGroup == "auto" {
+			var selectErr *ChannelSelectError
+			selectGroup, selectErr = policy.resolvePinnedAutoGroup(c, modelName, pin.ChannelId)
+			if selectErr != nil {
+				return nil, "", selectErr
+			}
 		}
 		channel, err := model.CacheGetChannel(pin.ChannelId)
 		if err != nil {
@@ -325,13 +362,22 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				FilterKind: kind, Channel: channel,
 			}
 		}
-		return channel, "", nil
+		actualGroup := usingGroup
+		if selectGroup != "" {
+			actualGroup = selectGroup
+			common.SetContextKey(c, constant.ContextKeyAutoGroup, selectGroup)
+		}
+		if policy.contract != "" {
+			if !model.IsChannelEnabledForGroupModel(actualGroup, modelName, channel.Id) || len(policy.candidates(actualGroup, channel)) == 0 {
+				return nil, selectGroup, &ChannelSelectError{StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel, Params: map[string]any{"Group": actualGroup, "Model": modelName}, NoAvailableChannel: true}
+			}
+		}
+		return channel, selectGroup, nil
 	}
 
-	usingGroup := retry.TokenGroup
 	var channel *model.Channel
 	var selectGroup string
-	if retry.GetRetry() == 0 {
+	if retry.GetRetry() == 0 && (!policy.restrictsAffinity(c, usingGroup) || RequestPolicy(c).SessionMode == "strict") {
 		if preferredChannelID, found := GetPreferredChannelByAffinity(c, modelName, usingGroup); found {
 			affinityUsable := false
 			preferred, err := model.CacheGetChannel(preferredChannelID)
@@ -343,7 +389,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				if usingGroup == "auto" {
 					userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
 					for _, g := range GetRequestAutoGroups(c, userGroup) {
-						if model.IsChannelEnabledForGroupModel(g, modelName, preferred.Id) {
+						if policy.channelEligible(g, modelName, preferred) {
 							selectGroup = g
 							common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
 							channel = preferred
@@ -352,7 +398,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 							break
 						}
 					}
-				} else if model.IsChannelEnabledForGroupModel(usingGroup, modelName, preferred.Id) {
+				} else if policy.channelEligible(usingGroup, modelName, preferred) {
 					channel = preferred
 					selectGroup = usingGroup
 					affinityUsable = true
@@ -371,6 +417,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 	if channel == nil {
 		var err error
 		channel, selectGroup, err = CacheGetRandomSatisfiedChannel(retry)
+		if errors.Is(err, ErrWebSearchGroupDisabled) {
+			return nil, selectGroup, webSearchGroupDenied()
+		}
 		if err != nil {
 			showGroup := usingGroup
 			if usingGroup == "auto" {
@@ -382,6 +431,9 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 			}
 		}
 		if channel == nil {
+			if group, decisionErr := selectBuiltinTools(c, retry, modelName, policy); decisionErr != nil || group != "" {
+				return nil, group, decisionErr
+			}
 			return nil, selectGroup, &ChannelSelectError{
 				StatusCode: http.StatusServiceUnavailable, Code: types.ErrorCodeModelNotFound, MessageID: i18n.MsgDistributorNoAvailableChannel,
 				Params: map[string]any{"Group": usingGroup, "Model": modelName}, NoAvailableChannel: true,
@@ -396,6 +448,80 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		}
 	}
 	return channel, selectGroup, nil
+}
+
+const builtinToolsGroupKey = "builtin_tools_group"
+
+func BuiltinToolsGroup(ctx *gin.Context) (string, bool) {
+	group := ctx.GetString(builtinToolsGroupKey)
+	return group, group != ""
+}
+
+func selectBuiltinTools(ctx *gin.Context, retry *RetryParam, modelName string, policy webSearchGroupPolicy) (string, *ChannelSelectError) {
+	if !policy.settings.BuiltinFallbackEnabled || policy.contract == "" || retry.GetRetry() != 0 || len(retry.AttemptedChannelIDs) != 0 ||
+		common.GetContextKeyInt(ctx, constant.ContextKeyTokenId) <= 0 || RequestPolicy(ctx).SessionMode == "strict" {
+		return "", nil
+	}
+	filters := GetChannelConstraints(ctx).Filters
+	for _, filter := range filters {
+		switch filter.Kind {
+		case dto.FilterRequestPath:
+		case dto.FilterTaskPluginIdentity:
+			if filter.TaskPluginKey != "" || len(filter.TaskPluginKeys) != 0 || len(filter.TaskPluginChannelTypes) != 0 {
+				return "", nil
+			}
+		default:
+			return "", nil
+		}
+	}
+	userGroup := common.GetContextKeyString(ctx, constant.ContextKeyUserGroup)
+	groups := []string{retry.TokenGroup}
+	if retry.TokenGroup == "auto" {
+		groups = GetRequestAutoGroups(ctx, userGroup)
+	}
+	for _, group := range groups {
+		if !IsUserSelectableGroup(userGroup, group) || len(policy.builtinToolsCandidates(group, modelName)) == 0 {
+			continue
+		}
+		if len(filters) != 0 {
+			unfiltered, err := policy.selectChannel(group, modelName, 0, nil)
+			if err != nil || unfiltered != nil {
+				continue
+			}
+		}
+		if !hasBuiltinToolsPrice(modelName) {
+			return group, &ChannelSelectError{StatusCode: http.StatusBadRequest, Code: types.ErrorCodeModelPriceError, Message: "No price is configured for this tool."}
+		}
+		ctx.Set(builtinToolsGroupKey, group)
+		if retry.TokenGroup == "auto" {
+			common.SetContextKey(ctx, constant.ContextKeyAutoGroup, group)
+		}
+		return group, nil
+	}
+	return "", nil
+}
+
+func (policy webSearchGroupPolicy) builtinToolsCandidates(group, modelName string) []abstract.Candidate {
+	if !policy.settings.BuiltinFallbackEnabled || policy.contract == websearch_setting.ContractAlphaSearch {
+		return nil
+	}
+	contract := abstract.Contract(policy.contract)
+	if modelName != toolsBillingModel(contract, "") {
+		return nil
+	}
+	candidates, _ := policy.routing(group).Qualify(abstract.ChannelContext{}, contract, abstract.Qualification{Builtin: true})
+	return candidates
+}
+
+func hasBuiltinToolsPrice(modelName string) bool {
+	if billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr {
+		_, exists := billing_setting.GetBillingExpr(modelName)
+		return exists
+	}
+	if _, exists := ratio_setting.GetModelPrice(modelName, false); exists {
+		return true
+	}
+	return ratio_setting.HasConfiguredModelRatio(modelName)
 }
 
 // Origin-task pins report a fixed code so task polling can tell a retired

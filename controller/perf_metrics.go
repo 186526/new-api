@@ -34,6 +34,19 @@ func GetPerfMetricsSummary(c *gin.Context) {
 		})
 		return
 	}
+	if c.GetInt("role") >= common.RoleAdminUser {
+		c.Header("Cache-Control", "private, no-store")
+		result.RequestObservations, err = perfmetrics.QueryRequestObservations(result.WindowStart, result.WindowEnd, activeGroups)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		result.ObservationDistribution, err = perfmetrics.QueryObservationDistribution(result.WindowStart, result.WindowEnd, activeGroups)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

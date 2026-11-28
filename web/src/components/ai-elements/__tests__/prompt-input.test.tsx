@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, expect, test, vi } from 'vitest'
 
@@ -24,6 +24,7 @@ import {
   PromptInput,
   PromptInputAttachments,
   PromptInputProvider,
+  PromptInputSpeechButton,
   PromptInputSubmit,
   PromptInputTextarea,
 } from '../prompt-input'
@@ -90,4 +91,92 @@ test('keeps an attachment available for retry when conversion fails', async () =
     )
     expect(screen.queryByText('note.txt')).not.toBeInTheDocument()
   })
+})
+
+class SpeechRecognitionMock extends EventTarget {
+  start = vi.fn(() => this.dispatchEvent(new Event('start')))
+  stop = vi.fn()
+
+  emitTranscript(transcript: string): void {
+    const result = { 0: { transcript }, isFinal: true }
+    const results = { length: 1, item: () => result }
+    act(() => {
+      this.dispatchEvent(Object.assign(new Event('result'), { results }))
+    })
+  }
+}
+
+function stubSpeechRecognition(): SpeechRecognitionMock[] {
+  const recognizers: SpeechRecognitionMock[] = []
+  vi.stubGlobal(
+    'SpeechRecognition',
+    class extends SpeechRecognitionMock {
+      constructor() {
+        super()
+        recognizers.push(this)
+      }
+    }
+  )
+  return recognizers
+}
+
+test('ignores late transcripts after the speech button unmounts', async () => {
+  const user = userEvent.setup()
+  const recognizers = stubSpeechRecognition()
+  const textareaRef = { current: document.createElement('textarea') }
+  const onTranscriptionChange = vi.fn()
+  const { unmount } = render(
+    <PromptInputSpeechButton
+      aria-label='Dictate'
+      textareaRef={textareaRef}
+      onTranscriptionChange={onTranscriptionChange}
+    />
+  )
+  const [recognizer] = recognizers
+
+  await user.click(screen.getByRole('button', { name: 'Dictate' }))
+  recognizer.emitTranscript('Before unmount')
+  expect(onTranscriptionChange).toHaveBeenCalledWith('Before unmount')
+  onTranscriptionChange.mockClear()
+
+  unmount()
+  recognizer.emitTranscript('Late transcript')
+
+  expect(recognizer.stop).toHaveBeenCalledOnce()
+  expect(onTranscriptionChange).not.toHaveBeenCalled()
+  expect(textareaRef.current).toHaveValue('Before unmount')
+})
+
+test('only accepts transcripts from the active recognizer after replacement', async () => {
+  const user = userEvent.setup()
+  const recognizers = stubSpeechRecognition()
+  const textareaRef = { current: document.createElement('textarea') }
+  const oldCallback = vi.fn()
+  const newCallback = vi.fn()
+  const { rerender } = render(
+    <PromptInputSpeechButton
+      aria-label='Dictate'
+      textareaRef={textareaRef}
+      onTranscriptionChange={oldCallback}
+    />
+  )
+  await user.click(screen.getByRole('button', { name: 'Dictate' }))
+
+  rerender(
+    <PromptInputSpeechButton
+      aria-label='Dictate'
+      textareaRef={textareaRef}
+      onTranscriptionChange={newCallback}
+    />
+  )
+  const [retiredRecognizer, activeRecognizer] = recognizers
+  await user.click(screen.getByRole('button', { name: 'Dictate' }))
+  retiredRecognizer.emitTranscript('Stale transcript')
+  activeRecognizer.emitTranscript('Current transcript')
+
+  expect(retiredRecognizer.stop).toHaveBeenCalledOnce()
+  expect(activeRecognizer.start).toHaveBeenCalledOnce()
+  expect(oldCallback).not.toHaveBeenCalled()
+  expect(newCallback).toHaveBeenCalledExactlyOnceWith('Current transcript')
+  expect(textareaRef.current).toHaveValue('Current transcript')
 })

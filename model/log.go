@@ -514,6 +514,29 @@ type LogFilter struct {
 	Group             string
 	RequestId         string
 	UpstreamRequestId string
+	ToolContract      string
+}
+
+func applyToolContractLogFilter(tx *gorm.DB, contract string) (*gorm.DB, error) {
+	switch contract {
+	case "":
+		return tx, nil
+	case "tools/search", "tools/fetch", "alpha/search", "moonshot/search", "moonshot/fetch":
+	default:
+		return nil, common.NewMessage("Invalid tool contract")
+	}
+	var expression string
+	switch tx.Dialector.Name() {
+	case "clickhouse":
+		expression = `JSONExtractString(logs.other, 'tool_execution', 'contract')`
+	case "postgres":
+		expression = `(CASE WHEN logs.other IS JSON THEN CAST(logs.other AS json) -> 'tool_execution' ->> 'contract' END)`
+	case "mysql":
+		expression = `JSON_UNQUOTE(JSON_EXTRACT(IF(JSON_VALID(logs.other), logs.other, '{}'), '$.tool_execution.contract'))`
+	default:
+		expression = `json_extract(CASE WHEN json_valid(logs.other) THEN logs.other ELSE '{}' END, '$.tool_execution.contract')`
+	}
+	return tx.Where(expression+" = ?", contract), nil
 }
 
 func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
@@ -548,7 +571,7 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	if f.Group != "" {
 		tx = tx.Where("logs."+logGroupCol+" = ?", f.Group)
 	}
-	return tx, nil
+	return applyToolContractLogFilter(tx, f.ToolContract)
 }
 
 func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int64, err error) {
@@ -571,6 +594,7 @@ func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		assignDisplayLogIds(logs, startIdx)
 	}
+	loadToolRefundOutcomes(logs)
 
 	channelIds := types.NewSet[int]()
 	for _, log := range logs {
@@ -637,8 +661,15 @@ func GetUserLogs(userId int, filter LogFilter, startIdx int, num int) (logs []*L
 		return nil, 0, common.NewMessage("Failed to query logs")
 	}
 
+	loadToolRefundOutcomes(logs)
 	formatUserLogs(logs, startIdx)
 	return logs, total, err
+}
+
+func loadToolRefundOutcomes(logs []*Log) {
+	if err := OverlayToolRefundOutcomes(logs); err != nil {
+		common.SysError(common.LogText("failed to load tool refund outcomes: %s", err.Error()))
+	}
 }
 
 // StreamAllLogs calls fn with each log matching filter, newest first, as an

@@ -202,16 +202,30 @@ func InitOptionMap() {
 func loadOptionsFromDatabase() {
 	requestPolicyOptionMutex.Lock()
 	defer requestPolicyOptionMutex.Unlock()
-	defer func() {
-		if err := refreshRequestPolicySnapshot(); err != nil {
-			common.SysError(common.LogText("invalid request policy: %s", err.Error()))
-		}
-	}()
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
-	options, _ := AllOption()
+	options, err := AllOption()
+	if err != nil {
+		common.SysError(common.LogText("failed to load options: %s", err.Error()))
+		return
+	}
 	passkeyOptions := make(map[string]string)
+	webSearchOptions := make(map[string]string)
+	preprocessingOptions := make(map[string]string)
 	for _, option := range options {
+		if isRequestPreprocessingOption(option.Key) {
+			preprocessingOptions[option.Key] = option.Value
+			continue
+		}
+
+		if websearch_setting.IsOption(option.Key) {
+			if err := websearch_setting.ValidateOption(option.Key, option.Value); err != nil {
+				common.SysLog(common.LogText("invalid websearch option %s: %s", option.Key, err.Error()))
+				continue
+			}
+			webSearchOptions[option.Key] = option.Value
+			continue
+		}
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
 			continue
@@ -222,6 +236,12 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
+	if err := applyWebSearchOptions(webSearchOptions); err != nil {
+		common.SysLog(common.LogText("failed to apply websearch options: %s", err.Error()))
+	}
+	if err := refreshRequestPolicySnapshot(preprocessingOptions); err != nil {
+		common.SysError(common.LogText("invalid request policy: %s", err.Error()))
+	}
 }
 
 func SyncOptions(frequency int) {
@@ -233,6 +253,12 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	if key == websearch_setting.GroupPoliciesOptionKey {
+		return common.NewMessage("Save tool group policies with a version through /api/tools-api/group-policies")
+	}
+	if websearch_setting.IsOption(key) {
+		return websearch_setting.ValidateOption(key, value)
+	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
 	}
@@ -276,6 +302,9 @@ func validateOptionValue(key string, value string) error {
 }
 
 func UpdateOption(key string, value string) error {
+	if websearch_setting.IsOption(key) {
+		return UpdateOptionsBulk(map[string]string{key: value})
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -324,11 +353,23 @@ func UpdateOptionsBulk(values map[string]string) error {
 			return err
 		}
 	}
+	webSearchOptions := make(map[string]string)
+	for key, value := range values {
+		if websearch_setting.IsOption(key) {
+			webSearchOptions[key] = value
+		}
+	}
+	if len(webSearchOptions) > 0 {
+		requestPolicyOptionMutex.Lock()
+		defer requestPolicyOptionMutex.Unlock()
+	}
 	var policySnapshot *RequestPolicySnapshot
 	for key := range values {
 		if IsRequestPolicyOption(key) {
-			requestPolicyOptionMutex.Lock()
-			defer requestPolicyOptionMutex.Unlock()
+			if len(webSearchOptions) == 0 {
+				requestPolicyOptionMutex.Lock()
+				defer requestPolicyOptionMutex.Unlock()
+			}
 			options := maps.Clone(CurrentRequestPolicy().Options)
 			for key, value := range values {
 				if IsRequestPolicyOption(key) {
@@ -360,13 +401,44 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
+	if err := applyWebSearchOptions(webSearchOptions); err != nil {
+		return err
+	}
 	for k, v := range values {
+		if websearch_setting.IsOption(k) || isRequestPreprocessingOption(k) {
+			continue
+		}
 		if err := updateOptionMap(k, v); err != nil {
 			return err
 		}
 	}
 	if policySnapshot != nil {
-		requestPolicySnapshot.Store(policySnapshot)
+		return publishRequestPolicy(policySnapshot)
+	}
+	return nil
+}
+
+func applyWebSearchOptions(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	fields := make(map[string]string, len(values))
+	for key, value := range values {
+		if err := websearch_setting.ValidateOption(key, value); err != nil {
+			return err
+		}
+		fields[strings.TrimPrefix(key, "websearch_setting.")] = value
+	}
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	if err := config.UpdateConfigFromMap(config.GlobalConfig.Get("websearch_setting"), fields); err != nil {
+		return err
+	}
+	if err := websearch_setting.UpdateAndSync(); err != nil {
+		return err
+	}
+	for key, value := range values {
+		common.OptionMap[key] = value
 	}
 	return nil
 }
@@ -377,6 +449,9 @@ func updateOptionMap(key string, value string) (err error) {
 		delete(common.OptionMap, key)
 		common.OptionMapRWMutex.Unlock()
 		return nil
+	}
+	if websearch_setting.IsOption(key) {
+		return applyWebSearchOptions(map[string]string{key: value})
 	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
@@ -745,10 +820,6 @@ func handleConfigUpdate(key, value string) bool {
 	} else if configName == "billing_setting" {
 		InvalidatePricingCache()
 		ratio_setting.InvalidateExposedDataCache()
-	} else if configName == "websearch_setting" {
-		if err := websearch_setting.UpdateAndSync(); err != nil {
-			common.SysError(common.LogText("invalid websearch_setting: %s", err.Error()))
-		}
 	}
 
 	return true // 已处理

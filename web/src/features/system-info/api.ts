@@ -32,9 +32,9 @@ export async function listSystemInstances() {
   return res.data
 }
 
-export async function deleteStaleSystemInstances() {
+export async function deleteExpiredSystemInstances() {
   const res = await api.delete<SystemInstanceDeleteResponse>(
-    '/api/system-info/stale-instances'
+    '/api/system-info/expired-instances'
   )
   return res.data
 }

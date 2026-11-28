@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,12 +18,13 @@ import (
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 
+	"github.com/QuantumNous/new-api/service/redaction"
 	"github.com/samber/hot"
 	"golang.org/x/sync/singleflight"
 )
 
 const (
-	forwardCacheNamespace = "websearch:forward:v1"
+	forwardCacheNamespace = "websearch:forward:v3"
 	forwardCacheCapacity  = 5000
 	// forwardResponseLimit caps one upstream body. Every provider this package
 	// speaks to answers with a search result list or one extracted page, so 8
@@ -81,18 +81,13 @@ type ForwardOptions struct {
 	CacheTTLSeconds int
 	// TimeoutSeconds overrides the header wait. Zero follows the global setting.
 	TimeoutSeconds int
+	cacheSubject   string
+	stableBodyKey  bool // CacheKey replaces a body containing generated, nonsemantic fields.
+	normalize      func(context.Context, forwardEntry) (forwardEntry, error)
 }
 
-// Forward sends one request to one provider and returns its answer. It is the
-// only place the retry, cache and size policies live, so every requester behaves
-// the same way under a refusing upstream.
-//
-// A retryable refusal (408, 429, 5xx) is retried up to the configured attempt
-// count, and the last answer is returned rather than an error: the client then
-// reads the upstream's own status code through status_code_mapping, which is
-// what it read before this package existed. Only a transport failure that
-// prevented the request from being answered at all becomes an error, and that
-// error reports WasSent false so the caller may try another candidate.
+// Forward returns the first upstream response, including refusals. Only a
+// failure known to precede transmission permits another candidate.
 func Forward(ctx context.Context, channel abstract.ChannelContext, build func(context.Context) (*http.Request, error), options ForwardOptions) (Upstream, error) {
 	settings := websearch_setting.Get()
 
@@ -104,21 +99,26 @@ func Forward(ctx context.Context, channel abstract.ChannelContext, build func(co
 		timeout = 25
 	}
 	headerWait := time.Duration(timeout) * time.Second
-	attempts := settings.RetryAttempts
-	if attempts <= 0 {
-		attempts = 1
+	fetch := func() (forwardEntry, error) {
+		attemptCtx, cancel := context.WithTimeout(ctx, headerWait)
+		defer cancel()
+		entry, err := forwardOnce(attemptCtx, channelHTTPClient(channel), build)
+		if err != nil || options.normalize == nil {
+			return entry, err
+		}
+		return options.normalize(attemptCtx, entry)
 	}
-	baseWait := time.Duration(settings.RetryBaseDelayMilliseconds) * time.Millisecond
-	if baseWait <= 0 {
-		baseWait = 500 * time.Millisecond
-	}
-
 	ttl := forwardCacheTTL(options, settings)
-	key := forwardKey(build, options)
+	if redaction.IsProtectedRequest(ctx) || ttl <= 0 {
+		entry, err := fetch()
+		return entryUpstream(entry, false), err
+	}
 
-	entry, cached, err := forwardThrough(key, ttl, func() (forwardEntry, error) {
-		return forwardUncached(ctx, channel, build, headerWait, attempts, baseWait)
-	})
+	key, err := forwardKey(ctx, channel, build, options)
+	if err != nil {
+		return Upstream{}, notSent(err)
+	}
+	entry, cached, err := forwardCached(ctx, options.cacheSubject, key, ttl, fetch)
 	if err != nil {
 		return Upstream{}, err
 	}
@@ -148,9 +148,7 @@ func forwardThrough(key string, ttl time.Duration, fetch func() (forwardEntry, e
 		if fetchErr != nil {
 			return nil, fetchErr
 		}
-		// A refusal is not cached: the retry budget belongs to this request, and
-		// caching a 429 would hand the same refusal to a caller that would have
-		// succeeded a second later.
+		// A refusal applies only to this call; a later caller may succeed.
 		if ttl > 0 && entry.StatusCode >= 200 && entry.StatusCode < 300 && len(entry.Body) > 0 {
 			storeForward(key, entry, ttl)
 		}
@@ -186,90 +184,39 @@ func entryUpstream(entry forwardEntry, cached bool) Upstream {
 	}
 }
 
-// forwardUncached runs the attempt loop. Each attempt gets its own request
-// because an http.Request cannot be replayed once its body was read.
-func forwardUncached(ctx context.Context, channel abstract.ChannelContext, build func(context.Context) (*http.Request, error), timeout time.Duration, attempts int, baseWait time.Duration) (forwardEntry, error) {
-	client := channelHTTPClient(channel)
-
-	var (
-		lastEntry forwardEntry
-		lastErr   error
-		wait      = baseWait
-	)
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return forwardEntry{}, ctx.Err()
-			case <-time.After(wait):
-			}
-			wait *= 2
-		}
-
-		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		entry, retryable, err := forwardOnce(attemptCtx, client, build)
-		cancel()
-
-		if err == nil {
-			return entry, nil
-		}
-		if !retryable {
-			// The request reached the upstream and was refused in a way that
-			// repeating it would only bill again. Hand the refusal back as an
-			// answer so the handler keeps the upstream's status code.
-			if entry.StatusCode != 0 {
-				return entry, nil
-			}
-			return forwardEntry{}, err
-		}
-		lastEntry, lastErr = entry, err
-	}
-	if lastEntry.StatusCode != 0 {
-		// The retry budget is spent. The client reads the last upstream answer,
-		// not a local error, so status_code_mapping still applies.
-		return lastEntry, nil
-	}
-	return forwardEntry{}, notSent(lastErr)
-}
-
-// forwardOnce sends one attempt. It reports whether the failure is retryable:
-// a refusal that a repeat cannot fix is not.
-func forwardOnce(ctx context.Context, client *http.Client, build func(context.Context) (*http.Request, error)) (forwardEntry, bool, error) {
+func forwardOnce(ctx context.Context, client *http.Client, build func(context.Context) (*http.Request, error)) (forwardEntry, error) {
 	req, err := build(ctx)
 	if err != nil {
-		return forwardEntry{}, false, err
+		return forwardEntry{}, notSent(err)
+	}
+	if err := ctx.Err(); err != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return forwardEntry{}, notSent(err)
 	}
 
-	resp, err := client.Do(req)
+	// The client is shared with other relays. Do not change their redirect policy.
+	oneShot := *client
+	oneShot.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	// The paid providers send POST bodies. Do not give the transport a copy to replay.
+	req.GetBody = nil
+	resp, err := oneShot.Do(req)
 	if err != nil {
-		var timeoutErr interface{ Timeout() bool }
-		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-			return forwardEntry{}, true, err
-		}
-		// A transport failure may or may not have reached the upstream, so this
-		// one is retried: the loop's last answer wins, and a body-less failure is
-		// reported as not sent.
-		return forwardEntry{}, true, err
+		return forwardEntry{}, sentError{err}
 	}
 	defer resp.Body.Close()
 
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, forwardResponseLimit))
-	entry := forwardEntry{
+	if readErr != nil {
+		return forwardEntry{}, sentError{readErr}
+	}
+	return forwardEntry{
 		StatusCode:  resp.StatusCode,
 		ContentType: resp.Header.Get("Content-Type"),
 		Body:        body,
 		Header:      resp.Header.Clone(),
-	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if readErr != nil {
-			return forwardEntry{}, true, readErr
-		}
-		return entry, false, nil
-	}
-	return entry, retryableStatus(resp.StatusCode), fmt.Errorf(
-		"websearch: upstream answered %d: %s",
-		resp.StatusCode, truncateBody(body),
-	)
+	}, nil
 }
 
 // sentError marks a failure that may already have been billed, so the caller
@@ -297,28 +244,12 @@ func WasSent(err error) bool {
 	if err == nil {
 		return false
 	}
-	var unsent *unsentError
-	if errors.As(err, &unsent) {
-		return false
-	}
 	var sent sentError
 	if errors.As(err, &sent) {
 		return true
 	}
-	// A failure without a marker is treated as sent: refusing to retry costs one
-	// refused request, retrying a billed one costs money twice.
-	return true
-}
-
-func retryableStatus(status int) bool {
-	switch {
-	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
-		return true
-	case status >= 500 && status <= 599:
-		return true
-	default:
-		return false
-	}
+	var unsent *unsentError
+	return !errors.As(err, &unsent)
 }
 
 // channelHTTPClient builds the client a channel's proxy and transport settings
@@ -372,13 +303,26 @@ func effectiveSearchTTL(ttlSeconds int) int {
 
 // forwardKey separates the provider from its input, so two providers that
 // answer the same query never read each other's entry.
-func forwardKey(build func(context.Context) (*http.Request, error), options ForwardOptions) string {
-	target := ""
-	if req, err := build(context.Background()); err == nil && req != nil {
-		target = req.Method + "\x00" + req.URL.String()
+func forwardKey(ctx context.Context, channel abstract.ChannelContext, build func(context.Context) (*http.Request, error), options ForwardOptions) (string, error) {
+	req, err := build(ctx)
+	if err != nil {
+		return "", err
 	}
-	sum := sha256.Sum256([]byte(target + "\x00" + options.CacheKey))
-	return hex.EncodeToString(sum[:])
+	if req.Body != nil {
+		defer req.Body.Close()
+	}
+	policy, _ := abstract.RequestRoutingPolicy(ctx)
+	hash := sha256.New()
+	fmt.Fprintf(hash, "http:%d:%d:%s\x00%s\x00%s\x00%s\x00", channel.ChannelType, channel.ChannelID, policy.Group, req.Method, req.URL.String(), options.CacheKey)
+	if err := req.Header.Write(hash); err != nil {
+		return "", err
+	}
+	if req.Body != nil && !options.stableBodyKey {
+		if _, err := io.Copy(hash, req.Body); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func lookupForward(key string) (forwardEntry, bool) {
@@ -394,13 +338,4 @@ func storeForward(key string, entry forwardEntry, ttl time.Duration) {
 	if err := getForwardCache().SetWithTTL(key, entry, ttl); err != nil {
 		logger.LogWarn(context.Background(), "websearch: forward cache write failed: %v", err)
 	}
-}
-
-func truncateBody(body []byte) string {
-	const limit = 300
-	text := strings.TrimSpace(string(body))
-	if len(text) > limit {
-		return text[:limit] + "..."
-	}
-	return text
 }

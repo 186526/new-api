@@ -41,6 +41,9 @@ func PrepareMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.
 	if !shouldBill {
 		return false, nil
 	}
+	if model.SQLQuotaLedgerWriterEnabled() {
+		return false, errors.New("Midjourney billing has no task-bound debit receipt")
+	}
 	if relayInfo == nil {
 		return false, errors.New("relay info is nil")
 	}
@@ -94,6 +97,9 @@ func SettleMidjourneyTaskBilling(relayInfo *relaycommon.RelayInfo, task *model.M
 
 // RefundMidjourneyQuota reverses every accounting element recorded for a billed legacy task.
 func RefundMidjourneyQuota(ctx context.Context, task *model.Midjourney, reason string) bool {
+	if task.Quota < 0 || model.SQLQuotaLedgerWriterEnabled() {
+		return false
+	}
 	quota := task.Quota
 	if quota == 0 {
 		return true

@@ -29,6 +29,8 @@ export type SystemInstanceInfo = {
   }
   role?: {
     is_master?: boolean
+    server_role?: string
+    region?: string
     [key: string]: unknown
   }
   runtime?: {
@@ -69,6 +71,10 @@ export type SystemInstance = {
   stale_after_seconds: number
   started_at: number
   last_seen_at: number
+  ephemeral?: boolean
+  expired?: boolean
+  host_node_name?: string
+  expire_after_seconds?: number
   info?: SystemInstanceInfo
 }
 
@@ -76,6 +82,7 @@ export type SystemInstanceListResponse = {
   success: boolean
   message: string
   data?: SystemInstance[]
+  reporter_enabled?: boolean
 }
 
 export type SystemInstanceDeleteResponse = {

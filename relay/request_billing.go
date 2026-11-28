@@ -74,9 +74,7 @@ func RefundFailedRequestBilling(c *gin.Context, info *relaycommon.RelayInfo, api
 		return nil
 	}
 	apiErr = service.NormalizeViolationFeeError(apiErr)
-	if info.Billing != nil {
-		info.Billing.Refund(c)
-	}
+	service.RefundRequestBilling(c, info)
 	service.ChargeViolationFeeIfNeeded(c, info, apiErr)
 	return apiErr
 }

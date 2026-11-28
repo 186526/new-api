@@ -405,6 +405,14 @@ func SearchChannels(c *gin.Context) {
 		channelData = channels
 	}
 
+	if modelKeyword == constant.ToolsSearchModel || modelKeyword == constant.ToolsFetchModel {
+		channelData = slices.DeleteFunc(channelData, func(channel *model.Channel) bool {
+			return !slices.ContainsFunc(channel.GetModels(), func(configuredModel string) bool {
+				return strings.TrimSpace(configuredModel) == modelKeyword
+			})
+		})
+	}
+
 	if statusFilter == common.ChannelStatusEnabled || statusFilter == 0 {
 		filtered := make([]*model.Channel, 0, len(channelData))
 		for _, ch := range channelData {
@@ -1277,6 +1285,11 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
+	if (channel.BaseURL != nil && !equalStringPtr(channel.BaseURL, originChannel.BaseURL)) || (channel.Type != 0 && channel.Type != originChannel.Type) {
+		if channel.Type == constant.ChannelTypeAdvancedCustom || originChannel.Type == constant.ChannelTypeAdvancedCustom {
+			channel.ClearCustomTools()
+		}
+	}
 	err = channel.Update()
 	if err != nil {
 		common.ApiError(c, err)
@@ -1629,6 +1642,7 @@ func CopyChannel(c *gin.Context) {
 	// clone channel
 	clone := *origin // shallow copy is sufficient as we will overwrite primitives
 	clone.Id = 0     // let DB auto-generate
+	clone.CustomTools = nil
 	clone.CreatedTime = common.GetTimestamp()
 	clone.Name = origin.Name + suffix
 	clone.TestTime = 0

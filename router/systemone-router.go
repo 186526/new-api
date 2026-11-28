@@ -20,7 +20,9 @@ import (
 func SetSystemOneRouter(router *gin.Engine) {
 	group := router.Group(relayconstant.SystemOneContractPathPrefix)
 	group.Use(middleware.SystemOneErrorShape())
-	group.Use(gzip.Gzip(gzip.DefaultCompression))
+	group.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPaths([]string{
+		relayconstant.SystemOneContractPathPrefix + "/systemone",
+	})))
 	group.Use(middleware.RouteTag("relay"))
 	group.Use(middleware.GlobalAPIRateLimit())
 	group.Use(middleware.TokenAuth())

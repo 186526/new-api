@@ -21,12 +21,7 @@ import (
 )
 
 const (
-	localFetchTimeout = 20 * time.Second
-	// localFetchBodyLimit bounds one download. At 200 KB the limit cut the page
-	// before its body: github.com/186526/new-api is 443 KB and
-	// kubernetes.io/docs/concepts/overview 508 KB, so both extracted to nothing,
-	// while the same bytes parsed locally yielded 15.7 KB and 10.8 KB.
-	localFetchBodyLimit  = 2 << 20 // 2 MB
+	localFetchTimeout    = 20 * time.Second
 	localExtractMaxChars = 400_000
 	// localExtractMinChars is the least text a chosen container must hold. Below
 	// it the container is a headline or a teaser rather than the page, and the
@@ -402,13 +397,12 @@ func (localRequester) Search(context.Context, abstract.ChannelContext, Query) (U
 // the local parser can hand it to the caller as a Page.Content.
 //
 // The page goes through the same cache and concurrency merge as an upstream
-// answer. This requester builds no *http.Request that Forward could key on, so
-// it keys on the provider and the URL instead; without this every repeated
-// fetch re-read the page.
+// answer. Including the read limit prevents reuse of pages read under a different limit.
 func (r localRequester) Fetch(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
-	key := CacheKeyFor(websearch_setting.ProviderLocal, strings.TrimSpace(query.URL))
-	entry, cached, err := forwardThrough(key, CacheTTL(false, channel.Settings.WebSearchFetchCacheTTLSeconds), func() (forwardEntry, error) {
-		text, err := r.extract(ctx, query.URL)
+	limit := websearch_setting.Get().LocalFetchMaxBytes
+	key := CacheKeyFor(websearch_setting.ProviderLocal, fmt.Sprintf("%d\x00%s", limit, strings.TrimSpace(query.URL)))
+	entry, cached, err := forwardCached(ctx, forwardSubject("", query.URL), key, CacheTTL(false, channel.Settings.WebSearchFetchCacheTTLSeconds), func() (forwardEntry, error) {
+		text, err := r.extract(ctx, query.URL, int64(limit))
 		if err != nil {
 			return forwardEntry{}, err
 		}
@@ -457,7 +451,7 @@ func (r localRequester) httpClient() *http.Client {
 	return &http.Client{Timeout: localFetchTimeout}
 }
 
-func (r localRequester) extract(ctx context.Context, target string) (string, error) {
+func (r localRequester) extract(ctx context.Context, target string, limit int64) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(target))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return "", notSent(fmt.Errorf("websearch: invalid fetch url: %q", target))
@@ -487,7 +481,7 @@ func (r localRequester) extract(ctx context.Context, target string) (string, err
 		return "", localFetchStatusError{URL: parsed.String(), StatusCode: resp.StatusCode}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, localFetchBodyLimit))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		return "", err
 	}

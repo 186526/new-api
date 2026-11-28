@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -13,8 +12,9 @@ import (
 )
 
 const (
-	exaSearchPath = "/search"
-	exaFetchPath  = "/contents"
+	exaSearchPath      = "/search"
+	exaFetchPath       = "/contents"
+	defaultExaEndpoint = "https://api.exa.ai"
 	// exaTextCharacters bounds the text Exa returns per hit. The parser keeps the
 	// whole value, so this is what stops an article from filling the caller's
 	// context.
@@ -36,6 +36,9 @@ func (exaRequester) Name() string { return websearch_setting.ProviderExa }
 func (exaRequester) Native() []abstract.Contract { return nil }
 
 func (exaRequester) Search(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
+	if query.CustomOperation != nil {
+		return sendCustomTool(ctx, channel, query, customToolClient)
+	}
 	apiKey, err := exaAPIKey(channel)
 	if err != nil {
 		return Upstream{}, notSent(err)
@@ -45,14 +48,11 @@ func (exaRequester) Search(ctx context.Context, channel abstract.ChannelContext,
 		return Upstream{}, notSent(err)
 	}
 
-	upstream, err := Forward(ctx, channel, func(requestCtx context.Context) (*http.Request, error) {
-		return exaRequest(requestCtx, exaBaseURL(query)+exaSearchPath, apiKey, payload, query.Prepare)
+	upstream, err := forwardManaged(ctx, channel, query, func(requestCtx context.Context) (*http.Request, error) {
+		return exaRequest(requestCtx, exaBaseURL(channel, query)+exaSearchPath, apiKey, payload, query.Prepare)
 	}, ForwardOptions{
-		Search: true,
-		// Exa's answer depends on the text and on the result count; the count is
-		// part of the key because the same text at a different size is a different
-		// upstream call.
-		CacheKey: query.Text + "\x00" + strconv.Itoa(query.Count),
+		Search:   true,
+		CacheKey: CacheKeyFor(websearch_setting.ProviderExa, string(payload)),
 	})
 	if err != nil {
 		return Upstream{}, err
@@ -62,6 +62,9 @@ func (exaRequester) Search(ctx context.Context, channel abstract.ChannelContext,
 }
 
 func (exaRequester) Fetch(ctx context.Context, channel abstract.ChannelContext, query Query) (Upstream, error) {
+	if query.CustomOperation != nil {
+		return sendCustomTool(ctx, channel, query, customToolClient)
+	}
 	apiKey, err := exaAPIKey(channel)
 	if err != nil {
 		return Upstream{}, notSent(err)
@@ -74,9 +77,14 @@ func (exaRequester) Fetch(ctx context.Context, channel abstract.ChannelContext, 
 		return Upstream{}, notSent(err)
 	}
 
-	upstream, err := Forward(ctx, channel, func(requestCtx context.Context) (*http.Request, error) {
-		return exaRequest(requestCtx, exaBaseURL(query)+exaFetchPath, apiKey, payload, query.Prepare)
-	}, ForwardOptions{CacheKey: query.URL})
+	upstream, err := forwardManaged(ctx, channel, query, func(requestCtx context.Context) (*http.Request, error) {
+		return exaRequest(requestCtx, exaBaseURL(channel, query)+exaFetchPath, apiKey, payload, query.Prepare)
+	}, ForwardOptions{
+		CacheKey: CacheKeyFor("exa-fetch-verified-v1", query.URL),
+		normalize: func(_ context.Context, entry forwardEntry) (forwardEntry, error) {
+			return normalizeExaContents(query.URL, entry)
+		},
+	})
 	if err != nil {
 		return Upstream{}, err
 	}
@@ -84,25 +92,21 @@ func (exaRequester) Fetch(ctx context.Context, channel abstract.ChannelContext, 
 	return upstream, nil
 }
 
-// exaAPIKey prefers the channel's own key, which is what a channel that binds
-// Exa holds, and falls back to the global key that lets Exa serve channels
-// without one.
 func exaAPIKey(channel abstract.ChannelContext) (string, error) {
 	if key := strings.TrimSpace(channel.Key); key != "" {
-		return key, nil
-	}
-	if key := strings.TrimSpace(websearch_setting.Get().ExaAPIKey); key != "" {
 		return key, nil
 	}
 	return "", errors.New("websearch: exa has no api key")
 }
 
-// exaBaseURL lets the relay layer point a request at its own upstream, such as a
-// self-hosted proxy, and otherwise sends it to the configured Exa endpoint.
-func exaBaseURL(query Query) string {
+// A custom endpoint and its credential must be selected together by the caller.
+func exaBaseURL(channel abstract.ChannelContext, query Query) string {
 	base := strings.TrimSpace(query.Endpoint)
 	if base == "" {
-		base = websearch_setting.ExaEndpoint()
+		base = strings.TrimSpace(channel.BaseURL)
+	}
+	if base == "" {
+		base = defaultExaEndpoint
 	}
 	return strings.TrimRight(base, "/")
 }

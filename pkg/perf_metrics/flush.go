@@ -23,6 +23,8 @@ func flushLoop() {
 }
 
 func flushCompletedBuckets() {
+	observationFlushMu.Lock()
+	defer observationFlushMu.Unlock()
 	currentBucket := bucketStart(time.Now().Unix())
 	hotBuckets.Range(func(key, value any) bool {
 		k := key.(bucketKey)
@@ -32,7 +34,7 @@ func flushCompletedBuckets() {
 
 		bucket := value.(*atomicBucket)
 		drained := bucket.drain()
-		if drained.requestCount == 0 {
+		if drained.requestCount == 0 && drained.observation == (model.PerfMetricObservation{}) && len(drained.distribution) == 0 {
 			deleteOldEmptyBucket(k, key)
 			return true
 		}
@@ -48,6 +50,8 @@ func flushCompletedBuckets() {
 			TtftCount:      drained.ttftCount,
 			OutputTokens:   drained.outputTokens,
 			GenerationMs:   drained.generationMs,
+			Observation:    drained.observation,
+			Distribution:   drained.distribution,
 		})
 		if err != nil {
 			bucket.addCounters(drained)

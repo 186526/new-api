@@ -811,8 +811,9 @@ const BASE_RATE_LIMITS = {
 }
 
 function baseRateLimitFor(category: ApiCategory): Omit<RateLimit, 'group'> {
-  if (category === 'image' || category === 'video')
+  if (category === 'image' || category === 'video') {
     return BASE_RATE_LIMITS.media
+  }
   if (category === 'embedding') return BASE_RATE_LIMITS.embedding
   return BASE_RATE_LIMITS.default
 }

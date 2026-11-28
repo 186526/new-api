@@ -51,6 +51,8 @@ export type ApiProtocolDoc = {
   endpoints: ApiEndpointDoc[]
 }
 
+export const ALPHA_SEARCH_ENDPOINT_TYPE = 'openai-alpha-search'
+
 /**
  * The protocols in page order. Only structure lives here: paths, endpoint
  * types and fallback model names. Every user-visible string is a literal
@@ -178,7 +180,7 @@ export const API_PROTOCOLS: ApiProtocolDoc[] = [
         id: 'alpha-search',
         method: 'POST',
         path: '/v1/alpha/search',
-        endpointType: 'openai-alpha-search',
+        endpointType: ALPHA_SEARCH_ENDPOINT_TYPE,
       },
     ],
   },
@@ -190,11 +192,6 @@ export const SAMPLE_LANGUAGE_LABELS: Record<ApiSampleLanguage, string> = {
   curl: 'cURL',
   python: 'Python',
 }
-
-export const SAMPLE_LANGUAGE_HIGHLIGHT = {
-  curl: 'bash',
-  python: 'python',
-} as const
 
 /** Environment-variable name the samples read the API key from. */
 export const API_KEY_ENV = 'NEW_API_KEY'

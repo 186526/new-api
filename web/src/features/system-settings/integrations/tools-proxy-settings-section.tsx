@@ -17,12 +17,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useEffect, useId, useMemo, useRef } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
+import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
@@ -35,6 +38,16 @@ import {
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { ToolsApiContent } from '@/features/tools-api'
+import { ProviderOrderEditor } from '@/features/tools-api/components/ProviderOrderEditor'
+import { ToolsCache } from '@/features/tools-api/components/ToolsCache'
+import { ToolsDiagnostics } from '@/features/tools-api/components/ToolsDiagnostics'
+import { ToolsNavigation } from '@/features/tools-api/components/ToolsNavigation'
+import { getProviderSummary, summaryKey, type ProviderSummary } from '@/features/tools-api/lib/admin'
+import {
+  parseProviderOrder,
+  supportsToolContract,
+} from '@/features/tools-api/lib/group-policies'
 
 import {
   SettingsForm,
@@ -45,48 +58,39 @@ import {
 import { SettingsPageFormActions } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useResetForm } from '../hooks/use-reset-form'
+import { useSystemOptions } from '../hooks/use-system-options'
 import { useUpdateOption } from '../hooks/use-update-option'
 import { safeNumberFieldProps } from '../utils/numeric-field'
 
-// Provider names the backend accepts as a candidate. Kept in sync with
-// setting/websearch_setting.KnownProviders.
-const knownProviders = [
-  'antigravity',
-  'codex',
-  'deepseek',
-  'exa',
-  'local',
-] as const
-
-function findUnknownProvider(order: string): string | null {
-  for (const entry of order.split(',')) {
-    const name = entry.trim().toLowerCase()
-    if (!name) continue
-    if (!knownProviders.includes(name as (typeof knownProviders)[number])) {
-      return name
-    }
-  }
-  return null
-}
-
-const createToolsProxySchema = (t: (key: string) => string) =>
+const createToolsProxySchema = (t: (key: string) => string, directory?: ProviderSummary[]) =>
   z.object({
     websearch_setting: z.object({
       candidate_order: z.string().superRefine((value, ctx) => {
-        const unknown = findUnknownProvider(value)
-        if (unknown !== null) {
+        const providers = parseProviderOrder(value)
+        const unknown = providers.find(
+          (provider) => !supportsToolContract(provider, undefined, directory)
+        )
+        if (unknown) {
           ctx.addIssue({
             code: 'custom',
             message: `${t('Unknown provider')}: ${unknown}`,
           })
+        } else if (new Set(providers).size !== providers.length) {
+          ctx.addIssue({
+            code: 'custom',
+            message: t('Provider order cannot contain duplicates'),
+          })
         }
       }),
+      fallback_enabled: z.boolean().optional(),
+      local_fetch_max_bytes: z.number().int().min(1).max(8 * 1024 * 1024).optional(),
       native_first: z.boolean(),
+      builtin_fallback_enabled: z.boolean(),
       search_cache_ttl_seconds: z.number().int().min(-1),
       fetch_cache_ttl_seconds: z.number().int().min(-1),
       redirect_cache_ttl_seconds: z.number().int().min(-1),
       response_header_timeout_seconds: z.number().int().min(0),
-      retry_attempts: z.number().int().min(0).max(10),
+      retry_attempts: z.number().int().min(0).max(5),
       retry_base_delay_milliseconds: z.number().int().min(0),
       exa_base_url: z.string().refine((value) => {
         const trimmed = value.trim()
@@ -105,6 +109,7 @@ type ToolsProxyFormValues = z.infer<ReturnType<typeof createToolsProxySchema>>
 type FlatToolsProxySettings = {
   'websearch_setting.candidate_order': string
   'websearch_setting.native_first': boolean
+  'websearch_setting.builtin_fallback_enabled': boolean
   'websearch_setting.search_cache_ttl_seconds': number
   'websearch_setting.fetch_cache_ttl_seconds': number
   'websearch_setting.redirect_cache_ttl_seconds': number
@@ -131,6 +136,8 @@ const buildFormDefaults = (
   websearch_setting: {
     candidate_order: defaults['websearch_setting.candidate_order'] ?? '',
     native_first: defaults['websearch_setting.native_first'] ?? true,
+    builtin_fallback_enabled:
+      defaults['websearch_setting.builtin_fallback_enabled'] ?? false,
     search_cache_ttl_seconds:
       defaults['websearch_setting.search_cache_ttl_seconds'] ?? 600,
     fetch_cache_ttl_seconds:
@@ -156,6 +163,8 @@ const normalizeDefaults = (
     defaults['websearch_setting.candidate_order'] ?? '',
   'websearch_setting.native_first':
     defaults['websearch_setting.native_first'] ?? true,
+  'websearch_setting.builtin_fallback_enabled':
+    defaults['websearch_setting.builtin_fallback_enabled'] ?? false,
   'websearch_setting.search_cache_ttl_seconds':
     defaults['websearch_setting.search_cache_ttl_seconds'] ?? 600,
   'websearch_setting.fetch_cache_ttl_seconds':
@@ -183,6 +192,8 @@ const normalizeFormValues = (
   'websearch_setting.candidate_order':
     values.websearch_setting.candidate_order.trim(),
   'websearch_setting.native_first': values.websearch_setting.native_first,
+  'websearch_setting.builtin_fallback_enabled':
+    values.websearch_setting.builtin_fallback_enabled,
   'websearch_setting.search_cache_ttl_seconds':
     values.websearch_setting.search_cache_ttl_seconds,
   'websearch_setting.fetch_cache_ttl_seconds':
@@ -205,7 +216,9 @@ export function ToolsProxySettingsSection({
   defaultValues,
 }: ToolsProxySettingsSectionProps) {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const updateOption = useUpdateOption()
+  const [clearKeyOpen, setClearKeyOpen] = useState(false)
   const orderTitleId = useId()
   const cacheTitleId = useId()
   const upstreamTitleId = useId()
@@ -217,19 +230,31 @@ export function ToolsProxySettingsSection({
     JSON.stringify(normalizeDefaults(defaultValues))
   )
 
-  const formDefaults = useMemo(
-    () => buildFormDefaults(defaultValues),
-    [defaultValues]
-  )
+  const options = useSystemOptions().data?.data
+  const searchFallback = options?.find(({ key }) => key === 'websearch_setting.fallback_enabled')?.value
+  const fetchLimit = options?.find(({ key }) => key === 'websearch_setting.local_fetch_max_bytes')?.value
+  const formDefaults = useMemo(() => {
+    const defaults = buildFormDefaults(defaultValues)
+    defaults.websearch_setting.fallback_enabled = searchFallback === undefined ? undefined : searchFallback === 'true'
+    defaults.websearch_setting.local_fetch_max_bytes = fetchLimit === undefined ? undefined : Number(fetchLimit)
+    return defaults
+  }, [defaultValues, searchFallback, fetchLimit])
 
-  const toolsProxySchema = useMemo(() => createToolsProxySchema(t), [t])
+  const directoryQuery = useQuery({
+    queryKey: summaryKey,
+    queryFn: getProviderSummary,
+    meta: { errorToast: false },
+  })
+  const directory = directoryQuery.isError ? undefined : directoryQuery.data
+  const toolsProxySchema = useMemo(() => createToolsProxySchema(t, directory), [t, directory])
 
   const form = useForm<ToolsProxyFormValues>({
     resolver: zodResolver(toolsProxySchema),
     defaultValues: formDefaults,
   })
 
-  useResetForm(form, formDefaults)
+  const { isDirty, isSubmitting } = form.formState
+  useResetForm(form, isDirty || isSubmitting ? undefined : formDefaults)
 
   useEffect(() => {
     const normalized = normalizeDefaults(defaultValues)
@@ -240,12 +265,39 @@ export function ToolsProxySettingsSection({
   }, [defaultValues])
 
   const exaKeyConfigured = defaultValues.ExaKeyConfigured === true
+  const refreshProviderReadiness = () => {
+    void queryClient.invalidateQueries({ queryKey: summaryKey })
+  }
+
+  const clearExaKey = async () => {
+    if (!exaKeyConfigured || updateOption.isPending || isSubmitting) return
+
+    try {
+      await updateOption.mutateAsync({
+        key: 'websearch_setting.exa_api_key',
+        value: '',
+      })
+    } catch {
+      return
+    }
+
+    form.resetField('websearch_setting.exa_api_key')
+    refreshProviderReadiness()
+    setClearKeyOpen(false)
+  }
 
   const onSubmit = async (values: ToolsProxyFormValues) => {
+    if (clearKeyOpen) return
+
     const normalized = normalizeFormValues(values)
+    const fallback = values.websearch_setting.fallback_enabled
+    const maxBytes = values.websearch_setting.local_fetch_max_bytes
+    const saveFallback = searchFallback !== undefined && fallback !== undefined && fallback !== (searchFallback === 'true')
+    const saveLimit = fetchLimit !== undefined && maxBytes !== undefined && maxBytes !== Number(fetchLimit)
     const updates = (
       Object.keys(normalized) as Array<keyof FlatToolsProxySettings>
     ).filter((key) => {
+      if (key === 'websearch_setting.retry_attempts' || key === 'websearch_setting.retry_base_delay_milliseconds') return false
       if (normalized[key] === baselineRef.current[key]) return false
       // An empty key field means "leave the stored key alone".
       if (key === 'websearch_setting.exa_api_key' && normalized[key] === '') {
@@ -254,9 +306,16 @@ export function ToolsProxySettingsSection({
       return true
     })
 
-    if (updates.length === 0) {
+    if (!updates.length && !saveFallback && !saveLimit) {
       toast.info(t('No changes to save'))
       return
+    }
+
+    if (saveFallback) {
+      await updateOption.mutateAsync({ key: 'websearch_setting.fallback_enabled', value: fallback })
+    }
+    if (saveLimit) {
+      await updateOption.mutateAsync({ key: 'websearch_setting.local_fetch_max_bytes', value: maxBytes })
     }
 
     for (const key of updates) {
@@ -264,6 +323,7 @@ export function ToolsProxySettingsSection({
         key,
         value: normalized[key],
       })
+      if (key === 'websearch_setting.exa_api_key') refreshProviderReadiness()
     }
 
     // The key field is write-only, so the baseline never holds a key: clearing
@@ -274,11 +334,14 @@ export function ToolsProxySettingsSection({
     }
     baselineRef.current = nextBaseline
     baselineSerializedRef.current = JSON.stringify(nextBaseline)
-    form.setValue('websearch_setting.exa_api_key', '')
+    form.reset({
+      websearch_setting: { ...values.websearch_setting, exa_api_key: '' },
+    })
   }
 
   return (
     <SettingsSection title={t('Tools Proxy')} className='gap-6'>
+      <ToolsNavigation />
       <Form {...form}>
         <SettingsForm onSubmit={form.handleSubmit(onSubmit)} autoComplete='off'>
           <SettingsPageFormActions
@@ -295,6 +358,16 @@ export function ToolsProxySettingsSection({
             <h4 id={orderTitleId} className='font-medium'>
               {t('Candidate order')}
             </h4>
+            {directoryQuery.isError && (
+              <div className='flex flex-wrap items-center gap-2'>
+                <p role='status' className='text-muted-foreground text-sm'>
+                  {t('Provider directory is unavailable. Existing selections are preserved.')}
+                </p>
+                <Button type='button' variant='outline' size='sm' disabled={directoryQuery.isFetching} onClick={() => void directoryQuery.refetch()}>
+                  {t('Retry')}
+                </Button>
+              </div>
+            )}
             <SettingsFormGrid>
               <FormField
                 control={form.control}
@@ -303,17 +376,15 @@ export function ToolsProxySettingsSection({
                   <FormItem>
                     <FormLabel>{t('Provider order')}</FormLabel>
                     <FormControl>
-                      <Input
-                        placeholder='exa,deepseek,antigravity,local'
-                        autoComplete='off'
-                        {...field}
-                        onChange={(event) => field.onChange(event.target.value)}
+                      <ProviderOrderEditor
+                        value={field.value}
+                        directory={directory}
+                        onChange={field.onChange}
+                        onBlur={field.onBlur}
                       />
                     </FormControl>
                     <FormDescription>
-                      {t(
-                        'Comma-separated providers to try in order. Leave blank to use the built-in order.'
-                      )}
+                      {t('Leave the list empty to use the built-in order.')}
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -341,6 +412,31 @@ export function ToolsProxySettingsSection({
                   </SettingsSwitchItem>
                 )}
               />
+              <FormField
+                control={form.control}
+                name='websearch_setting.builtin_fallback_enabled'
+                render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent>
+                      <FormLabel>
+                        {t('Enable built-in tool fallback')}
+                      </FormLabel>
+                      <FormDescription>
+                        {t(
+                          'Use configured Exa or local fetch when no eligible channel is available. Group policies still apply.'
+                        )}
+                      </FormDescription>
+                    </SettingsSwitchContent>
+                    <FormControl>
+                      <Switch
+                        name={field.name}
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </SettingsSwitchItem>
+                )}
+              />
             </SettingsFormGrid>
           </div>
 
@@ -355,6 +451,23 @@ export function ToolsProxySettingsSection({
               {t('Cache and retries')}
             </h4>
             <SettingsFormGrid>
+              {searchFallback !== undefined && (
+                <FormField control={form.control} name='websearch_setting.fallback_enabled' render={({ field }) => (
+                  <SettingsSwitchItem>
+                    <SettingsSwitchContent><FormLabel>{t('Inject default search parameters')}</FormLabel></SettingsSwitchContent>
+                    <FormControl><Switch checked={field.value ?? false} onCheckedChange={field.onChange} /></FormControl>
+                  </SettingsSwitchItem>
+                )} />
+              )}
+              {fetchLimit !== undefined && (
+                <FormField control={form.control} name='websearch_setting.local_fetch_max_bytes' render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('Local fetch limit (bytes)')}</FormLabel>
+                    <FormControl><Input type='number' min={1} max={8 * 1024 * 1024} step={1} {...safeNumberFieldProps(field)} /></FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )} />
+              )}
               <FormField
                 control={form.control}
                 name='websearch_setting.search_cache_ttl_seconds'
@@ -457,15 +570,14 @@ export function ToolsProxySettingsSection({
                       <Input
                         type='number'
                         min={0}
-                        max={10}
+                        max={5}
+                        readOnly
                         step={1}
                         {...safeNumberFieldProps(field)}
                       />
                     </FormControl>
                     <FormDescription>
-                      {t(
-                        '0 uses the built-in 3 attempts. Allowed range is 0 to 10.'
-                      )}
+                      {t('Legacy setting. Tool requests are not retried after sending.')}
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -482,13 +594,14 @@ export function ToolsProxySettingsSection({
                     <FormControl>
                       <Input
                         type='number'
+                        readOnly
                         min={0}
                         step={1}
                         {...safeNumberFieldProps(field)}
                       />
                     </FormControl>
                     <FormDescription>
-                      {t('0 uses the built-in 500 milliseconds.')}
+                      {t('Legacy setting. Tool requests are not retried after sending.')}
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -554,36 +667,49 @@ export function ToolsProxySettingsSection({
                           )}
                     </FormDescription>
                     <FormMessage />
+                    {exaKeyConfigured && (
+                      <Button
+                        type='button'
+                        variant='outline'
+                        size='sm'
+                        className='justify-self-start'
+                        disabled={isSubmitting || updateOption.isPending}
+                        onClick={() => setClearKeyOpen(true)}
+                      >
+                        {t('Clear Exa key')}
+                      </Button>
+                    )}
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name='websearch_setting.antigravity_search_model'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Antigravity search model')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        autoComplete='off'
-                        placeholder={t('Leave blank to use the built-in model')}
-                        {...field}
-                        onChange={(event) => field.onChange(event.target.value)}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t(
-                        'Model an Antigravity search is sent to. Leave blank to use the built-in model name.'
-                      )}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <dl>
+                <dt>{t('Antigravity search model')}</dt>
+                <dd className='text-muted-foreground text-sm'>
+                  gemini-3.5-flash-lite
+                </dd>
+              </dl>
             </SettingsFormGrid>
           </div>
         </SettingsForm>
       </Form>
+      <ConfirmDialog
+        open={clearKeyOpen}
+        onOpenChange={(open) => {
+          if (!updateOption.isPending) setClearKeyOpen(open)
+        }}
+        title={t('Clear Exa key?')}
+        desc={t('Tools Proxy will stop using the stored Exa key.')}
+        confirmText={t('Clear')}
+        destructive
+        isLoading={updateOption.isPending}
+        disabled={!exaKeyConfigured || isSubmitting}
+        handleConfirm={() => void clearExaKey()}
+      />
+      <ToolsDiagnostics />
+      <div id='group-policies' className='min-w-0 scroll-mt-16'>
+        <ToolsApiContent />
+      </div>
+      <ToolsCache />
     </SettingsSection>
   )
 }

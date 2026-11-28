@@ -7,6 +7,15 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 )
 
+func acceptsChannel(channel *Channel, predicates []func(*Channel) bool) bool {
+	for _, accept := range predicates {
+		if !accept(channel) {
+			return false
+		}
+	}
+	return true
+}
+
 var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginEndpoint,
@@ -95,7 +104,7 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		if filter.RequestPath == "" {
 			return true
 		}
-		if !constant.IsAdvancedCustomChannel(ch.Type) {
+		if !constant.IsAdvancedCustomChannel(ch.Type) || ch.hasIndependentToolRoute(filter.RequestPath) {
 			return true
 		}
 		config := ch.GetOtherSettings().AdvancedCustom

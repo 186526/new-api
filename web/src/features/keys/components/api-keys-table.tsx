@@ -39,6 +39,7 @@ import {
   EmptyTitle,
 } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useTableUrlState } from '@/hooks/use-table-url-state'
 import { createServerError } from '@/lib/server-error-message'
@@ -53,6 +54,7 @@ import {
 } from '../constants'
 import type { ApiKey } from '../types'
 import { ApiKeyQuotaCell } from './api-key-quota-cell'
+import { ApiKeyRedactionSummary } from './api-key-redaction-summary'
 import { ApiKeyActivityCell } from './api-key-timestamp-cell'
 import {
   ApiKeyCell,
@@ -189,6 +191,7 @@ function ApiKeysMobileList({
             <div className='flex flex-wrap items-center gap-x-5 gap-y-1'>
               <ModelLimitsCell apiKey={apiKey} detailsTrigger='click' />
               <IpRestrictionsCell apiKey={apiKey} detailsTrigger='click' />
+              <ApiKeyRedactionSummary apiKey={apiKey} />
             </div>
 
             <div className='grid grid-cols-3 items-start gap-3 border-t pt-2'>
@@ -257,7 +260,9 @@ export function ApiKeysTable() {
     columnId: '_tokenSearch',
     onColumnFiltersChange,
   })
-  const shouldSearch = Boolean(globalFilter?.trim() || tokenFilter.trim())
+  const [redactionFilter, setRedactionFilter] = useState('all')
+  const redactionEnabled = redactionFilter === 'all' ? undefined : redactionFilter === 'enabled'
+  const shouldSearch = Boolean(globalFilter?.trim() || tokenFilter.trim() || redactionEnabled !== undefined)
 
   // Fetch data with React Query
   // eslint-disable-next-line @tanstack/query/exhaustive-deps
@@ -268,6 +273,7 @@ export function ApiKeysTable() {
       pagination.pageSize,
       globalFilter,
       tokenFilter,
+      redactionEnabled,
       refreshTrigger,
     ],
     queryFn: async () => {
@@ -275,6 +281,7 @@ export function ApiKeysTable() {
         ? await searchApiKeys({
             keyword: globalFilter,
             token: tokenFilter,
+            redactionEnabled,
             p: pagination.pageIndex + 1,
             size: pagination.pageSize,
           })
@@ -308,6 +315,7 @@ export function ApiKeysTable() {
     data: apiKeys,
     columns,
     enableRowSelection: true,
+    getRowId: (row) => String(row.id),
     columnFilters,
     columnVisibilityStorageKey: API_KEYS_COLUMN_VISIBILITY_STORAGE_KEY,
     globalFilter,
@@ -354,13 +362,28 @@ export function ApiKeysTable() {
         searchPlaceholder: t('Filter by name...'),
         searchDebounceMs: 500,
         additionalSearch: (
-          <Input
-            placeholder={t('Filter by API key...')}
-            aria-label={t('Filter by API key...')}
-            value={tokenFilterInput}
-            onChange={(e) => setTokenFilterInput(e.target.value)}
-            className='w-full sm:w-50 lg:w-60'
-          />
+          <div className='flex flex-wrap gap-2'>
+            <Input
+              placeholder={t('Filter by API key...')}
+              aria-label={t('Filter by API key...')}
+              value={tokenFilterInput}
+              onChange={(event) => setTokenFilterInput(event.target.value)}
+              className='w-full sm:w-50 lg:w-60'
+            />
+            <NativeSelect
+              aria-label={t('Filter by redaction')}
+              value={redactionFilter}
+              onChange={(event) => {
+                table.resetRowSelection()
+                onPaginationChange({ ...pagination, pageIndex: 0 })
+                setRedactionFilter(event.target.value)
+              }}
+            >
+              <NativeSelectOption value='all'>{t('All redaction states')}</NativeSelectOption>
+              <NativeSelectOption value='enabled'>{t('Redaction enabled')}</NativeSelectOption>
+              <NativeSelectOption value='disabled'>{t('Redaction disabled')}</NativeSelectOption>
+            </NativeSelect>
+          </div>
         ),
         filters: [
           {

@@ -81,12 +81,18 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
   apiClient.post = async (url, data) => {
     expect(url).toBe('/api/token/')
     expect(data && typeof data === 'object').toBeTruthy()
-    createdPayloads.push(data as Record<string, unknown>)
-    return { data: { success: true, data: {} } }
+    const payload = data as Record<string, unknown>
+    createdPayloads.push(payload)
+    return {
+      data: {
+        success: true,
+        data: { created: payload.count, redaction_enabled: false },
+      },
+    }
   }
 }
 
-async function renderCreateDrawer(): Promise<void> {
+async function renderCreateDrawer(onOpenChange = vi.fn()): Promise<void> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -127,7 +133,7 @@ async function renderCreateDrawer(): Promise<void> {
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
         <ApiKeysProvider>
-          <ApiKeysMutateDrawer open onOpenChange={() => undefined} />
+          <ApiKeysMutateDrawer open onOpenChange={onOpenChange} />
         </ApiKeysProvider>
       </I18nextProvider>
     </QueryClientProvider>
@@ -206,10 +212,11 @@ afterEach(() => {
 })
 
 describe('API keys mutate drawer Auto group integration', () => {
-  test('inherits the root Auto order and sends an empty override for every batch-created key', async () => {
+  test('sends one batch request inheriting the root Auto order', async () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)
-    await renderCreateDrawer()
+    const close = vi.fn()
+    await renderCreateDrawer(close)
 
     const groupTrigger = getControlByLabel('Group')
     expect(groupTrigger.textContent?.includes('auto')).toBe(true)
@@ -228,15 +235,69 @@ describe('API keys mutate drawer Auto group integration', () => {
     changeInput(getControlByLabel('Name'), 'batch')
     changeInput(getControlByLabel('Quantity'), '2')
     fireEvent.click(findButton('Save changes', true))
-    await waitFor(() => expect(createdPayloads).toHaveLength(2))
+    await waitFor(() => expect(close).toHaveBeenCalledWith(false))
+    expect(createdPayloads).toHaveLength(1)
+    expect(createdPayloads[0]).toMatchObject({
+      count: 2,
+      name: 'batch',
+      group: 'auto',
+      auto_groups: [],
+      cross_group_retry: true,
+    })
+  })
 
-    expect(createdPayloads.length).toBe(2)
-    expect(createdPayloads[0]?.name).toBe('batch')
-    for (const payload of createdPayloads) {
-      expect(payload.group).toBe('auto')
-      expect(payload.auto_groups).toEqual([])
-      expect(payload.cross_group_retry).toBe(true)
+  test.each(['legacy success', 'connection lost'] as const)(
+    'keeps the draft and advises checking the list after %s',
+    async (outcome) => {
+      installApiFixtures([])
+      const post = vi.fn<ApiMethod>(async () => {
+        if (outcome === 'connection lost') throw new Error('connection lost')
+        return { data: { success: true, message: '' } }
+      })
+      apiClient.post = post
+      await renderCreateDrawer()
+
+      const name = getControlByLabel('Name')
+      const quantity = getControlByLabel('Quantity')
+      changeInput(name, 'batch')
+      changeInput(quantity, '3')
+      fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+
+      await waitFor(() =>
+        expect(screen.getByRole('status')).toHaveTextContent(
+          'Creation could not be confirmed. Check the key list before submitting again.'
+        )
+      )
+      expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled()
+      expect(name).toHaveValue('batch')
+      expect(quantity).toHaveValue(3)
+      expect(post).toHaveBeenCalledTimes(1)
     }
+  )
+
+  test('keeps one request in flight when multiple submit events arrive', async () => {
+    installApiFixtures([])
+    let resolveRequest!: (response: { data: unknown }) => void
+    const request = new Promise<{ data: unknown }>((resolve) => {
+      resolveRequest = resolve
+    })
+    const post = vi.fn<ApiMethod>(() => request)
+    apiClient.post = post
+    await renderCreateDrawer()
+
+    const name = getControlByLabel('Name')
+    changeInput(name, 'batch')
+    const form = name.form
+    if (!form) throw new Error('Expected the name input to belong to a form')
+    await act(async () => {
+      fireEvent.submit(form)
+      fireEvent.submit(form)
+    })
+    expect(screen.getByRole('button', { name: 'Saving...' })).toBeDisabled()
+    expect(post).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      resolveRequest({ data: { success: true, data: { created: 1, redaction_enabled: false } } })
+    })
   })
 
   test('preserves an unsaved custom order and mode after Auto to ordinary to Auto changes', async () => {

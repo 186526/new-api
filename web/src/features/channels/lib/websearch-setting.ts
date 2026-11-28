@@ -16,27 +16,128 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { z } from 'zod'
+
 import {
   CHANNEL_TYPE_ADVANCED_CUSTOM,
-  CHANNEL_TYPE_ANTIGRAVITY,
+  CHANNEL_TYPE_CODEX,
+  TOOLS_FETCH_MODEL,
+  TOOLS_SEARCH_MODEL,
 } from '../constants'
+import {
+  formatModelsArray,
+  parseModelsString,
+} from './model-mapping-validation'
 
-/** DeepSeek, the second channel type whose upstream sells search and fetch. */
-const CHANNEL_TYPE_DEEPSEEK = 43
+const operationSchema = z.object({
+  supported: z.boolean(),
+  native_contracts: z.array(z.string()),
+  mapping_required_contracts: z.array(z.string()),
+  fixed_model: z.string().optional(),
+})
+const providerSchema = z.object({
+  provider: z.string(),
+  search: operationSchema,
+  fetch: operationSchema,
+})
+export const channelToolCatalogSchema = z.object({
+  channel_types: z.record(z.string(), providerSchema),
+  fallbacks: z.array(providerSchema),
+})
+export type ChannelToolCatalog = z.infer<typeof channelToolCatalogSchema>
+export type ToolModel = typeof TOOLS_SEARCH_MODEL | typeof TOOLS_FETCH_MODEL
+export const CODEX_SEARCH_MAPPING_REQUIRED =
+  'Enter a valid upstream model for Codex search.'
 
-/**
- * Channel types whose upstream can answer a search or a fetch. The backend
- * derives the provider from the type, and every other type answers "this
- * channel does not support this endpoint", so the settings are shown only here.
- */
-const WEB_SEARCH_CHANNEL_TYPES: ReadonlySet<number> = new Set([
-  CHANNEL_TYPE_ANTIGRAVITY,
-  CHANNEL_TYPE_DEEPSEEK,
-  // An advanced custom channel reaches whatever upstream its base URL names,
-  // so an Exa key can be bound to one here instead of globally.
-  CHANNEL_TYPE_ADVANCED_CUSTOM,
-])
+export function isToolModel(model: string): model is ToolModel {
+  return model === TOOLS_SEARCH_MODEL || model === TOOLS_FETCH_MODEL
+}
 
-export function supportsWebSearchSettings(channelType: number): boolean {
-  return WEB_SEARCH_CHANNEL_TYPES.has(channelType)
+export function preserveToolModels(current: string, models: string[]): string {
+  return formatModelsArray([
+    ...models.filter((model) => !isToolModel(model.trim())),
+    ...parseModelsString(current).filter(isToolModel),
+  ])
+}
+
+export function getChannelToolAvailability(
+  channelType: number,
+  catalog?: ChannelToolCatalog,
+  preference?: string
+) {
+  const provider = catalog?.channel_types[channelType]
+  const candidates = catalog ? [...Object.values(catalog.channel_types), ...catalog.fallbacks] : []
+  const bound = preference === 'antigravity' || preference === 'deepseek' ||
+    (preference === 'exa' && channelType !== CHANNEL_TYPE_ADVANCED_CUSTOM)
+    ? candidates.find((candidate) => candidate.provider === preference)
+    : undefined
+  const search = bound?.search.supported ? bound.search : provider?.search
+  const fetch = bound?.fetch.supported ? bound.fetch : provider?.fetch
+  const canConfigure = Boolean(
+    channelType === CHANNEL_TYPE_ADVANCED_CUSTOM || search?.supported || fetch?.supported
+  )
+  const localFetch = catalog?.fallbacks.some(
+    (fallback) => fallback.provider === 'local' && fallback.fetch.supported
+  )
+
+  return {
+    provider,
+    canConfigure,
+    canSearch: Boolean(search?.supported),
+    canFetch: Boolean(fetch?.supported || (canConfigure && localFetch)),
+    localFetch,
+    requiresSearchMapping: catalog
+      ? Boolean(search?.mapping_required_contracts.includes('tools/search'))
+      : channelType === CHANNEL_TYPE_CODEX,
+    requiresFetchMapping: Boolean(
+      fetch?.mapping_required_contracts.includes('tools/fetch')
+    ),
+  }
+}
+
+function readMapping(value: string): Record<string, string> | undefined {
+  try {
+    const mapping: unknown = JSON.parse(value.trim() || '{}')
+    if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+      return
+    }
+    if (Object.values(mapping).some((target) => typeof target !== 'string')) {
+      return
+    }
+    return mapping as Record<string, string>
+  } catch {
+    return undefined
+  }
+}
+
+export function toolModelMapping(value: string, model: ToolModel): string | undefined {
+  const mapping = readMapping(value)
+  return mapping && (mapping[model] ?? '')
+}
+
+export function withToolModelMapping(value: string, model: ToolModel, target: string): string | undefined {
+  const mapping = readMapping(value)
+  if (!mapping) return undefined
+  if (target) {
+    mapping[model] = target
+  } else {
+    delete mapping[model]
+  }
+  return JSON.stringify(mapping, null, 2)
+}
+
+export function validToolModelMapping(value: string, toolModel: ToolModel): boolean {
+  const mapping = readMapping(value)
+  if (!mapping) return false
+  const visited = new Set<string>()
+  let model: string = toolModel
+  while (!visited.has(model)) {
+    visited.add(model)
+    const target = Object.hasOwn(mapping, model) ? mapping[model].trim() : ''
+    if (!target || target === model) {
+      return !isToolModel(model) && !/[/?#\\ \r\n\t]/.test(model)
+    }
+    model = target
+  }
+  return false
 }

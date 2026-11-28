@@ -455,7 +455,13 @@ func TestAwsStreamHandlerUsesFinalUpstreamUsage(t *testing.T) {
 		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":423}}`,
 		`{"type":"message_stop"}`,
 	}
+	const finalPayload = `{"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":"not observed"}]}`
 	client := newAwsTestClient(awsHTTPClientFunc(func(request *http.Request) (*http.Response, error) {
+		sent, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		assert.JSONEq(t, finalPayload, string(sent))
 		var body bytes.Buffer
 		for _, event := range events {
 			if err := writeAwsStreamEvent(&body, event); err != nil {
@@ -464,13 +470,19 @@ func TestAwsStreamHandlerUsesFinalUpstreamUsage(t *testing.T) {
 		}
 		return newAwsStreamResponse(request, io.NopCloser(bytes.NewReader(body.Bytes()))), nil
 	}))
-	adaptor := &Adaptor{AwsClient: client, AwsReq: newAwsStreamInput()}
+	input := newAwsStreamInput()
+	input.Body = []byte(finalPayload)
+	adaptor := &Adaptor{AwsClient: client, AwsReq: input}
 	recorder := httptest.NewRecorder()
 	c := newAwsTestContext(recorder, context.Background())
+	info := newAwsTestRelayInfo()
+	info.AutoReasoning = &relaycommon.AutoReasoningMeta{Reason: "applied"}
 
-	handlerErr, usage := awsStreamHandler(c, newAwsTestRelayInfo(), adaptor)
+	handlerErr, usage := awsStreamHandler(c, info, adaptor)
 
 	require.Nil(t, handlerErr)
+	assert.Equal(t, "observed", info.AutoReasoning.OutboundStatus)
+	assert.Equal(t, map[string]any{"thinking.type": "enabled", "thinking.budget_tokens": float64(1024)}, info.AutoReasoning.OutboundFields)
 	require.NotNil(t, usage)
 	require.NotNil(t, usage.BillingUsage)
 	require.NotNil(t, usage.BillingUsage.ClaudeUsage)

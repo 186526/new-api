@@ -358,6 +358,7 @@ func migrateDB() error {
 		&Midjourney{},
 		&TopUp{},
 		&QuotaData{},
+		&QuotaRefundReceipt{},
 		&Task{},
 		&TaskPlugin{},
 		&Model{},
@@ -373,6 +374,7 @@ func migrateDB() error {
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
+		&PerfMetricDistributionRow{},
 		&SystemInstance{},
 		&SystemTask{},
 		&SystemTaskLock{},
@@ -380,6 +382,13 @@ func migrateDB() error {
 		&AuthzRole{},
 		&UserAccessToken{},
 		&RegionQuotaEvent{},
+		&RegionQuotaLeaseV2{},
+		&RegionQuotaDebitV2{},
+		&RegionReportReceipt{},
+		&QuotaWriteProtocol{},
+		&QuotaBalancePublication{},
+		&NonRequestQuotaReceipt{},
+		&QuotaReconciliation{},
 	)
 	if err != nil {
 		return err

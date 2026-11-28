@@ -176,10 +176,19 @@ func GetAndValidateAlphaSearchRequest(c *gin.Context) (*dto.AlphaSearchRequest, 
 	return request, nil
 }
 
-// GetAndValidateSystemOneRequest keeps the raw body for forwarding. The
-// upstream validates state, questions and criteria shapes; this layer only
-// needs the model for channel selection.
+// GetAndValidateSystemOneRequest retains the JSON document for relay validation and forwarding.
 func GetAndValidateSystemOneRequest(c *gin.Context) (*dto.SystemOneRequest, error) {
+	if common.IsMultipartFormContentType(c.GetHeader("Content-Type")) {
+		multipartRequest, problems, err := common.ReadSystemOneMultipart(c)
+		if err != nil {
+			return nil, err
+		}
+		if len(problems) > 0 {
+			return nil, errors.New("invalid System One multipart request")
+		}
+		return &dto.SystemOneRequest{Model: multipartRequest.Model, RawBody: multipartRequest.Body}, nil
+	}
+
 	request := &dto.SystemOneRequest{}
 	if err := common.UnmarshalBodyReusable(c, request); err != nil {
 		return nil, err

@@ -14,6 +14,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -167,9 +169,8 @@ func TestDeepSeekToolsHandlerForwardsTheRequestBodyVerbatim(t *testing.T) {
 }
 
 // TestDeepSeekToolsHandlerKeepsAnUpstreamErrorStatus requires an upstream
-// refusal to keep its status, its channel status_code_mapping and to be
-// retryable, none of which a provider error raised inside service/websearch
-// carries.
+// refusal to keep its mapped status without retrying a channel that already
+// answered.
 func TestDeepSeekToolsHandlerKeepsAnUpstreamErrorStatus(t *testing.T) {
 	initLegacyWebsearchTest(t)
 
@@ -208,6 +209,45 @@ func TestDeepSeekToolsHandlerKeepsAnUpstreamErrorStatus(t *testing.T) {
 	assert.Equal(t, "/v1/tools/fetch", gotPath)
 	assert.Equal(t, http.StatusUnprocessableEntity, apiErr.StatusCode, "the channel status_code_mapping still applies")
 	assert.Equal(t, "failed to fetch URL", apiErr.Error())
-	assert.False(t, types.IsSkipRetryError(apiErr))
+	assert.True(t, types.IsSkipRetryError(apiErr))
 	assert.Empty(t, recorder.Body.String())
+}
+
+func TestWebsearchHandlersRefundRenderedEmptyAnswers(t *testing.T) {
+	initLegacyWebsearchTest(t)
+	exa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, []string{"/search", "/contents"}, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"results":[]}`)
+	}))
+	t.Cleanup(exa.Close)
+	settings := config.GlobalConfig.Get("websearch_setting").(*websearch_setting.WebSearchSetting)
+	previous := *settings
+	t.Cleanup(func() {
+		*settings = previous
+		assert.NoError(t, websearch_setting.UpdateAndSync())
+	})
+	settings.ExaBaseURL = exa.URL
+	settings.ExaAPIKey = "test-key"
+	settings.CandidateOrder = "exa"
+	settings.NativeFirst = false
+	require.NoError(t, websearch_setting.UpdateAndSync())
+
+	for _, tc := range []struct {
+		path, body, expected string
+	}{
+		{toolsSearchPath, `{"query":"empty example"}`, `{"results":[]}`},
+		{toolsFetchPath, `{"url":"https://a.example/empty"}`, `{"title":"","content":""}`},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			recorder, settlement, nativePath, _, apiErr := runDeepSeekToolsHelper(t, tc.path, tc.body,
+				http.StatusInternalServerError, `{"error":{"message":"unexpected native request"}}`, constant.ChannelTypeDeepSeek)
+			require.Nil(t, apiErr)
+			assert.Empty(t, nativePath)
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.JSONEq(t, tc.expected, recorder.Body.String())
+			assert.Empty(t, settlement.settled)
+			assert.Equal(t, 1, settlement.refundCalls)
+		})
+	}
 }

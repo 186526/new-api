@@ -35,7 +35,9 @@ func SetUpLogger(server *gin.Engine) {
 			path := param.Path
 			// OAuth callbacks carry one-time codes and state in the query string.
 			// Redact the log value only; the handler still needs the original query.
-			if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
+			if protectedPath, ok := param.Keys[requestRedactionLogPath].(string); ok {
+				path = protectedPath
+			} else if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
 				path, _, _ = strings.Cut(path, "?")
 			} else {
 				path = redactRequestTarget(param.Request)

@@ -18,7 +18,9 @@ On SIGTERM:
 - The listener closes after `SHUTDOWN_DRAIN_DELAY_SECONDS` (default 10), with `SHUTDOWN_TIMEOUT_SECONDS` (default 120) to finish them.
 - The deployment probes `/healthz` for readiness and sets a 300-second grace period.
 
-After `Shutdown` returns, `main.go` first calls `model.WaitDetachedQuotaWork` and only then `model.FlushBatchUpdates` when `BATCH_UPDATE_ENABLED` is on. The order MUST NOT be reversed.
+After `Shutdown` returns, `main.go` first calls `model.WaitDetachedQuotaWork` and only then `model.FlushBatchUpdates` when `BATCH_UPDATE_ENABLED` is on. The order MUST NOT be reversed. The instance reporter then cancels and joins its loop before removing its own row, with one 5-second budget for the join and unregister.
+
+System Info uses `POD_UID` as the instance key and displays `POD_NAME` and `POD_HOST_NODE_NAME` from the Downward API. This does not change the global `NodeName`. Unregister matches the process ID as well as the instance key. Admin/all deletes expired temporary rows every 30 seconds; their default lifetime is 180 seconds (`SYSTEM_INSTANCE_AUTO_EXPIRE_SECONDS`). Manual bulk cleanup calls `DELETE /api/system-info/expired-instances` and only deletes rows whose positive expiry has elapsed. The dashboard does not fall back when an older backend lacks this route. The current server keeps `DELETE /api/system-info/stale-instances` as a compatibility alias with the same restricted behavior, but older backends used the last heartbeat for that route. Rows without an expiry can still be reviewed and deleted individually once stale. `SYSTEM_INSTANCE_REPORTER_ENABLED=false` stops this server's heartbeat but does not stop cleanup or scheduled tasks. Upgrade the migration-running admin before proxies use the new instance columns.
 
 ## Why the refund wait comes first
 

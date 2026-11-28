@@ -270,7 +270,13 @@ func claimTaskQuotaWriteBack(task *model.Task, fromQuota int) (bool, error) {
 // 当异步任务失败时，退还资金与令牌额度，并回减用户和渠道用量。
 // 返回资金来源是否已成功退还；失败时保留 quota，供显式重试或人工对账。
 func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
+	if task.PrivateData.WalletDebit != nil || model.SQLQuotaLedgerWriterEnabled() {
+		return false
+	}
 	quota := task.Quota
+	if quota < 0 {
+		return false
+	}
 	if quota == 0 {
 		return true
 	}
@@ -397,20 +403,31 @@ func RecalculateTaskQuota(ctx context.Context, task *model.Task, actualQuota int
 // 当任务成功且返回了 totalTokens 时，根据模型倍率和分组倍率重新计算实际扣费额度，
 // 与预扣费的差额进行补扣或退还。支持钱包和订阅计费来源。
 func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTokens int) bool {
-	if totalTokens <= 0 {
+	decision := taskQuotaFromTokens(task, totalTokens)
+	if decision == nil {
 		return false
+	}
+	RecalculateTaskQuota(ctx, task, decision.amount, decision.reason, decision.clamp)
+	return true
+}
+
+type taskQuotaDecision struct {
+	amount int
+	reason *common.Message
+	clamp  *common.QuotaClamp
+}
+
+func taskQuotaFromTokens(task *model.Task, totalTokens int) *taskQuotaDecision {
+	if totalTokens <= 0 {
+		return nil
 	}
 
 	modelName := taskModelName(task)
-
-	// 获取模型价格和倍率
 	modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
-	// 只有配置了倍率(非固定价格)时才按 token 重新计费
 	if !hasRatioSetting || modelRatio <= 0 {
-		return false
+		return nil
 	}
 
-	// 获取用户和组的倍率信息
 	group := task.Group
 	if group == "" {
 		user, err := model.GetUserById(task.UserId, false)
@@ -419,7 +436,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		}
 	}
 	if group == "" {
-		return false
+		return nil
 	}
 
 	groupRatio := ratio_setting.GetGroupRatio(group)
@@ -447,8 +464,7 @@ func RecalculateTaskQuotaByTokens(ctx context.Context, task *model.Task, totalTo
 		"group_ratio":      fmt.Sprintf("%.2f", finalGroupRatio),
 		"other_multiplier": fmt.Sprintf("%.4f", otherMultiplier),
 	})
-	RecalculateTaskQuota(ctx, task, actualQuota, reason, clamp)
-	return true
+	return &taskQuotaDecision{amount: actualQuota, reason: reason, clamp: clamp}
 }
 
 // EvaluateTaskCompletionUsage evaluates actual facts against the frozen task

@@ -1,9 +1,9 @@
 package abstract
 
 import (
+	"slices"
 	"strings"
 
-	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/setting/websearch_setting"
 )
 
@@ -40,47 +40,6 @@ const (
 	OriginLocal
 )
 
-// nativeContracts names the contracts each provider speaks itself. A provider
-// missing from this table serves nothing natively; one listed for a contract
-// answers that document without rendering.
-var nativeContracts = map[string][]Contract{
-	websearch_setting.ProviderDeepSeek: {
-		ContractToolsSearch,
-		ContractToolsFetch,
-	},
-	websearch_setting.ProviderCodex: {
-		ContractAlphaSearch,
-	},
-}
-
-// SpeaksNatively reports whether the provider's upstream publishes the
-// contract itself.
-func SpeaksNatively(provider string, contract Contract) bool {
-	for _, known := range nativeContracts[provider] {
-		if known == contract {
-			return true
-		}
-	}
-	return false
-}
-
-// channelProvider is the provider a channel type maps to on its own, empty when
-// the type has no web search upstream.
-func channelProvider(channelType int) string {
-	switch channelType {
-	case constant.ChannelTypeAntigravity:
-		return websearch_setting.ProviderAntigravity
-	case constant.ChannelTypeDeepSeek,
-		constant.ChannelTypeNewAPI,
-		constant.ChannelTypeSub2API:
-		return websearch_setting.ProviderDeepSeek
-	case constant.ChannelTypeCodex:
-		return websearch_setting.ProviderCodex
-	default:
-		return ""
-	}
-}
-
 // Candidates returns every provider that can serve the contract, best first.
 //
 // The list is the full set of providers this deployment can reach, reordered by
@@ -89,37 +48,40 @@ func channelProvider(channelType int) string {
 // is the only signal that the channel can serve nothing, which the relay layer
 // turns into a retry on another channel.
 func Candidates(channel ChannelContext, contract Contract) ([]Candidate, error) {
-	settings := websearch_setting.Get()
+	return CandidatesWithSettings(channel, contract, websearch_setting.Get())
+}
 
-	bound := ""
-	switch strings.ToLower(strings.TrimSpace(channel.Settings.WebSearchProvider)) {
-	case "":
-	case websearch_setting.ProviderAntigravity,
-		websearch_setting.ProviderDeepSeek,
-		websearch_setting.ProviderExa:
-		bound = strings.ToLower(strings.TrimSpace(channel.Settings.WebSearchProvider))
-	default:
-		// A name this build does not know is treated as no binding rather than
-		// as a refusal: the channel's own upstream still serves the request.
+func CandidatesWithSettings(channel ChannelContext, contract Contract, settings websearch_setting.WebSearchSetting) ([]Candidate, error) {
+	candidates, _ := qualifiedCandidates(channel, contract, settings, nil)
+	if len(candidates) == 0 {
+		return nil, ErrUnsupportedChannel
+	}
+	return candidates, nil
+}
+
+func qualifiedCandidates(channel ChannelContext, contract Contract, settings websearch_setting.WebSearchSetting, qualification *Qualification) ([]Candidate, []CandidateEligibility) {
+	bound := channelOperatorBinding(channel.ChannelType, channel.Settings.WebSearchProvider).Provider
+	if channel.CustomOperation(contract) != nil {
+		bound = websearch_setting.ProviderExa
 	}
 
-	own := channelProvider(channel.ChannelType)
+	own := ChannelProvider(channel.ChannelType)
 
 	candidates := make([]Candidate, 0, 5)
+	var diagnostics []CandidateEligibility
 	add := func(provider string, origin CandidateOrigin) {
-		if provider == "" {
+		candidate := Candidate{Provider: provider, Native: SpeaksNatively(provider, contract), Origin: origin}
+		reason := candidateReason(channel, contract, candidate)
+		if qualification != nil {
+			if reason == EligibilityReady {
+				reason = qualification.reason(channel, settings, contract, candidate)
+			}
+			diagnostics = append(diagnostics, CandidateEligibility{Candidate: candidate, Reason: reason})
+		}
+		if reason != EligibilityReady || slices.ContainsFunc(candidates, func(existing Candidate) bool { return existing.Provider == provider }) {
 			return
 		}
-		for _, existing := range candidates {
-			if existing.Provider == provider {
-				return
-			}
-		}
-		candidates = append(candidates, Candidate{
-			Provider: provider,
-			Native:   SpeaksNatively(provider, contract),
-			Origin:   origin,
-		})
+		candidates = append(candidates, candidate)
 	}
 
 	// The channel's own upstream always participates; whether it speaks the
@@ -135,28 +97,40 @@ func Candidates(channel ChannelContext, contract Contract) ([]Candidate, error) 
 	if bound != "" && bound != own {
 		add(bound, OriginOperatorBinding)
 	}
-	for _, provider := range websearch_setting.GlobalProviders() {
-		if provider == bound || provider == own {
-			continue
-		}
-		add(provider, OriginGlobalCredential)
+	if qualification != nil || strings.TrimSpace(settings.ExaAPIKey) != "" {
+		add(websearch_setting.ProviderExa, OriginGlobalCredential)
 	}
-	// The in-process fetcher answers any fetch without a credential. A search
-	// has no local implementation, so it never appears there.
 	if !contract.IsSearch() {
 		add(websearch_setting.ProviderLocal, OriginLocal)
 	}
 
 	if len(candidates) == 0 {
-		return nil, ErrUnsupportedChannel
+		return nil, diagnostics
 	}
 
-	order := websearch_setting.ProviderOrder()
+	order := strings.Split(settings.CandidateOrder, ",")
+	if settings.CandidateOrder == "" {
+		order = nil
+	} else {
+		for index := range order {
+			order[index] = strings.ToLower(strings.TrimSpace(order[index]))
+		}
+	}
 	if len(order) > 0 || !settings.NativeFirst || bound != "" {
 		rankCandidates(candidates, order, bound, settings.NativeFirst)
 	}
+	if len(channel.PreferredProviders) != 0 {
+		positions := make(map[string]int, len(channel.PreferredProviders))
+		for index, provider := range channel.PreferredProviders {
+			positions[provider] = index + 1
+		}
+		sortCandidates(candidates, func(first, second Candidate) bool {
+			firstRank, secondRank := positions[first.Provider], positions[second.Provider]
+			return firstRank != 0 && (secondRank == 0 || firstRank < secondRank)
+		})
+	}
 	pinFetchFallback(candidates, contract)
-	return candidates, nil
+	return candidates, diagnostics
 }
 
 // rankCandidates applies the operator's preference. It reorders only: every

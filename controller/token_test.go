@@ -641,6 +641,59 @@ func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 	}
 }
 
+func TestAddTokenCreatesBatchWithSeparatelySealedPolicies(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	payload := map[string]any{
+		"name": "batch", "count": 3, "unlimited_quota": true,
+		"redaction_config": map[string]any{"strategy": "typed_placeholder", "builtin_rules": []string{"email"}, "scopes": map[string]bool{"user_messages": true}},
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", payload, 1)
+	AddToken(ctx)
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	assert.JSONEq(t, `{"created":3,"redaction_enabled":false}`, string(response.Data))
+	var tokens []model.Token
+	require.NoError(t, db.Where("user_id = ?", 1).Find(&tokens).Error)
+	require.Len(t, tokens, 3)
+	original, err := tokens[0].RedactionConfigBytes()
+	require.NoError(t, err)
+	require.NotEmpty(t, original)
+	for _, token := range tokens[1:] {
+		assert.NotEqual(t, tokens[0].Key, token.Key)
+		assert.NotEqual(t, tokens[0].RedactionConfig, token.RedactionConfig)
+		policy, err := token.RedactionConfigBytes()
+		require.NoError(t, err)
+		assert.Equal(t, original, policy)
+	}
+	assert.ErrorIs(t, insertTokenCreateBatch(tokens, 4), errTokenCreateLimit)
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+	assert.EqualValues(t, 3, count)
+}
+
+func TestAddTokenReturnsStablePolicyErrorWithoutRuleContents(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	payload := map[string]any{
+		"name": "batch", "count": 2,
+		"redaction_config": map[string]any{
+			"strategy": "typed_placeholder", "scopes": map[string]bool{"user_messages": true},
+			"custom_rules": []map[string]string{{"id": "rule", "label": "RULE", "pattern": "[PRIVATE_TEST"}},
+		},
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", payload, 1)
+	AddToken(ctx)
+	var response struct {
+		Success    bool   `json:"success"`
+		MessageKey string `json:"message_key"`
+		Field      string `json:"field"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	assert.Equal(t, "redaction.invalid_pattern", response.MessageKey)
+	assert.Equal(t, "redaction_config.custom_rules.0.pattern", response.Field)
+	assert.NotContains(t, recorder.Body.String(), "PRIVATE_TEST")
+}
+
 func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -736,7 +789,7 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				db, _ := newAuditTestDatabase(t, database.name, dsn)
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.Token{}))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
@@ -764,9 +817,9 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 
 func verifyAPITokenAudit(t *testing.T) {
 	t.Helper()
-	pat := "api-token-audit-pat-secret"
-	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &pat, AffCode: "token-owner"}
+	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "token-owner"}
 	require.NoError(t, model.DB.Create(user).Error)
+	pat, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "api_key:reveal")
 	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
@@ -801,9 +854,10 @@ func verifyAPITokenAudit(t *testing.T) {
 		failWrite, rateLimit, usePAT     bool
 	}{
 		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true},
+		{name: "create batch", method: "POST", path: "/", body: `{"name":"created batch","count":2,"expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true, params: `{"name":"created batch","count":2}`},
 		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{"name":"attempt"}`},
 		{name: "malformed body", method: "POST", path: "/", body: `{"key":"raw-body-secret"`, action: "token.create", params: `{}`},
-		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
+		{name: "oversized invalid number is not echoed", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
 		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","unlimited_quota":true}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
 		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"remain_quota":200,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
 		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
@@ -869,7 +923,16 @@ func verifyAPITokenAudit(t *testing.T) {
 			}
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
-			if strings.Contains(tc.name, "exceeds audit buffer") {
+			if tc.usePAT {
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				require.True(t, decodeAPIResponse(t, response).Success)
+			}
+			switch tc.name {
+			case "oversized invalid number is not echoed":
+				assert.Equal(t, "Invalid request", decodeAPIResponse(t, response).Message)
+				assert.Less(t, response.Body.Len(), 64*1024)
+				assert.NotContains(t, response.Body.String(), strings.Repeat("9", 16))
+			case "successful response exceeds audit buffer":
 				assert.Greater(t, response.Body.Len(), 64*1024)
 			}
 			var events []model.AuditLog

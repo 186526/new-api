@@ -24,11 +24,12 @@ import {
   ServerCog,
   Trash2,
 } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useId, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { EmptyState } from '@/components/empty-state'
 import { ErrorState } from '@/components/error-state'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -63,7 +64,7 @@ import { cn } from '@/lib/utils'
 
 import {
   deleteStaleSystemInstance,
-  deleteStaleSystemInstances,
+  deleteExpiredSystemInstances,
   listSystemInstances,
 } from '../api'
 import type { SystemInstance, SystemInstanceStatus } from '../types'
@@ -86,16 +87,22 @@ const STATUS_DOT_CLASS_NAME: Record<SystemInstanceStatus, string> = {
   stale: 'bg-amber-500',
 }
 
-function roleLabel(instance: SystemInstance) {
-  if (instance.info?.role?.is_master) return 'master'
-  return 'worker'
-}
-
-function roleDescriptionKey(instance: SystemInstance) {
-  if (instance.info?.role?.is_master) {
-    return 'Master instances run scheduled background tasks.'
+function InstanceRole(props: { instance: SystemInstance }) {
+  const role = props.instance.info?.role
+  let label = role?.is_master ? 'master' : 'worker'
+  let variant: 'default' | 'outline' | 'secondary' = 'outline'
+  if (role?.server_role === 'admin' || role?.server_role === 'proxy') {
+    label = role.server_role
+    variant = role.server_role === 'admin' ? 'default' : 'secondary'
+  } else if (role?.server_role === 'all') {
+    label = role.server_role
   }
-  return 'Worker instances do not run master-only background tasks.'
+  return (
+    <div className='flex items-center gap-1.5'>
+      <Badge variant={variant}>{label}</Badge>
+      {role?.region && <Badge variant='outline'>{role.region}</Badge>}
+    </div>
+  )
 }
 
 function runtimeLabel(instance: SystemInstance) {
@@ -236,10 +243,19 @@ type SystemInstancesTableProps = {
 
 function SystemInstancesList(props: SystemInstancesTableProps) {
   const { t, i18n } = useTranslation()
+  const captionId = useId()
 
   return (
-    <div className='overflow-x-auto rounded-md border'>
-      <Table className='min-w-[1230px]'>
+    <div
+      role='region'
+      aria-labelledby={captionId}
+      tabIndex={0}
+      className='overflow-x-auto rounded-md border focus-visible:outline-2 focus-visible:outline-offset-2'
+    >
+      <Table withContainer={false} className='min-w-[1230px]'>
+        <caption id={captionId} className='sr-only'>
+          {t('Active Replicas')}
+        </caption>
         <TableHeader>
           <TableRow className='bg-muted/40 hover:bg-muted/40'>
             <TableHead className='h-9 min-w-[240px] px-4 text-xs'>
@@ -276,6 +292,7 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
         <TableBody>
           {props.instances.map((instance) => {
             const shouldConfigure =
+              !instance.ephemeral &&
               instance.info?.node?.should_configure_manually === true
             const resources = instance.info?.resources
             const storage = resources?.storage
@@ -298,6 +315,9 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
                         <span className='truncate text-sm font-medium'>
                           {getNodeName(instance)}
                         </span>
+                        {instance.ephemeral && (
+                          <Badge variant='outline'>Pod</Badge>
+                        )}
                         {shouldConfigure && (
                           <Popover>
                             <PopoverTrigger
@@ -345,7 +365,9 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
                         )}
                       </div>
                       <div className='text-muted-foreground truncate font-mono text-[11px]'>
-                        {instance.info?.host?.hostname || '-'}
+                        {instance.host_node_name ||
+                          instance.info?.host?.hostname ||
+                          '-'}
                       </div>
                     </div>
                   </div>
@@ -367,21 +389,20 @@ function SystemInstancesList(props: SystemInstancesTableProps) {
                     />
                     {t(instance.status)}
                   </Badge>
+                  {instance.status === 'stale' &&
+                    instance.expire_after_seconds != null && (
+                      <div className='text-muted-foreground mt-1 text-xs'>
+                        {t(
+                          'Pods expire after {{seconds}}s without a heartbeat.',
+                          {
+                            seconds: instance.expire_after_seconds,
+                          }
+                        )}
+                      </div>
+                    )}
                 </TableCell>
                 <TableCell className='py-2.5 align-middle'>
-                  <TooltipProvider delay={100}>
-                    <Tooltip>
-                      <TooltipTrigger
-                        className='inline-flex shrink-0 rounded-full focus-visible:ring-2 focus-visible:outline-none'
-                        aria-label={t('Node role')}
-                      >
-                        <Badge variant='outline'>{roleLabel(instance)}</Badge>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        {t(roleDescriptionKey(instance))}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
+                  <InstanceRole instance={instance} />
                 </TableCell>
                 <TableCell className='py-2.5 align-middle'>
                   <ResourceCell value={resources?.cpu?.usage_percent} />
@@ -504,18 +525,17 @@ export function SystemInstancesPanel() {
       if (!res.success || !Array.isArray(res.data)) {
         throw createServerError(res, t('We could not load instances.'))
       }
-      return res.data
+      return { instances: res.data, reporterEnabled: res.reporter_enabled }
     },
     staleTime: 30 * 1000,
     retry: false,
     refetchInterval: INSTANCE_POLL_INTERVAL_MS,
   })
 
-  const instances = instancesQuery.data ?? []
-  const staleInstances = instances.filter(
-    (instance) => instance.status === 'stale'
+  const instances = instancesQuery.data?.instances ?? []
+  const hasExpiredInstances = instances.some(
+    (instance) => instance.ephemeral === true && instance.expired === true
   )
-  const hasStaleInstances = staleInstances.length > 0
   const loading = instancesQuery.isLoading
   const refreshing = instancesQuery.isFetching && !instancesQuery.isLoading
 
@@ -550,9 +570,9 @@ export function SystemInstancesPanel() {
     },
   })
 
-  const deleteStaleInstancesMutation = useMutation({
+  const deleteExpiredInstancesMutation = useMutation({
     mutationFn: async () => {
-      const res = await deleteStaleSystemInstances()
+      const res = await deleteExpiredSystemInstances()
       if (!res.success) {
         throw createServerError(res, t('Delete failed'))
       }
@@ -560,7 +580,7 @@ export function SystemInstancesPanel() {
     },
     onSuccess: async (res) => {
       toast.success(
-        t('Deleted {{count}} stale instances', {
+        t('Deleted {{count}} expired records', {
           count: res.data?.deleted_count ?? 0,
         })
       )
@@ -600,19 +620,19 @@ export function SystemInstancesPanel() {
       />
     )
   } else if (instances.length === 0) {
-    instancesContent = (
-      <div className='px-4 py-10 text-center sm:px-5'>
-        <div className='bg-muted mx-auto mb-3 flex size-10 items-center justify-center rounded-lg'>
-          <ServerCog
-            className='text-muted-foreground size-5'
-            aria-hidden='true'
-          />
-        </div>
-        <p className='text-muted-foreground text-sm'>
-          {t('No instances have reported yet.')}
+    instancesContent =
+      instancesQuery.data?.reporterEnabled === false ? (
+        <p className='text-muted-foreground px-4 py-3 text-sm sm:px-5'>
+          {t('Instance reporting is disabled on this server.')}{' '}
+          {t('See Grafana for cluster metrics.')}
         </p>
-      </div>
-    )
+      ) : (
+        <EmptyState
+          className='min-h-0 py-10'
+          icon={ServerCog}
+          title={t('No instances have reported yet.')}
+        />
+      )
   } else {
     instancesContent = (
       <div className='p-4 sm:p-5'>
@@ -620,7 +640,7 @@ export function SystemInstancesPanel() {
           instances={instances}
           deletingNodeName={deletingNodeName}
           isDeletingInstance={
-            isMutatingInstance || deleteStaleInstancesMutation.isPending
+            isMutatingInstance || deleteExpiredInstancesMutation.isPending
           }
           onDeleteStaleInstance={setDeleteTarget}
         />
@@ -638,7 +658,9 @@ export function SystemInstancesPanel() {
                 <ServerCog className='size-4' aria-hidden='true' />
               </span>
               <div className='min-w-0'>
-                <h3 className='text-sm font-semibold'>{t('Instances')}</h3>
+                <h3 className='text-sm font-semibold'>
+                  {t('Active Replicas')}
+                </h3>
                 <p className='text-muted-foreground mt-0.5 text-xs'>
                   {t(
                     'Nodes reporting from this deployment and their latest heartbeat.'
@@ -653,17 +675,17 @@ export function SystemInstancesPanel() {
                 seconds: INSTANCE_POLL_INTERVAL_MS / 1000,
               })}
             </span>
-            {hasStaleInstances ? (
+            {hasExpiredInstances && !instancesQuery.isError ? (
               <Button
                 type='button'
                 variant='destructive'
                 size='sm'
                 onClick={() => setDeleteAllConfirmOpen(true)}
                 disabled={
-                  isMutatingInstance || deleteStaleInstancesMutation.isPending
+                  isMutatingInstance || deleteExpiredInstancesMutation.isPending
                 }
               >
-                {deleteStaleInstancesMutation.isPending ? (
+                {deleteExpiredInstancesMutation.isPending ? (
                   <Loader2
                     data-icon='inline-start'
                     className='size-3.5 animate-spin'
@@ -676,7 +698,7 @@ export function SystemInstancesPanel() {
                     aria-hidden='true'
                   />
                 )}
-                {t('Delete all stale')}
+                {t('Delete expired records')}
               </Button>
             ) : null}
             <Button
@@ -703,19 +725,17 @@ export function SystemInstancesPanel() {
       <ConfirmDialog
         open={deleteAllConfirmOpen}
         onOpenChange={setDeleteAllConfirmOpen}
-        title={t('Delete stale instances')}
-        desc={t(
-          'Delete {{count}} stale instance records? Online instances will not be deleted.',
-          { count: staleInstances.length }
-        )}
+        title={t('Delete expired records')}
+        desc={t('Only expired temporary instance records will be deleted.')}
         destructive
-        isLoading={deleteStaleInstancesMutation.isPending}
+        disabled={!hasExpiredInstances || instancesQuery.isError}
+        isLoading={deleteExpiredInstancesMutation.isPending}
         confirmText={
-          deleteStaleInstancesMutation.isPending
+          deleteExpiredInstancesMutation.isPending
             ? t('Deleting...')
             : t('Delete')
         }
-        handleConfirm={() => deleteStaleInstancesMutation.mutate()}
+        handleConfirm={() => deleteExpiredInstancesMutation.mutate()}
       />
 
       <ConfirmDialog

@@ -690,8 +690,10 @@ export const PromptInput = ({
     const blob = await response.blob()
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
-      reader.onloadend = () => resolve(reader.result as string)
-      reader.onerror = reject
+      reader.addEventListener('loadend', () => resolve(reader.result as string), {
+        once: true,
+      })
+      reader.addEventListener('error', reject, { once: true })
       reader.readAsDataURL(blob)
     })
   }
@@ -1034,14 +1036,18 @@ interface SpeechRecognition extends EventTarget {
   lang: string
   start(): void
   stop(): void
-  onstart: ((this: SpeechRecognition, ev: Event) => void) | null
-  onend: ((this: SpeechRecognition, ev: Event) => void) | null
-  onresult:
-    | ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => void)
-    | null
-  onerror:
-    | ((this: SpeechRecognition, ev: SpeechRecognitionErrorEvent) => void)
-    | null
+  addEventListener: (<EventName extends keyof SpeechRecognitionEvents>(
+    type: EventName,
+    listener: (event: SpeechRecognitionEvents[EventName]) => void,
+    options?: AddEventListenerOptions
+  ) => void) & EventTarget['addEventListener']
+}
+
+interface SpeechRecognitionEvents {
+  start: Event
+  end: Event
+  result: SpeechRecognitionEvent
+  error: SpeechRecognitionErrorEvent
 }
 
 interface SpeechRecognitionEvent extends Event {
@@ -1072,12 +1078,8 @@ interface SpeechRecognitionErrorEvent extends Event {
 
 declare global {
   interface Window {
-    SpeechRecognition: {
-      new (): SpeechRecognition
-    }
-    webkitSpeechRecognition: {
-      new (): SpeechRecognition
-    }
+    SpeechRecognition?: new () => SpeechRecognition
+    webkitSpeechRecognition?: new () => SpeechRecognition
   }
 }
 
@@ -1094,70 +1096,59 @@ export const PromptInputSpeechButton = ({
   onTranscriptionChange,
   ...props
 }: PromptInputSpeechButtonProps) => {
-  const [isListening, setIsListening] = useState(false)
+  const [listeningRecognition, setListeningRecognition] =
+    useState<SpeechRecognition | null>(null)
   const [recognition, setRecognition] = useState<SpeechRecognition | null>(null)
-  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  const isListening =
+    recognition !== null && listeningRecognition === recognition
 
   useEffect(() => {
-    if (
-      typeof window !== 'undefined' &&
-      ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)
-    ) {
-      const SpeechRecognition =
-        window.SpeechRecognition || window.webkitSpeechRecognition
-      const speechRecognition = new SpeechRecognition()
+    const Recognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!Recognition) return
 
-      speechRecognition.continuous = true
-      speechRecognition.interimResults = true
-      speechRecognition.lang = 'en-US'
+    const speechRecognition = new Recognition()
+    speechRecognition.continuous = true
+    speechRecognition.interimResults = true
+    speechRecognition.lang = 'en-US'
 
-      speechRecognition.onstart = () => {
-        setIsListening(true)
-      }
+    const listeners = new AbortController()
+    const options = { signal: listeners.signal }
 
-      speechRecognition.onend = () => {
-        setIsListening(false)
-      }
+    const startListening = () => setListeningRecognition(speechRecognition)
+    const resetListening = () => setListeningRecognition(null)
+    const handleResult = (event: SpeechRecognitionEvent) => {
+      let finalTranscript = ''
+      const results = event.results
 
-      speechRecognition.onresult = (event) => {
-        let finalTranscript = ''
-
-        const results = event.results
-
-        for (let resultIndex = 0; resultIndex < results.length; resultIndex++) {
-          const result = results.item(resultIndex)
-          if (result.isFinal) {
-            finalTranscript += result[0]?.transcript ?? ''
-          }
-        }
-
-        if (finalTranscript && textareaRef?.current) {
-          const textarea = textareaRef.current
-          const currentValue = textarea.value
-          const newValue =
-            currentValue + (currentValue ? ' ' : '') + finalTranscript
-
-          textarea.value = newValue
-          textarea.dispatchEvent(new Event('input', { bubbles: true }))
-          onTranscriptionChange?.(newValue)
+      for (let resultIndex = 0; resultIndex < results.length; resultIndex++) {
+        const result = results.item(resultIndex)
+        if (result.isFinal) {
+          finalTranscript += result[0]?.transcript ?? ''
         }
       }
 
-      speechRecognition.onerror = (event) => {
-        // eslint-disable-next-line no-console
-        console.error('Speech recognition error:', event.error)
-        setIsListening(false)
-      }
+      if (finalTranscript && textareaRef?.current) {
+        const textarea = textareaRef.current
+        const currentValue = textarea.value
+        const newValue =
+          currentValue + (currentValue ? ' ' : '') + finalTranscript
 
-      recognitionRef.current = speechRecognition
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setRecognition(speechRecognition)
+        textarea.value = newValue
+        textarea.dispatchEvent(new Event('input', { bubbles: true }))
+        onTranscriptionChange?.(newValue)
+      }
     }
 
+    speechRecognition.addEventListener('start', startListening, options)
+    speechRecognition.addEventListener('end', resetListening, options)
+    speechRecognition.addEventListener('result', handleResult, options)
+    speechRecognition.addEventListener('error', resetListening, options)
+
+    setRecognition(speechRecognition)
     return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop()
-      }
+      listeners.abort()
+      speechRecognition.stop()
     }
   }, [textareaRef, onTranscriptionChange])
 

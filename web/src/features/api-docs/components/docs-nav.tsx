@@ -16,72 +16,66 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useEffect, useState } from 'react'
+import { createLink } from '@tanstack/react-router'
+import type { ComponentProps } from 'react'
 import { useTranslation } from 'react-i18next'
-
-import { cn } from '@/lib/utils'
 
 import { API_PROTOCOLS } from '../constants'
 import { protocolTitle } from '../lib/copy'
 
-/**
- * Left-hand anchor navigation. Every link points at the id of a protocol
- * section on the same page, and the entry for the section in view is marked
- * current so the list follows the reader while scrolling.
- */
+const ProtocolLink = createLink(function ProtocolAnchor(
+  props: ComponentProps<'a'>
+) {
+  return (
+    <a
+      {...props}
+      aria-current={props['aria-current'] === 'page' ? 'location' : undefined}
+    />
+  )
+})
+
 export function DocsNav() {
   const { t } = useTranslation()
-  const [activeId, setActiveId] = useState<string>(API_PROTOCOLS[0]?.id ?? '')
-
-  useEffect(() => {
-    const sections = API_PROTOCOLS.map((protocol) =>
-      document.querySelector(`#${protocol.id}`)
-    ).filter((element): element is HTMLElement => element !== null)
-
-    if (sections.length === 0) {
-      return
-    }
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)
-        if (visible[0]?.target.id) {
-          setActiveId(visible[0].target.id)
-        }
-      },
-      { rootMargin: '-96px 0px -60% 0px', threshold: 0 }
-    )
-
-    sections.forEach((section) => observer.observe(section))
-    return () => observer.disconnect()
-  }, [])
 
   return (
     <nav
       aria-label={t('apiDocs.nav.label', {
         defaultValue: 'Protocol navigation',
       })}
-      className='text-sm'
+      className='min-w-0 self-start border-b pb-5 text-sm lg:sticky lg:top-20 lg:max-h-[calc(100dvh-6rem)] lg:overflow-y-auto lg:border-e lg:border-b-0 lg:pe-4 lg:pb-0'
     >
       <p className='text-muted-foreground mb-2 px-2 text-xs font-medium tracking-wide uppercase'>
         {t('apiDocs.nav.protocols', { defaultValue: 'Protocols' })}
       </p>
-      <ul className='space-y-0.5'>
+      <ul className='flex flex-wrap gap-1 lg:flex-col'>
         {API_PROTOCOLS.map((protocol) => (
           <li key={protocol.id}>
-            <a
-              aria-current={activeId === protocol.id ? 'true' : undefined}
-              className={cn(
-                'text-muted-foreground hover:bg-muted hover:text-foreground block rounded-md px-2 py-1.5 transition-colors',
-                activeId === protocol.id &&
-                  'bg-muted text-foreground font-medium'
-              )}
-              href={`#${protocol.id}`}
+            <ProtocolLink
+              to='/docs'
+              hash={protocol.id}
+              activeOptions={{
+                exact: true,
+                includeHash: true,
+                includeSearch: false,
+              }}
+              onClick={(event) => {
+                if (
+                  event.defaultPrevented ||
+                  event.metaKey ||
+                  event.ctrlKey ||
+                  event.altKey ||
+                  event.shiftKey
+                ) {
+                  return
+                }
+                document
+                  .querySelector<HTMLElement>(`#${protocol.id}`)
+                  ?.focus({ preventScroll: true })
+              }}
+              className='text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-ring aria-[current=location]:bg-muted aria-[current=location]:text-foreground block rounded-md px-2 py-1.5 focus-visible:outline-2 focus-visible:-outline-offset-2 aria-[current=location]:font-semibold'
             >
               {protocolTitle(t, protocol.id)}
-            </a>
+            </ProtocolLink>
           </li>
         ))}
       </ul>

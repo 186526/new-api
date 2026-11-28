@@ -32,6 +32,9 @@ import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { AuditLogViewer } from './components/audit-log-viewer'
+import { QuotaReconciliationDialog } from './components/quota-reconciliation-dialog'
+
+const quotaReconciliationAvailable = false
 
 export function AuditLogs() {
   const { t } = useTranslation()
@@ -91,6 +94,12 @@ export function AuditLogs() {
     <SectionPageLayout fixedContent>
       <SectionPageLayout.Title>{t('Audit Logs')}</SectionPageLayout.Title>
       <SectionPageLayout.Actions>
+        {quotaReconciliationAvailable && effectiveScope === 'all' && (
+          <QuotaReconciliationDialog
+            key={userId}
+            canConfirm={user?.role === ROLE.SUPER_ADMIN}
+          />
+        )}
         {canReadAll && !accessRevoked && (
           <Tabs
             value={scope}

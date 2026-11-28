@@ -264,8 +264,9 @@ type UserSubscription struct {
 
 	Source string `json:"source" gorm:"type:varchar(32);default:'order'"` // order/admin
 
-	LastResetTime int64 `json:"last_reset_time" gorm:"type:bigint;default:0"`
-	NextResetTime int64 `json:"next_reset_time" gorm:"type:bigint;default:0;index"`
+	LastResetTime   int64 `json:"last_reset_time" gorm:"type:bigint;default:0"`
+	NextResetTime   int64 `json:"next_reset_time" gorm:"type:bigint;default:0;index"`
+	QuotaGeneration int64 `json:"-" gorm:"type:bigint;not null;default:0"`
 
 	UpgradeGroup  string `json:"upgrade_group" gorm:"type:varchar(64);default:''"`
 	PrevUserGroup string `json:"prev_user_group" gorm:"type:varchar(64);default:''"`
@@ -765,7 +766,7 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 	var logMoney float64
 	var chargedQuota int
 	var upgradeGroup string
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err := nonRequestQuotaTransaction(func(tx *gorm.DB) error {
 		plan, err := getSubscriptionPlanByIdTx(tx, planId)
 		if err != nil {
 			return err
@@ -792,7 +793,7 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 		if requiredQuota > 0 && user.Quota < requiredQuota {
 			return common.NewMessage("Insufficient balance")
 		}
-		if requiredQuota > 0 {
+		if requiredQuota > 0 && !SQLQuotaLedgerWriterEnabled() {
 			if err := tx.Model(&User{}).Where("id = ?", userId).
 				Update("quota", gorm.Expr("quota - ?", requiredQuota)).Error; err != nil {
 				return err
@@ -822,6 +823,13 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 			return err
 		}
 
+		if SQLQuotaLedgerWriterEnabled() {
+			receipt := quotaCreditReceipt("subscription_balance", order.Id, userId, requiredQuota)
+			receipt.Mode = "subtract"
+			if err := receipt.applyOnce(tx, user, nil, ErrWalletQuotaLimitExceeded); err != nil {
+				return err
+			}
+		}
 		logPlanTitle = plan.Title
 		logMoney = plan.PriceAmount
 		chargedQuota = requiredQuota
@@ -834,7 +842,7 @@ func PurchaseSubscriptionWithBalance(userId int, planId int) error {
 		return err
 	}
 
-	if chargedQuota > 0 {
+	if chargedQuota > 0 && !SQLQuotaLedgerWriterEnabled() {
 		// The transaction already wrote the row, so this delta must move the
 		// ledger without being rebuilt from that row: the row holds it.
 		if err := syncRowCommittedUserQuota(userId, -int64(chargedQuota)); err != nil {
@@ -1021,7 +1029,9 @@ func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *Subscript
 	if tx == nil || sub == nil || plan == nil {
 		return errors.New("invalid reset args")
 	}
-	sub.AmountUsed = 0
+	if err := sub.resetQuotaUsage(); err != nil {
+		return err
+	}
 	if advanceResetTime {
 		nextReset := calcNextResetTime(time.Unix(now, 0), plan, sub.EndTime)
 		sub.NextResetTime = nextReset
@@ -1296,7 +1306,9 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		}
 		return nil
 	}
-	sub.AmountUsed = 0
+	if err := sub.resetQuotaUsage(); err != nil {
+		return err
+	}
 	sub.LastResetTime = base.Unix()
 	sub.NextResetTime = next
 	return tx.Save(sub).Error
@@ -1424,7 +1436,7 @@ func RefundSubscriptionPreConsume(requestId string) error {
 			record.Status = "refunded"
 			return tx.Save(&record).Error
 		}
-		if err := PostConsumeUserSubscriptionDelta(record.UserSubscriptionId, -record.PreConsumed); err != nil {
+		if err := postConsumeUserSubscriptionDeltaTx(tx, record.UserSubscriptionId, -record.PreConsumed); err != nil {
 			return err
 		}
 		record.Status = "refunded"
@@ -1523,25 +1535,29 @@ func PostConsumeUserSubscriptionDelta(userSubscriptionId int, delta int64) error
 		return nil
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).
-			First(&sub).Error; err != nil {
-			return err
-		}
-		newUsed := sub.AmountUsed + delta
-		if newUsed < 0 {
-			// 退还超过已用量说明账目已经失配，封顶到 0 并留日志，避免静默丢失退款
-			common.SysLog(common.LogText(
-				"subscription refund exceeds used amount, clamped to zero: subscription=%d used=%d delta=%d",
-				userSubscriptionId, sub.AmountUsed, delta,
-			))
-			newUsed = 0
-		}
-		if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
-			return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
-		}
-		sub.AmountUsed = newUsed
-		return tx.Save(&sub).Error
+		return postConsumeUserSubscriptionDeltaTx(tx, userSubscriptionId, delta)
 	})
+}
+
+func postConsumeUserSubscriptionDeltaTx(tx *gorm.DB, userSubscriptionId int, delta int64) error {
+	var sub UserSubscription
+	if err := lockForUpdate(tx).
+		Where("id = ?", userSubscriptionId).
+		First(&sub).Error; err != nil {
+		return err
+	}
+	newUsed := sub.AmountUsed + delta
+	if newUsed < 0 {
+		// 退还超过已用量说明账目已经失配，封顶到 0 并留日志，避免静默丢失退款
+		common.SysLog(common.LogText(
+			"subscription refund exceeds used amount, clamped to zero: subscription=%d used=%d delta=%d",
+			userSubscriptionId, sub.AmountUsed, delta,
+		))
+		newUsed = 0
+	}
+	if sub.AmountTotal > 0 && newUsed > sub.AmountTotal {
+		return fmt.Errorf("subscription used exceeds total, used=%d total=%d", newUsed, sub.AmountTotal)
+	}
+	sub.AmountUsed = newUsed
+	return tx.Save(&sub).Error
 }

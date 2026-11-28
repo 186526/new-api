@@ -52,8 +52,18 @@ func PanicRecover() gin.HandlerFunc {
 			if recovered == nil {
 				return
 			}
-			common.SysLog(common.LogText("panic detected: %v", recovered))
-			common.SysLog(common.LogText("panic request method=%s target=%q client_ip=%s", c.Request.Method, redactRequestTarget(c.Request), c.ClientIP()))
+			target := redactRequestTarget(c.Request)
+			protectedPath, protected := c.Get(requestRedactionLogPath)
+			if protected {
+				target, _ = protectedPath.(string)
+			} else {
+				common.SysLog(common.LogText("panic detected: %v", recovered))
+			}
+			common.SysLog(common.LogText("panic request method=%s target=%q client_ip=%s", c.Request.Method, target, c.ClientIP()))
+			if protected {
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "Internal request processing error."}})
+				return
+			}
 			common.SysLog(common.LogText("stacktrace from panic: %s", string(debug.Stack())))
 			if brokenConnection(recovered) {
 				// The client is gone, so there is no answer to write; gin

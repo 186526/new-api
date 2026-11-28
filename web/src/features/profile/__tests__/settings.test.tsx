@@ -60,7 +60,8 @@ afterEach(() => vi.restoreAllMocks())
 
 /** The body a PUT sends over the wire: undefined fields are left out. */
 function sentBody(put: { mock: { calls: unknown[][] } }): unknown {
-  return JSON.parse(JSON.stringify(put.mock.calls[0][1]))
+  const serializedBody = JSON.stringify(put.mock.calls[0][1])
+  return JSON.parse(serializedBody)
 }
 
 describe('user settings saves across profile and security', () => {

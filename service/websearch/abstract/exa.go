@@ -81,6 +81,9 @@ func (exaParser) ParseSearch(body []byte) ([]Result, error) {
 }
 
 func (exaParser) ParseFetch(body []byte) (Page, error) {
+	if len(body) == 0 {
+		return Page{}, ErrEmptyContent
+	}
 	var payload exaFetchBody
 	if err := common.Unmarshal(body, &payload); err != nil {
 		return Page{}, fmt.Errorf("websearch: decode exa fetch body: %w", err)

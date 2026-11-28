@@ -64,6 +64,36 @@ export type PerfModelSummary = {
   request_count?: number
 }
 
+export type RequestObservations = {
+  tool_requests: number
+  tool_cache_hits: number
+  refund_requested: number
+  refund_completed: number
+  refund_failed?: number
+  images_compressed: number
+  image_bytes_saved: number
+  images_preprocessed?: number
+  image_preprocessing_runs?: number
+  image_count_samples?: number
+  image_savings_samples?: number
+  image_savings_unknown?: number
+  reasoning_fields_present?: number
+  reasoning_outbound_unknown?: number
+  reasoning_observed?: number
+  redacted_requests: number
+  redaction_matches: number
+  automatic_reasoning: number
+}
+
+export type RequestObservationDistributionEntry = {
+  kind: string
+  name: string
+  variant: string
+  outcome: string
+  count: number
+  cache_hits?: number
+}
+
 export type PerfSummaryAllData = {
   success: boolean
   message?: string
@@ -71,6 +101,8 @@ export type PerfSummaryAllData = {
     summary?: PerformanceSummary | null
     window_start?: number
     window_end?: number
+    request_observations?: RequestObservations
+    request_observation_distribution?: RequestObservationDistributionEntry[]
     models: PerfModelSummary[]
     recent_success_series?: Record<string, SuccessRatePoint[]>
   }

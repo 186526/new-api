@@ -98,11 +98,34 @@ describe('ProtocolSection', () => {
     )
 
     const [firstPython] = screen.getAllByRole('tab', { name: 'Python' })
-    await user.click(firstPython)
+    firstPython.focus()
+    await user.keyboard('{Enter}')
 
+    expect(firstPython).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel', { name: 'Python' })).toHaveTextContent(
+      'from openai import OpenAI'
+    )
+  })
+
+  it('lets a long endpoint path wrap without losing its table row header', () => {
+    const model = `gemini-${'long-'.repeat(16)}model`
+    render(
+      <ProtocolSection
+        baseUrl='https://gateway.example.com'
+        model={model}
+        protocol={protocol('gemini')}
+        supportedEndpoint={{}}
+      />
+    )
+
+    expect(screen.getByRole('table', { name: /gemini/i })).toHaveClass(
+      'table-fixed'
+    )
     expect(
-      await screen.findByText(/from openai import OpenAI/)
-    ).toBeInTheDocument()
+      screen.getByRole('rowheader', {
+        name: `/v1beta/models/${model}:generateContent`,
+      })
+    ).toHaveClass('whitespace-normal', 'wrap-anywhere')
   })
 
   it('prefers the path the backend reports over the documented one', () => {

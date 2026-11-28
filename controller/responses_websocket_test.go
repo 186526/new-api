@@ -88,7 +88,7 @@ func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 		setting.ModelRequestRateLimitMutex.Unlock()
 		require.NoError(t, sqlDB.Close())
 	})
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.QuotaRefundReceipt{}))
 	// The shared in-memory limiter outlives each database fixture. Give every
 	// user a separate quota bucket, including when the tests run with -count.
 	user := &model.User{Id: 5062000 + int(responsesWSTestUserSequence.Add(1)), Username: "responses-ws-user", Status: common.UserStatusEnabled, Group: "default", Quota: 1000, AuthVersion: 1}
@@ -200,6 +200,13 @@ func TestResponsesWSRequestRunnerRejectsRevokedCredentials(t *testing.T) {
 		}},
 		{name: "exhausted token", status: http.StatusUnauthorized, update: func(t *testing.T, _ *model.User, token *model.Token) {
 			require.NoError(t, model.DB.Model(token).Update("remain_quota", 0).Error)
+		}},
+		{name: "redaction with response restoration enabled after connection", status: http.StatusForbidden, update: func(t *testing.T, _ *model.User, token *model.Token) {
+			require.NoError(t, token.StoreRedactionConfig([]byte(`{"strategy":"typed_placeholder","builtin_rules":["email"],"scopes":{"user_messages":true},"restore_pii_in_response":true}`)))
+			require.NoError(t, model.DB.Model(token).Updates(map[string]any{
+				"redaction_enabled": true,
+				"redaction_config":  token.RedactionConfig,
+			}).Error)
 		}},
 		{name: "disabled user", status: http.StatusForbidden, update: func(t *testing.T, user *model.User, _ *model.Token) {
 			require.NoError(t, model.DB.Model(user).Update("status", common.UserStatusDisabled).Error)
@@ -525,6 +532,188 @@ func assertResponsesWSAccounting(t *testing.T, fixture *responsesWSBillingTest, 
 	assert.Equal(t, charged, fixture.token.UsedQuota)
 	assert.Equal(t, 100000-charged, fixture.user.Quota)
 	assert.Equal(t, charged, fixture.user.UsedQuota)
+}
+
+func TestResponsesWebSocketRedactsEachCreateBeforeUpstream(t *testing.T) {
+	received := make(chan string, 2)
+	fixture := newResponsesWSBillingTest(t, `tier("base", 100)`, func(upstream *websocket.Conn, _ *http.Request) {
+		for index := 0; index < 2; index++ {
+			_, body, err := upstream.ReadMessage()
+			if err != nil {
+				return
+			}
+			received <- string(body)
+			terminal := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp_%d","usage":{"input_tokens":1,"output_tokens":1}}}`, index)
+			if err := upstream.WriteMessage(websocket.TextMessage, []byte(terminal)); err != nil {
+				return
+			}
+		}
+	})
+	require.NoError(t, model.DB.Model(fixture.token).Update("redaction_enabled", true).Error)
+	client := fixture.client
+	for _, payload := range []string{
+		`{"type":"response.create","model":"ws-billing","input":"Contact first@example.test","stream_id":"flat"}`,
+		`{"type":"response.create","response":{"model":"ws-billing","input":"Contact next@example.test","stream_id":"wrapped"}}`,
+	} {
+		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(payload)))
+		require.Equal(t, "response.completed", readResponsesWSTestEvent(t, client)["type"])
+		select {
+		case observed := <-received:
+			assert.Contains(t, observed, "Contact ")
+			assert.NotContains(t, observed, "@example.test")
+		case <-time.After(3 * time.Second):
+			t.Fatal("upstream did not receive the request")
+		}
+	}
+}
+
+func TestResponsesWebSocketDoesNotForwardProtectedCancel(t *testing.T) {
+	finish := make(chan struct{})
+	forwarded := make(chan string, 1)
+	fixture := newResponsesWSBillingTest(t, `tier("base", 100)`, func(upstream *websocket.Conn, _ *http.Request) {
+		if _, _, err := upstream.ReadMessage(); err != nil {
+			return
+		}
+		if err := upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_active"}}`)); err != nil {
+			return
+		}
+		<-finish
+		if err := upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_active","usage":{"input_tokens":1,"output_tokens":1}}}`)); err != nil {
+			return
+		}
+		if _, body, err := upstream.ReadMessage(); err == nil {
+			forwarded <- string(body)
+		}
+	})
+	defer close(finish)
+	// Enable protection after the handshake; each create must use the latest policy.
+	require.NoError(t, model.DB.Model(fixture.token).Update("redaction_enabled", true).Error)
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hello"}`)))
+	require.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","event_id":"cancel","response_id":"resp_active","extra":"private@example.test"}`)))
+	refusal := readResponsesWSTestEvent(t, fixture.client)
+	require.Equal(t, "error", refusal["type"])
+	require.Equal(t, "cancel", refusal["event_id"])
+	require.Equal(t, float64(http.StatusBadRequest), refusal["status"])
+	finish <- struct{}{}
+	require.Equal(t, "response.completed", readResponsesWSTestEvent(t, fixture.client)["type"])
+	fixture.closeAndWait(t)
+	select {
+	case <-fixture.upstreamDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream connection did not close")
+	}
+	assert.Empty(t, forwarded)
+}
+
+func TestResponsesWebSocketProtectsIdentifiersAndCorrelatesSafeCancel(t *testing.T) {
+	fixture := newResponsesWSBillingTest(t, `tier("base", 100)`, func(upstream *websocket.Conn, _ *http.Request) {
+		_, create, err := upstream.ReadMessage()
+		var fields map[string]any
+		if !assert.NoError(t, err) || !assert.NoError(t, common.Unmarshal(create, &fields)) ||
+			!assert.Equal(t, "response.create", fields["type"]) || !assert.Equal(t, "stream_safe", fields["stream_id"]) ||
+			!assert.NotContains(t, string(create), "TEST_PRIVATE_") {
+			return
+		}
+		if !assert.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","stream_id":"stream_safe","response":{"id":"resp_active"}}`))) {
+			return
+		}
+		_, control, err := upstream.ReadMessage()
+		if !assert.NoError(t, err) || !assert.JSONEq(t, `{"type":"response.cancel","event_id":"cancel_safe","stream_id":"stream_safe","response_id":"resp_active"}`, string(control)) {
+			return
+		}
+		for _, event := range []string{
+			`{"type":"error","event_id":"cancel_safe","status":400,"error":{"type":"invalid_request_error","code":"invalid_input","message":"Cancel rejected"}}`,
+			`{"type":"response.completed","stream_id":"stream_safe","response":{"id":"resp_active","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		} {
+			if !assert.NoError(t, upstream.WriteMessage(websocket.TextMessage, []byte(event))) {
+				return
+			}
+		}
+		_, _, _ = upstream.ReadMessage()
+	})
+	const policy = `{"strategy":"typed_placeholder","scopes":{"user_messages":true},"custom_rules":[{"id":"fixture","label":"FIXTURE","pattern":"TEST_PRIVATE_[a-z]+"}]}`
+	require.NoError(t, fixture.token.StoreRedactionConfig([]byte(policy)))
+	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{
+		"redaction_enabled": true,
+		"redaction_config":  fixture.token.RedactionConfig,
+	}).Error)
+	client := fixture.client
+	for _, payload := range []string{
+		`{"type":"response.create","model":"ws-billing","input":"hello","stream_id":"TEST_PRIVATE_stream"}`,
+		`{"type":"response.create","model":"ws-billing","input":"hello","stream_id":"stream_safe","previous_response_id":"TEST_PRIVATE_previous"}`,
+	} {
+		require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(payload)))
+		refusal := readResponsesWSTestEvent(t, client)
+		require.Equal(t, "error", refusal["type"])
+		require.Equal(t, float64(http.StatusBadRequest), refusal["status"])
+	}
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hello","stream_id":"stream_safe"}`)))
+	require.Equal(t, "response.created", readResponsesWSTestEvent(t, client)["type"])
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","event_id":"TEST_PRIVATE_cancel","stream_id":"stream_safe","response_id":"resp_active"}`)))
+	refusal := readResponsesWSTestEvent(t, client)
+	require.Equal(t, "error", refusal["type"])
+	require.Equal(t, "TEST_PRIVATE_cancel", refusal["event_id"])
+	require.Equal(t, float64(http.StatusBadRequest), refusal["status"])
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.cancel","event_id":"cancel_safe","stream_id":"stream_safe","response_id":"resp_active"}`)))
+	cancelError := readResponsesWSTestEvent(t, client)
+	require.Equal(t, "error", cancelError["type"])
+	require.Equal(t, "cancel_safe", cancelError["event_id"])
+	require.Equal(t, "response.completed", readResponsesWSTestEvent(t, client)["type"])
+	fixture.closeAndWait(t)
+}
+
+func TestResponsesWebSocketRejectsProtectedRestorationBeforeUpstream(t *testing.T) {
+	var upstreamCreates atomic.Int32
+	fixture := newResponsesWSBillingTest(t, `tier("base", 100)`, func(upstream *websocket.Conn, _ *http.Request) {
+		for {
+			_, _, err := upstream.ReadMessage()
+			if err != nil {
+				return
+			}
+			upstreamCreates.Add(1)
+			if err := upstream.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_first","usage":{"input_tokens":1,"output_tokens":1}}}`)); err != nil {
+				return
+			}
+		}
+	})
+	client := fixture.client
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"unprotected first request"}`)))
+	require.Equal(t, "response.completed", readResponsesWSTestEvent(t, client)["type"])
+	require.EqualValues(t, 1, upstreamCreates.Load())
+
+	const restoreConfig = `{"strategy":"typed_placeholder","builtin_rules":["email"],"scopes":{"user_messages":true},"restore_pii_in_response":true}`
+	require.NoError(t, fixture.token.StoreRedactionConfig([]byte(restoreConfig)))
+	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{
+		"redaction_enabled": true,
+		"redaction_config":  fixture.token.RedactionConfig,
+	}).Error)
+	url := "ws" + strings.TrimPrefix(fixture.gatewayURL, "http") + "/v1/responses"
+	connection, response, err := websocket.DefaultDialer.Dial(url, http.Header{"Authorization": []string{"Bearer sk-" + fixture.token.Key}})
+	if connection != nil {
+		_ = connection.Close()
+	}
+	require.ErrorIs(t, err, websocket.ErrBadHandshake)
+	require.NotNil(t, response)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusForbidden, response.StatusCode)
+
+	require.NoError(t, client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","event_id":"protected-turn","model":"ws-billing","input":"ws-private@example.test"}`)))
+	refusal := readResponsesWSTestEvent(t, client)
+	require.Equal(t, "error", refusal["type"])
+	require.Equal(t, float64(http.StatusForbidden), refusal["status"])
+	require.Equal(t, "protected-turn", refusal["event_id"])
+	require.Equal(t, "request_redaction_failed", refusal["error"].(map[string]any)["code"])
+	_, _, err = client.ReadMessage()
+	require.True(t, websocket.IsCloseError(err, websocket.ClosePolicyViolation), "unexpected close: %v", err)
+	fixture.closeAndWait(t)
+	select {
+	case <-fixture.upstreamDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upstream connection did not close")
+	}
+	require.EqualValues(t, 1, upstreamCreates.Load())
 }
 
 func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {

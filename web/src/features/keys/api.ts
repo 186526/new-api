@@ -43,12 +43,13 @@ export async function getApiKeys(
 
 // Search API keys by keyword or token (with pagination)
 export async function searchApiKeys(
-  params: SearchApiKeysParams
+  params: SearchApiKeysParams & { redactionEnabled?: boolean }
 ): Promise<GetApiKeysResponse> {
-  const { keyword = '', token = '', p, size } = params
+  const { keyword = '', token = '', p, size, redactionEnabled } = params
   const queryParams = new URLSearchParams()
   if (keyword) queryParams.set('keyword', keyword)
   if (token) queryParams.set('token', token)
+  if (redactionEnabled !== undefined) queryParams.set('redaction_enabled', String(redactionEnabled))
   if (p != null) queryParams.set('p', String(p))
   if (size != null) queryParams.set('size', String(size))
   const res = await api.get(`/api/token/search?${queryParams.toString()}`)
@@ -69,20 +70,31 @@ export async function getTokenAutoGroups(): Promise<
   return res.data
 }
 
-// Create a new API key
 export async function createApiKey(
-  data: ApiKeyFormData
-): Promise<ApiResponse<ApiKey>> {
-  const res = await api.post('/api/token/', data)
+  data: ApiKeyFormData & { count: number }
+): Promise<ApiResponse<{ created: number; redaction_enabled: boolean }>> {
+  const res = await api.post('/api/token/', data, {
+    singleUseAuthorization: true,
+    skipErrorHandler: true,
+  })
   return res.data
 }
 
 // Update an existing API key
 export async function updateApiKey(
-  data: ApiKeyFormData & { id: number }
+  data: ApiKeyFormData & { id: number; redaction_revision?: number }
 ): Promise<ApiResponse<ApiKey>> {
   const res = await api.put('/api/token/', data)
   return res.data
+}
+
+export async function batchUpdateApiKeyRedaction(items: Array<{
+  id: number
+  redaction_revision: number
+  redaction_enabled: boolean
+}>): Promise<ApiResponse<{ items: Array<ApiResponse & { id: number; code?: string }>; updated: number }>> {
+  const response = await api.put('/api/token/redaction/batch', { items })
+  return response.data
 }
 
 // Delete a single API key

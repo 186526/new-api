@@ -9,7 +9,9 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { policyLabel } from './policy-label'
 
-export function RelatedPolicyLink(props: { section: 'routing' | 'health' }) {
+export function RelatedPolicyLink(props: {
+  section: 'routing' | 'health' | 'image-compression'
+}) {
   const { t } = useTranslation()
   const isRoot = useAuthStore(
     (state) => state.auth.user?.role === ROLE.SUPER_ADMIN
@@ -21,7 +23,9 @@ export function RelatedPolicyLink(props: { section: 'routing' | 'health' }) {
       to='/system-settings/request-policies/$section'
       params={{ section: props.section }}
     >
-      {t('Request policies')}
+      {props.section === 'image-compression'
+        ? t('Image compression')
+        : t('Request policies')}
     </Link>
   )
 }

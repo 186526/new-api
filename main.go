@@ -168,9 +168,7 @@ func main() {
 		service.StartSubscriptionQuotaResetTask()
 	}
 
-	// Report this process as a system instance so the System Info page can show
-	// all currently alive nodes in multi-instance deployments.
-	service.StartSystemInstanceReporter()
+	stopSystemInstanceReporter := service.StartSystemInstanceReporter()
 
 	// Wire task polling adaptor factory (breaks service -> relay import cycle).
 	// Must run before the system task runner starts: the async_task_poll handler
@@ -195,6 +193,11 @@ func main() {
 		common.BatchUpdateEnabled = true
 		common.SysLog(common.LogText("batch update enabled with interval %ss", strconv.Itoa(common.BatchUpdateInterval)))
 		model.InitBatchUpdater()
+	}
+	if model.InitializeQuotaRefundRecovery() && common.RunsAdmin() {
+		refundCtx, cancelRefundRecovery := context.WithCancel(context.Background())
+		defer cancelRefundRecovery()
+		go service.RunQuotaRefundRecovery(refundCtx)
 	}
 
 	host := os.Getenv("HOST")
@@ -245,6 +248,9 @@ func main() {
 		Handler: server,
 	}
 
+	stopRedactionProbe := controller.StartRedactionCapabilityProbe()
+	defer stopRedactionProbe()
+
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			common.FatalLog(common.LogText("failed to start HTTP server: %s", err.Error()))
@@ -263,6 +269,7 @@ func main() {
 	// The readiness probe fails from here on, so the pod leaves the Service
 	// endpoints before the listener closes and no new request is routed to it.
 	draining.Begin()
+	stopRedactionProbe()
 	time.Sleep(time.Duration(common.GetEnvOrDefault("SHUTDOWN_DRAIN_DELAY_SECONDS", 10)) * time.Second)
 
 	// SSE streams may run for minutes; give them time to finish before forced exit
@@ -296,6 +303,7 @@ func main() {
 	if common.BatchUpdateEnabled {
 		model.FlushBatchUpdates()
 	}
+	stopSystemInstanceReporter()
 	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer metricsCancel()
 	appmetrics.Shutdown(metricsCtx, metricsServer)

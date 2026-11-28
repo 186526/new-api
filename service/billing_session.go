@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -37,16 +38,37 @@ type BillingSession struct {
 	settled          bool   // Settle 全部完成（资金 + 令牌）
 	refunded         bool   // Refund 已调用
 	lang             string // 请求声明的语言，为空表示未声明
+	sqlDebit         *model.SQLQuotaDebit
+	sqlSubscription  *model.SQLSubscriptionDebit
 	mu               sync.Mutex
 }
 
-// Settle 根据实际消耗额度进行结算。
-// 资金来源和令牌额度分两步提交：若资金来源已提交但令牌调整失败，
-// 会标记 fundingSettled 防止 Refund 对已提交的资金来源执行退款。
 func (s *BillingSession) Settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
+		return nil
+	}
+	if s.refunded {
+		return model.ErrQuotaOperationDecided
+	}
+	if s.sqlSubscription != nil {
+		applied, err := s.sqlSubscription.Settle(actualQuota)
+		if err != nil {
+			return err
+		}
+		s.relayInfo.SubscriptionPostDelta += int64(applied)
+		s.settled = true
+		if expected := actualQuota - s.preConsumedQuota; expected > applied {
+			common.SysLog(common.LogText("subscription settlement left %d uncollected (operation=%s, request=%s)", expected-applied, s.sqlSubscription.ID, s.relayInfo.RequestId))
+		}
+		return nil
+	}
+	if s.sqlDebit != nil {
+		if err := s.sqlDebit.Settle(actualQuota); err != nil {
+			return err
+		}
+		s.settled = true
 		return nil
 	}
 	delta := actualQuota - s.preConsumedQuota
@@ -90,8 +112,42 @@ func (s *BillingSession) Refund(c *gin.Context) {
 		s.mu.Unlock()
 		return
 	}
-	s.refunded = true
+	if tool := s.relayInfo.ToolExecution; tool != nil {
+		tool.Refund = model.RefundRequested
+	}
+	var debit interface {
+		DecideRefund() error
+		ApplyRefund(context.Context) (string, error)
+	}
+	if s.sqlSubscription != nil {
+		debit = *s.sqlSubscription
+	} else if s.sqlDebit != nil {
+		debit = *s.sqlDebit
+	}
+	if debit != nil {
+		err := debit.DecideRefund()
+		if err == nil {
+			s.refunded = true
+		}
+		s.mu.Unlock()
+		persistOutcome := toolRefundLog(c, s.relayInfo)
+		if err != nil {
+			common.SysError("failed to persist quota refund decision: " + err.Error())
+			return
+		}
+		applySQLRefund(debit.ApplyRefund, persistOutcome)
+		return
+	}
+	receipts, err := s.registerRefunds(c)
+	if err == nil {
+		s.refunded = true
+	}
 	s.mu.Unlock()
+	persistOutcome := toolRefundLog(c, s.relayInfo)
+	if err != nil {
+		common.SysError("failed to register quota refund receipts: " + err.Error())
+		return
+	}
 
 	logger.LogInfo(c, common.LogText("user %d request failed, refunding the pre-consumed quota (token_quota=%s, funding=%s)",
 		s.relayInfo.UserId,
@@ -112,20 +168,31 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	// 否则借记被 flush 写入、退款却还排在队列里，失败请求会真实扣费。
 	model.GoDetachedQuotaWork(func() {
 		// 1) 退还资金来源
-		if err := funding.Refund(); err != nil {
+		status, err := refundFunding(funding, receipts[model.RefundPartWallet])
+		observeRefundFailure(receipts[model.RefundPartWallet], status)
+		observeRefundFailure(receipts[model.RefundPartSubscription], status)
+		if err != nil {
 			common.SysLog(common.LogText("error refunding billing source: %s", err.Error()))
 		}
 		if extraReserved > 0 && funding.Source() == BillingSourceSubscription && subscriptionId > 0 {
-			if err := model.PostConsumeUserSubscriptionDelta(subscriptionId, -int64(extraReserved)); err != nil {
+			err := model.PostConsumeUserSubscriptionDelta(subscriptionId, -int64(extraReserved))
+			extraStatus := model.QuotaRefundResult(err, true)
+			observeRefundFailure(receipts[model.RefundPartSubscriptionExtra], extraStatus)
+			status = mergeRefundResult(status, extraStatus)
+			if err != nil {
 				common.SysLog(common.LogText("error refunding subscription extra reserved quota: %s", err.Error()))
 			}
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
-			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
+			tokenStatus, err := refundToken(receipts[model.RefundPartToken], tokenId, tokenKey, tokenConsumed)
+			observeRefundFailure(receipts[model.RefundPartToken], tokenStatus)
+			status = mergeRefundResult(status, tokenStatus)
+			if err != nil {
 				common.SysLog(common.LogText("error refunding token quota: %s", err.Error()))
 			}
 		}
+		persistOutcome(status)
 	})
 }
 
@@ -142,6 +209,9 @@ func (s *BillingSession) needsRefundLocked() bool {
 		return false
 	}
 	if s.tokenConsumed > 0 {
+		return true
+	}
+	if wallet, ok := s.funding.(*WalletFunding); ok && wallet.consumed > 0 {
 		return true
 	}
 	// 订阅可能在 tokenConsumed=0 时仍预扣了额度
@@ -182,16 +252,28 @@ func (s *BillingSession) reserve(targetQuota int, requireAvailableQuota bool) er
 		return nil
 	}
 
-	if err := s.reserveFunding(delta, requireAvailableQuota); err != nil {
-		return err
-	}
-	if err := s.reserveToken(delta); err != nil {
-		s.rollbackFundingReserve(delta)
-		return err
+	if sub, ok := s.funding.(*SubscriptionFunding); ok && s.sqlSubscription != nil {
+		if err := s.reserveSQLSubscription(sub, targetQuota); err != nil {
+			return err
+		}
+	} else if wallet, ok := s.funding.(*WalletFunding); ok && (s.sqlDebit != nil || s.preConsumedQuota == 0 && model.SQLQuotaLedgerWriterEnabled()) {
+		if err := s.reserveSQLWallet(wallet, targetQuota, requireAvailableQuota); err != nil {
+			return err
+		}
+	} else {
+		if err := s.reserveFunding(delta, requireAvailableQuota); err != nil {
+			return err
+		}
+		if err := s.reserveToken(delta); err != nil {
+			s.rollbackFundingReserve(delta)
+			return err
+		}
+		if !s.relayInfo.IsPlayground {
+			s.tokenConsumed += delta
+		}
 	}
 
 	s.preConsumedQuota += delta
-	s.tokenConsumed += delta
 	s.extraReserved += delta
 	if requireAvailableQuota {
 		s.trusted = false
@@ -218,8 +300,26 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 		logger.LogInfo(c, common.LogText("user %d needs pre-consume %s (funding=%s)", s.relayInfo.UserId, logger.FormatQuota(effectiveQuota), s.funding.Source()))
 	}
 
+	if wallet, ok := s.funding.(*WalletFunding); ok && effectiveQuota > 0 && model.SQLQuotaLedgerWriterEnabled() {
+		if err := s.reserveSQLWallet(wallet, effectiveQuota, true); err != nil {
+			return err
+		}
+		s.preConsumedQuota = effectiveQuota
+		s.syncRelayInfo()
+		return nil
+	}
+
+	if sub, ok := s.funding.(*SubscriptionFunding); ok && effectiveQuota > 0 && !s.relayInfo.ForcePreConsume && model.SQLQuotaLedgerWriterEnabled() {
+		if err := s.reserveSQLSubscription(sub, effectiveQuota); err != nil {
+			return err
+		}
+		s.preConsumedQuota = effectiveQuota
+		s.syncRelayInfo()
+		return nil
+	}
+
 	// ---- 1) 预扣令牌额度 ----
-	if effectiveQuota > 0 {
+	if effectiveQuota > 0 && !s.relayInfo.IsPlayground {
 		if err := PreConsumeTokenQuota(s.relayInfo, effectiveQuota); err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodePreConsumeTokenQuotaFailed, http.StatusForbidden, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		}

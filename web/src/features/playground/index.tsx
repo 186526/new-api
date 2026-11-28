@@ -16,8 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { getRouteApi, useNavigate } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
+
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useAuthStore } from '@/stores/auth-store'
+
 import { PlaygroundChat } from './components/chat/playground-chat'
 import { PlaygroundInput } from './components/input/playground-input'
+import { PlaygroundTools } from './components/playground-tools'
 import {
   useChatHandler,
   usePlaygroundConversation,
@@ -25,7 +32,53 @@ import {
   usePlaygroundState,
 } from './hooks'
 
+const playgroundRoute = getRouteApi('/_authenticated/playground/')
+
 export function Playground() {
+  const { t } = useTranslation()
+  const navigate = useNavigate()
+  const userId = useAuthStore((state) => state.auth.user?.id)
+  const options = playgroundRoute.useSearch()
+  const endpoint = options.endpoint ?? 'moonshot/search'
+  const group = options.group ?? ''
+
+  return (
+    <Tabs
+      value={options.mode ?? 'chat'}
+      className='size-full min-h-0'
+      onValueChange={(mode) => {
+        void navigate({
+          to: '/playground',
+          search: { ...options, mode: mode === 'tools' ? 'tools' : undefined },
+        })
+      }}
+    >
+      <TabsList
+        aria-label={t('Playground mode')}
+        className='mx-auto mt-3 shrink-0'
+      >
+        <TabsTrigger value='chat'>{t('Chat')}</TabsTrigger>
+        <TabsTrigger value='tools'>{t('Tools')}</TabsTrigger>
+      </TabsList>
+      <TabsContent value='chat' keepMounted className='min-h-0'>
+        <ChatPlayground />
+      </TabsContent>
+      <TabsContent value='tools' className='min-h-0 overflow-y-auto'>
+        {userId != null && (
+          <PlaygroundTools
+            key={JSON.stringify([userId, endpoint, group, options.model])}
+            userId={userId}
+            endpoint={endpoint}
+            group={group}
+            model={options.model}
+          />
+        )}
+      </TabsContent>
+    </Tabs>
+  )
+}
+
+function ChatPlayground() {
   const {
     config,
     parameterEnabled,

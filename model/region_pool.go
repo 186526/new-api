@@ -123,22 +123,24 @@ redis.call('SADD', KEYS[2], ARGV[2])
 redis.call('SADD', KEYS[3], ARGV[2])
 return 1`
 
-// regionReportScript snapshots the unreported spend under a fresh sequence
-// number. The sequence lives in its own key so that rebuilding the balance
-// hash cannot rewind it.
 const regionReportScript = `
+if redis.call('HEXISTS', KEYS[3], ARGV[1]) == 1 then
+  return 0
+end
 if redis.call('HEXISTS', KEYS[1], 'TotalSpent') == 0 then
-  return {-1, 0, 0}
+  return 0
 end
 local total = tonumber(redis.call('HGET', KEYS[1], 'TotalSpent'))
 local reported = tonumber(redis.call('HGET', KEYS[1], 'LastReported') or '0')
 local delta = total - reported
 if delta == 0 then
-  return {0, 0, 0}
+  return 0
 end
-local seq = redis.call('INCR', KEYS[2])
+redis.call('INCR', KEYS[2])
+local seq = redis.call('GET', KEYS[2])
+redis.call('HSET', KEYS[3], ARGV[1], seq .. '|' .. string.format('%.0f', delta))
 redis.call('HSET', KEYS[1], 'LastReported', total)
-return {1, delta, seq}`
+return 1`
 
 const regionAckScript = `
 if redis.call('HEXISTS', KEYS[1], 'TotalSpent') == 0 then
@@ -362,22 +364,10 @@ type RegionReport struct {
 	Delta       int64
 }
 
-func NextRegionReport(region string, subjectType string, subjectID string) (*RegionReport, error) {
-	values, err := common.RDB.Eval(context.Background(), regionReportScript,
-		[]string{regionSubjectKey(region, subjectType, subjectID), regionSubjectSeqKey(region, subjectType, subjectID)}).Slice()
-	if err != nil {
-		return nil, err
-	}
-	if len(values) != 3 {
-		return nil, fmt.Errorf("unexpected region report reply: %v", values)
-	}
-	status, _ := values[0].(int64)
-	if status != 1 {
-		return nil, nil
-	}
-	delta, _ := values[1].(int64)
-	seq, _ := values[2].(int64)
-	return &RegionReport{Region: region, SubjectType: subjectType, SubjectID: subjectID, Seq: seq, Delta: delta}, nil
+func SnapshotRegionReport(region string, subjectType string, subjectID string) error {
+	return common.RDB.Eval(context.Background(), regionReportScript,
+		[]string{regionSubjectKey(region, subjectType, subjectID), regionSubjectSeqKey(region, subjectType, subjectID), regionPendingKey(region)},
+		regionMember(subjectType, subjectID)).Err()
 }
 
 // ackRegionReport restores the idle TTL once every delta has been reported.
@@ -592,14 +582,6 @@ func regionSubjectCentralBalance(subjectType string, subjectID string) (int, err
 	return 0, fmt.Errorf("unknown region subject type %q", subjectType)
 }
 
-// SavePendingRegionReport stores a batch whose delivery is not acknowledged
-// yet, so a restart cannot lose it.
-func SavePendingRegionReport(report *RegionReport) error {
-	value := fmt.Sprintf("%d|%d", report.Seq, report.Delta)
-	return common.RDB.HSet(context.Background(), regionPendingKey(report.Region),
-		regionMember(report.SubjectType, report.SubjectID), value).Err()
-}
-
 // PendingRegionReports lists batches still owed to the admin.
 func PendingRegionReports(region string) ([]RegionReport, error) {
 	entries, err := common.RDB.HGetAll(context.Background(), regionPendingKey(region)).Result()
@@ -628,9 +610,15 @@ func PendingRegionReports(region string) ([]RegionReport, error) {
 	return reports, nil
 }
 
-// ClearPendingRegionReport drops a batch the admin has accepted.
-func ClearPendingRegionReport(region string, subjectType string, subjectID string) error {
-	return common.RDB.HDel(context.Background(), regionPendingKey(region), regionMember(subjectType, subjectID)).Err()
+const regionPendingAckScript = `
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+  return redis.call('HDEL', KEYS[1], ARGV[1])
+end
+return 0`
+
+func AcknowledgePendingRegionReport(report RegionReport) error {
+	return common.RDB.Eval(context.Background(), regionPendingAckScript, []string{regionPendingKey(report.Region)},
+		regionMember(report.SubjectType, report.SubjectID), fmt.Sprintf("%d|%d", report.Seq, report.Delta)).Err()
 }
 
 // RegionAvailable reports the remaining lease a region holds for a subject.

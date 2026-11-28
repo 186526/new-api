@@ -19,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/redaction"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
@@ -67,6 +68,14 @@ func SetupApiRequestHeader(info *common.RelayInfo, c *gin.Context, req *http.Hea
 		// multipart/form-data
 	} else if info.RelayMode == constant.RelayModeRealtime {
 		// websocket
+	} else if info.RelayMode == constant.RelayModeSystemOne {
+		req.Set("Content-Type", "application/json")
+		req.Set("Accept", c.GetHeader("Accept"))
+		for _, name := range []string{"TypeSafe-Danger-Zone-Images", "TypeSafe-Danger-Zone-Long-Context"} {
+			if strings.EqualFold(strings.TrimSpace(c.GetHeader(name)), "true") {
+				req.Set(name, "true")
+			}
+		}
 	} else {
 		req.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 		req.Set("Accept", c.Request.Header.Get("Accept"))
@@ -214,8 +223,7 @@ func processHeaderOverride(info *common.RelayInfo, c *gin.Context) (map[string]s
 	}
 
 	headerOverrideSource := common.GetEffectiveHeaderOverride(info)
-	// Background polling has no client request from which to copy headers.
-	hasClientRequest := !info.IsChannelTest && c != nil && c.Request != nil
+	hasClientRequest := !info.IsChannelTest && c != nil && c.Request != nil && !redaction.IsProtectedRequest(c.Request.Context())
 
 	passAll := false
 	var passthroughRegex []*regexp.Regexp
@@ -498,6 +506,8 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, errors.New("resp is nil")
 	}
 	info.UpstreamHeaderTime = time.Now()
+	info.AutoReasoning.ObserveHTTPBody(req)
+	info.ImageCompression.ObserveHTTPBody(req, info.GetFinalRequestRelayFormat())
 	// The response headers are still uncommitted here, so a rejected attempt
 	// reaches the client as its real status code. Only an accepted stream
 	// starts the keepalive, and it is started before the first byte of the body

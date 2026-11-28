@@ -34,6 +34,7 @@ import { API_KEY_STATUSES } from '../constants'
 import type { ApiKey } from '../types'
 import { ApiKeyGroupCell } from './api-key-group-cell'
 import { ApiKeyQuotaCell } from './api-key-quota-cell'
+import { ApiKeyRedactionSummary } from './api-key-redaction-summary'
 import {
   ApiKeyActivityCell,
   ApiKeyTimestampCell,
@@ -107,7 +108,10 @@ export function useApiKeysColumns(now: number): ColumnDef<ApiKey>[] {
         accessorKey: 'name',
         header: t('Name'),
         cell: ({ row }) => (
-          <span className='font-medium'>{row.getValue('name')}</span>
+          <div className='flex flex-col gap-1 font-medium'>
+            {row.getValue('name')}
+            <ApiKeyRedactionSummary apiKey={row.original} />
+          </div>
         ),
         size: 180,
         meta: { mobileTitle: true },

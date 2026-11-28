@@ -115,9 +115,9 @@ export function protocolNote(t: TFunction, id: ApiProtocolId): string {
           'The client treats any non-200 answer as a failed call. /search answers JSON; /fetch answers text/markdown, not JSON.',
       })
     case 'deepseek-tools':
-      return t('apiDocs.protocol.deepseekTools.note', {
+      return t('apiDocs.protocol.deepseekTools.modelNote', {
         defaultValue:
-          'These paths take no model in the body; the routed model name is tools-search or tools-fetch.',
+          '/v1/tools/* selects tools-search or tools-fetch automatically. /v1/alpha/search requires a model your key can call for Alpha Search.',
       })
     default:
       return ''

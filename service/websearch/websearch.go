@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/service/websearch/request"
@@ -57,6 +58,7 @@ type Answer struct {
 	ContentType string
 	StatusCode  int
 	Header      http.Header
+	Provider    string
 	// Cached reports that this answer came from the cache rather than from an
 	// upstream call, so a caller can count the hit in its metrics.
 	Cached bool
@@ -68,15 +70,22 @@ var (
 	ErrEmptyContent       = abstract.ErrEmptyContent
 )
 
-// Search answers a search contract. It walks the candidates in the order the
-// abstract layer ranks them and stops at the first one whose answer it can use.
+// Search answers a search contract using the ordered requesters available for it.
 func Search(ctx context.Context, channel abstract.ChannelContext, query request.Query) (Answer, error) {
-	return answer(ctx, channel, query, true)
+	items, err := requestSearch(ctx, channel, query)
+	if err != nil {
+		return Answer{}, err
+	}
+	return answer(ctx, query, items)
 }
 
-// Fetch answers a fetch contract with the same candidate walk as Search.
+// Fetch answers a fetch contract using the ordered requesters available for it.
 func Fetch(ctx context.Context, channel abstract.ChannelContext, query request.Query) (Answer, error) {
-	return answer(ctx, channel, query, false)
+	items, err := requestFetch(ctx, channel, query)
+	if err != nil {
+		return Answer{}, err
+	}
+	return answer(ctx, query, items)
 }
 
 // Candidates exposes the ordered provider list, so a caller can log what it is
@@ -88,7 +97,7 @@ func Candidates(channel abstract.ChannelContext, contract abstract.Contract) ([]
 // LogCandidates writes the candidate order at debug level, which is the only
 // record of why one provider was tried before another.
 func LogCandidates(ctx context.Context, channel abstract.ChannelContext, contract abstract.Contract) {
-	candidates, err := abstract.Candidates(channel, contract)
+	candidates, err := abstract.CandidatesForRequest(ctx, channel, contract)
 	if err != nil {
 		logger.LogDebug(ctx, "websearch: no candidate for %s: %v", contract, err)
 		return
@@ -100,35 +109,115 @@ func LogCandidates(ctx context.Context, channel abstract.ChannelContext, contrac
 	logger.LogDebug(ctx, "websearch: candidates for %s: %v", contract, names)
 }
 
-func answer(ctx context.Context, channel abstract.ChannelContext, query request.Query, search bool) (Answer, error) {
-	candidates, err := abstract.Candidates(channel, query.Contract)
-	if err != nil {
-		return Answer{}, err
+type requesterItem struct {
+	candidate abstract.Candidate
+	channel   abstract.ChannelContext
+	query     request.Query
+	send      func(context.Context, abstract.ChannelContext, request.Query) (request.Upstream, error)
+}
+
+func requestSearch(ctx context.Context, channel abstract.ChannelContext, query request.Query) ([]requesterItem, error) {
+	if !query.Contract.IsSearch() {
+		return nil, ErrUnsupportedChannel
 	}
+	return discoverRequesters(ctx, channel, query)
+}
+
+func requestFetch(ctx context.Context, channel abstract.ChannelContext, query request.Query) ([]requesterItem, error) {
+	if query.Contract.IsSearch() {
+		return nil, ErrUnsupportedChannel
+	}
+	return discoverRequesters(ctx, channel, query)
+}
+
+func discoverRequesters(ctx context.Context, channel abstract.ChannelContext, query request.Query) ([]requesterItem, error) {
+	candidates, settings := requestCandidates(ctx, channel, query)
+
+	items := make([]requesterItem, 0, len(candidates))
+	for _, candidate := range candidates {
+		requester, err := request.For(candidate.Provider)
+		if err != nil {
+			continue
+		}
+		item := bindRequester(candidate, channel, query, settings)
+		item.send = requester.Fetch
+		if query.Contract.IsSearch() {
+			item.send = requester.Search
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return nil, ErrUnsupportedChannel
+	}
+	return items, nil
+}
+
+func bindRequester(candidate abstract.Candidate, channel abstract.ChannelContext, query request.Query, settings websearch_setting.WebSearchSetting) requesterItem {
+	providedBy := query.EndpointProvider
+	if providedBy == "" {
+		providedBy = abstract.ChannelProvider(channel.ChannelType)
+	}
+	ownsPreparedRequest := providedBy == candidate.Provider
+	switch candidate.Origin {
+	case abstract.OriginGlobalCredential:
+		channel = abstract.ChannelContext{BaseURL: settings.ExaBaseURL, Key: settings.ExaAPIKey}
+		ownsPreparedRequest = false
+	case abstract.OriginLocal:
+		fetchTTL := channel.Settings.WebSearchFetchCacheTTLSeconds
+		channel = abstract.ChannelContext{}
+		channel.Settings.WebSearchFetchCacheTTLSeconds = fetchTTL
+		ownsPreparedRequest = false
+	case abstract.OriginOperatorBinding:
+		if operation := channel.CustomOperation(query.Contract); operation != nil && candidate.Provider == websearch_setting.ProviderExa {
+			channel.Key = ""
+			query.CustomOperation = operation
+		}
+		ownsPreparedRequest = false
+	}
+	if !ownsPreparedRequest {
+		query.Endpoint = ""
+		query.EndpointProvider = ""
+		query.Prepare = nil
+		query.Model = ""
+		query.Raw = nil
+	}
+	return requesterItem{candidate: candidate, channel: channel, query: query}
+}
+
+func requestCandidates(ctx context.Context, channel abstract.ChannelContext, query request.Query) ([]abstract.Candidate, websearch_setting.WebSearchSetting) {
+	provider := query.EndpointProvider
+	if provider == "" {
+		provider = abstract.ChannelProvider(channel.ChannelType)
+	}
+	model := strings.TrimSpace(query.Model)
+	input := abstract.Qualification{
+		Builtin:        channel.ChannelID == 0 && channel.ChannelType == 0,
+		ChannelEnabled: true, AbilityEnabled: true, ChannelCredentialSelectable: true,
+		CredentialConfigured: strings.TrimSpace(channel.Key) != "",
+		Preparation: &abstract.RequestPreparation{
+			Provider: provider, EndpointConfigured: strings.TrimSpace(query.Endpoint) != "",
+			HasHeaders: query.Prepare != nil, HasBody: len(query.Raw) != 0,
+			HasMappedModel: model != "" && model != constant.ToolsSearchModel,
+		},
+	}
+	if policy, ok := abstract.RequestRoutingPolicy(ctx); ok {
+		candidates, _ := policy.Qualify(channel, query.Contract, input)
+		return candidates, policy.Settings
+	}
+	settings := websearch_setting.Get()
+	candidates, _ := abstract.QualifyWithSettings(channel, query.Contract, settings, input)
+	return candidates, settings
+}
+
+func answer(ctx context.Context, query request.Query, items []requesterItem) (Answer, error) {
 	renderer := response.For(query.Contract)
 	if renderer == nil {
 		return Answer{}, ErrUnsupportedChannel
 	}
 
 	var lastErr error
-	for _, candidate := range candidates {
-		requester, err := request.For(candidate.Provider)
-		if err != nil {
-			if request.WasSent(err) {
-				return Answer{}, err
-			}
-			lastErr = err
-			continue
-		}
-
-		candidateChannel, candidateQuery := channel, query
-		if candidate.Origin == abstract.OriginGlobalCredential {
-			candidateChannel.BaseURL = ""
-			candidateChannel.Key = ""
-			candidateQuery.Endpoint = ""
-			candidateQuery.Prepare = nil
-		}
-		upstream, err := send(ctx, requester, candidateChannel, candidateQuery, search)
+	for _, item := range items {
+		upstream, err := item.send(ctx, item.channel, item.query)
 		if err != nil {
 			// A candidate is skipped only when its request provably never
 			// reached the upstream. Once a request may have been billed, its
@@ -141,19 +230,12 @@ func answer(ctx context.Context, channel abstract.ChannelContext, query request.
 			return Answer{}, err
 		}
 
-		return render(ctx, upstream, renderer, channel, candidate, query, search)
+		return render(ctx, upstream, renderer, item.channel, item.candidate, query, query.Contract.IsSearch())
 	}
 	if lastErr == nil {
 		lastErr = ErrUnsupportedChannel
 	}
 	return Answer{}, lastErr
-}
-
-func send(ctx context.Context, requester request.Requester, channel abstract.ChannelContext, query request.Query, search bool) (request.Upstream, error) {
-	if search {
-		return requester.Search(ctx, channel, query)
-	}
-	return requester.Fetch(ctx, channel, query)
 }
 
 // render turns one upstream answer into the client's contract. A native
@@ -164,6 +246,7 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 		ContentType: renderer.ContentType(),
 		StatusCode:  upstream.StatusCode,
 		Header:      upstream.Header,
+		Provider:    candidate.Provider,
 		Cached:      upstream.Cached,
 	}
 
@@ -186,27 +269,28 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 
 	parser, err := abstract.ParserFor(upstream.Family)
 	if err != nil {
-		return Answer{}, err
+		return answer, err
 	}
 
 	if search {
 		results, err := parser.ParseSearch(upstream.Body)
 		if err != nil {
-			return Answer{}, err
+			return answer, err
 		}
 		parsed := abstract.Search{
 			Results:    results,
 			StatusCode: upstream.StatusCode,
 			Header:     upstream.Header,
 		}
-		if resolvesCitations(upstream.Family) {
-			// A rendered Antigravity answer cites pages through a redirect
-			// service, so its links are resolved before the client reads them.
+		if resolvesCitations(answer.Provider) {
 			request.ResolveSearchRedirects(ctx, channel, &parsed)
+			if len(parsed.Results) == 0 {
+				return answer, ErrEmptyResults
+			}
 		}
-		// Every result gets a snippet: the page's own lead paragraph when it can
-		// be read inside the budget, the model's own sentence otherwise.
-		fillSnippets(ctx, channel, parsed.Results)
+		if upstream.Family != hostedFamily && !(candidate.Origin == abstract.OriginOperatorBinding && channel.CustomOperation(query.Contract) != nil && candidate.Provider == websearch_setting.ProviderExa) {
+			fillSnippets(ctx, channel, parsed.Results)
+		}
 		// A page the model listed twice under two of its own URLs still reads as
 		// one hit: the second copy is dropped only when it also repeats the
 		// first one's snippet, so a site's separate pages stay listed.
@@ -219,7 +303,7 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 		}
 		body, err := renderer.RenderSearch(parsed)
 		if err != nil {
-			return Answer{}, err
+			return answer, err
 		}
 		answer.Body = body
 		return answer, nil
@@ -227,7 +311,7 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 
 	page, err := parser.ParseFetch(upstream.Body)
 	if err != nil {
-		return Answer{}, err
+		return answer, err
 	}
 	parsed := abstract.Fetch{
 		Page:       page,
@@ -236,14 +320,12 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 	}
 	body, err := renderer.RenderFetch(parsed)
 	if err != nil {
-		return Answer{}, err
+		return answer, err
 	}
 	answer.Body = body
 	return answer, nil
 }
 
-// resolvesCitations reports whether a provider cites pages through a redirect
-// service, which only Antigravity does.
-func resolvesCitations(family string) bool {
-	return family == websearch_setting.ProviderAntigravity
+func resolvesCitations(provider string) bool {
+	return provider == websearch_setting.ProviderAntigravity || provider == "gemini" || provider == "vertex"
 }

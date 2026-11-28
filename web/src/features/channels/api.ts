@@ -16,12 +16,26 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { t } from 'i18next'
+
 import { getGroups as getUserGroups } from '@/features/users/api'
 import { api, type ApiRequestConfig } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type { PriorityMove, PriorityOrder } from './lib/channel-priority-order'
+import {
+  CustomToolRequestError,
+  customToolStatusSchema,
+  customToolsSchema,
+  type CustomToolChange,
+  type CustomTools,
+  type CustomToolStatus,
+} from './lib/custom-tools'
 import type { InferenceStatus } from './lib/inference-status'
+import {
+  channelToolCatalogSchema,
+  type ChannelToolCatalog,
+} from './lib/websearch-setting'
 import type {
   AddChannelRequest,
   BatchDeleteParams,
@@ -50,6 +64,66 @@ const channelActionConfig = (
   skipBusinessError: true,
   skipErrorHandler: true,
 })
+
+export async function getChannelToolCapabilities(
+  signal: AbortSignal
+): Promise<ChannelToolCatalog> {
+  const response = await api.get<{ success: boolean; data: unknown }>(
+    '/api/channel/tool_capabilities',
+    channelActionConfig({ signal, disableDuplicate: true })
+  )
+  return channelToolCatalogSchema.parse(
+    requireServerSuccess(response.data).data
+  )
+}
+
+export async function getChannelCustomTools(
+  channelId: number,
+  signal: AbortSignal
+): Promise<CustomTools> {
+  try {
+    const { data } = await api.get<{ success: boolean; data: unknown }>(
+      `/api/channel/${channelId}/custom_tools`,
+      channelActionConfig({ signal, disableDuplicate: true })
+    )
+    return customToolsSchema.parse(requireServerSuccess(data).data)
+  } catch (error) {
+    throw new CustomToolRequestError(error, t('Failed to load tool configuration.'))
+  }
+}
+
+export async function changeChannelCustomTool(
+  channelId: number,
+  change: CustomToolChange,
+  signal: AbortSignal
+): Promise<CustomToolStatus> {
+  const url = `/api/channel/${channelId}/custom_tools/${change.operation}`
+  const config = channelActionConfig({ signal, singleUseAuthorization: true })
+  try {
+    const response =
+      change.action === 'verify'
+        ? await api.post(`${url}/verify`, undefined, config)
+        : await api.put(
+            url,
+            change.action === 'save'
+              ? {
+                  enabled: true,
+                  path: change.path,
+                  ...(change.apiKey && { api_key: change.apiKey }),
+                }
+              : { enabled: false },
+            config
+          )
+    return customToolStatusSchema.parse(requireServerSuccess(response.data).data)
+  } catch (error) {
+    throw new CustomToolRequestError(
+      error,
+      change.action === 'verify'
+        ? t('Verification failed. Please try again.')
+        : t('Request failed')
+    )
+  }
+}
 
 export async function getChannelPriorityOrder(): Promise<PriorityOrder> {
   const response = await api.get<{ success: boolean; data: PriorityOrder }>(

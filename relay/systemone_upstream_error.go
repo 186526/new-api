@@ -2,7 +2,6 @@ package relay
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -143,18 +142,4 @@ func systemOneDetailMessage(raw json.RawMessage) string {
 		}
 	}
 	return ""
-}
-
-// readSystemOneUpstreamBody drains and restores the body so the caller can still
-// read it after the error document was built.
-func readSystemOneUpstreamBody(response *http.Response) ([]byte, error) {
-	if response == nil || response.Body == nil {
-		return nil, nil
-	}
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	response.Body = io.NopCloser(strings.NewReader(string(body)))
-	return body, nil
 }

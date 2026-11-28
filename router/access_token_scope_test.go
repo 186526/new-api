@@ -75,8 +75,11 @@ var accessTokenExemptRoutes = []string{
 // accessTokenHelperRoutes are declared through handlePermissionRoute outside
 // channelPermissionRoutes.
 var accessTokenHelperRoutes = map[string]authz.Permission{
-	"GET /api/task_plugin_options": authz.TaskPluginBind,
-	"GET /api/audit":               authz.AuditRead,
+	"GET /api/task_plugin_options":                         authz.TaskPluginBind,
+	"GET /api/audit":                                       authz.AuditRead,
+	"GET /api/channel/:id/custom_tools":                    authz.ChannelRead,
+	"PUT /api/channel/:id/custom_tools/:operation":         authz.ChannelSensitiveWrite,
+	"POST /api/channel/:id/custom_tools/:operation/verify": authz.ChannelWrite,
 }
 
 func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
@@ -142,6 +145,27 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 		assert.Equal(t, "scope", rule.Kind(), key)
 		assert.Equal(t, service.AccessTokenScopeOf(permission), rule.Scope(), key)
 	}
+
+	const batchRedactionRoute = "PUT /api/token/redaction/batch"
+	rule, ok := middleware.AccessTokenRouteRule(batchRedactionRoute)
+	require.True(t, ok, batchRedactionRoute)
+	assert.Equal(t, "scope", rule.Kind(), batchRedactionRoute)
+	assert.Equal(t, "api_key:write", rule.Scope(), batchRedactionRoute)
+}
+
+func TestExpiredSystemInstanceCleanupUsesDedicatedWriteRoute(t *testing.T) {
+	const cleanupRoute = "/api/system-info/expired-instances"
+	for _, route := range newAccessTokenScopeTestEngine(t).Routes() {
+		if route.Method == "DELETE" && route.Path == cleanupRoute {
+			require.True(t, strings.HasSuffix(route.Handler, ".DeleteExpiredSystemInstances"), route.Handler)
+			rule, ok := middleware.AccessTokenRouteRule("DELETE " + cleanupRoute)
+			require.True(t, ok)
+			assert.Equal(t, "scope", rule.Kind())
+			assert.Equal(t, "ops:write", rule.Scope())
+			return
+		}
+	}
+	t.Fatal("the dedicated expired instance cleanup route is not registered")
 }
 
 func TestAccessTokenCatalogCoversEveryPermission(t *testing.T) {

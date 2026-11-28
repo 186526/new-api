@@ -22,7 +22,57 @@ import { z } from 'zod'
 // API Key Schema & Types
 // ============================================================================
 
+export const redactionRuleIDs = [
+  'email',
+  'phone',
+  'cn_id',
+  'credit_card',
+  'private_ip',
+  'all_ip',
+  'api_keys',
+  'cloud_tokens',
+  'dsn_secret',
+  'jwt_bearer',
+  'pem_private_key',
+] as const
+
+export const redactionConfigSchema = z.object({
+  strategy: z.enum(['typed_placeholder', 'mask', 'hmac_short']),
+  builtin_rules: z.array(z.enum(redactionRuleIDs)),
+  scopes: z.object({
+    user_messages: z.boolean(),
+    tool_io: z.boolean(),
+    system_prompt: z.boolean(),
+  }),
+  allowlist: z.array(z.string().max(128)).max(50),
+  custom_rules: z
+    .array(
+      z.object({
+        id: z.string().min(1).max(64),
+        label: z.string().regex(/^[A-Z0-9_]{2,24}$/),
+        pattern: z.string().min(1).max(256),
+        replacement: z.string().max(128).optional(),
+      })
+    )
+    .max(10),
+  restore_pii_in_response: z.boolean(),
+})
+
+export type RedactionConfig = z.output<typeof redactionConfigSchema>
+
 export const apiKeySchema = z.object({
+  redaction_enabled: z.boolean().optional(),
+  redaction_revision: z.number().int().nonnegative().optional(),
+  redaction_summary: z.object({
+    builtin_rules: z.number(),
+    custom_rules: z.number(),
+    scopes: z.object({
+      user_messages: z.boolean(),
+      tool_io: z.boolean(),
+      system_prompt: z.boolean(),
+    }),
+  }).optional(),
+  redaction_config: redactionConfigSchema.optional(),
   id: z.number(),
   name: z.string(),
   key: z.string(),
@@ -57,7 +107,10 @@ export type ApiKey = z.infer<typeof apiKeySchema>
 
 export interface ApiResponse<T = unknown> {
   success: boolean
+  field?: string
   message?: string
+  message_key?: string
+  message_params?: Record<string, unknown>
   data?: T
 }
 
@@ -85,6 +138,8 @@ export interface SearchApiKeysParams {
 }
 
 export interface ApiKeyFormData {
+  redaction_enabled?: boolean
+  redaction_config?: RedactionConfig
   name: string
   remain_quota: number
   expired_time: number

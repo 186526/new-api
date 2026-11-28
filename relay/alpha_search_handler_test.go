@@ -58,15 +58,19 @@ func TestBuildAlphaSearchRequestBodyNoMappingKeepsRawBytes(t *testing.T) {
 }
 
 type recordedSettlement struct {
-	settled  []int
-	refunded bool
+	settled     []int
+	refunded    bool
+	refundCalls int
 }
 
 func (s *recordedSettlement) Settle(quota int) error {
 	s.settled = append(s.settled, quota)
 	return nil
 }
-func (s *recordedSettlement) Refund(*gin.Context)    { s.refunded = true }
+func (s *recordedSettlement) Refund(*gin.Context) {
+	s.refunded = true
+	s.refundCalls++
+}
 func (*recordedSettlement) NeedsRefund() bool        { return false }
 func (*recordedSettlement) GetPreConsumedQuota() int { return 0 }
 func (*recordedSettlement) Reserve(int) error        { return nil }

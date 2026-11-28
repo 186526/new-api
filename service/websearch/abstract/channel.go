@@ -17,5 +17,11 @@ type ChannelContext struct {
 	// key unless the channel holds several.
 	Key string
 	// Settings holds the channel settings that tune this package.
-	Settings dto.ChannelSettings
+	Settings           dto.ChannelSettings
+	PreferredProviders []string
+	OnlyProviders      bool
+	// ModelMapping distinguishes a configured Codex search capability from a
+	// channel that cannot build a cross-contract search request.
+	ModelMapping string
+	CustomTools  *string
 }

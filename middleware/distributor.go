@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/websearch/abstract"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
@@ -146,7 +147,15 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		switch c.Request.URL.Path {
+		case "/v1/tools/search", "/v1/tools/fetch", "/v1/alpha/search", relayconstant.MoonshotSearchPath, relayconstant.MoonshotFetchPath:
+			c.Request = c.Request.WithContext(abstract.WithCacheTenant(c.Request.Context(), common.GetContextKeyInt(c, constant.ContextKeyUserId)))
+		}
+		if _, builtin := service.BuiltinToolsGroup(c); builtin {
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelRequest.Model)
+		} else {
+			SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
@@ -461,6 +470,15 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			modelRequest.Model = modelName
 		}
 		c.Set("relay_mode", relayMode)
+	} else if relayconstant.IsSystemOnePath(c.Request.URL.Path) && common.IsMultipartFormContentType(c.GetHeader("Content-Type")) {
+		request, problems, err := common.ReadSystemOneMultipart(c)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(problems) > 0 {
+			return nil, false, errors.New("invalid System One multipart request")
+		}
+		modelRequest.Model = request.Model
 	} else if !strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") && !common.IsMultipartFormContentType(c.Request.Header.Get("Content-Type")) {
 		req, err := getModelFromRequest(c)
 		if err != nil {

@@ -141,12 +141,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
+	preprocessing := relay.NewRequestPreprocessing(relayInfo)
+	defer preprocessing.Close()
 	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
 		return
 	}
 	defer func() {
 		newAPIError = relay.RefundFailedRequestBilling(c, relayInfo, newAPIError)
 	}()
+
+	if group, builtin := service.BuiltinToolsGroup(c); builtin {
+		relayInfo.UsingGroup = group
+		newAPIError = relayHandler(c, relayInfo)
+		return
+	}
 
 	retryParam := &service.RetryParam{
 		Ctx:         c,
@@ -163,6 +171,7 @@ relayAttempts:
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
+		relay.ResetRequestAttemptObservations(relayInfo)
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -189,43 +198,32 @@ relayAttempts:
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
-		// The channel setting is the upstream's own image limit, so the request
-		// past it is refused here instead of an attempt that would only come
-		// back as an upstream error. The client sees a context overflow and
-		// compacts the conversation instead. The limit is read from the
-		// settings the distributor stored for the selected channel: the
-		// channel object below is a stub without settings, because
-		// getChannel rebuilds it from the context id, and relayInfo carries no
-		// channel settings here either, because the handler fills ChannelMeta
-		// only after this check. Reading channel.GetSetting() is always zero.
-		// The upstream's limit belongs to the model, not to the channel, so a
-		// model the settings name takes its own limit; the model_mapping the
-		// distributor stored is what the request will be sent under.
-		channelSetting, _ := common.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting)
-		if limitErr := relay.CheckRequestImageLimitForModels(
-			relayInfo.Request,
-			relayFormat,
-			channelSetting,
-			common.GetContextKeyString(c, constant.ContextKeyChannelModelMapping),
-			channel.Id,
-			channel.Name,
-			relayInfo.OriginModelName,
-		); limitErr != nil {
-			newAPIError = limitErr
+		restoreRequest, preprocessErr := preprocessing.ApplyForAttempt(c, relayInfo)
+		if preprocessErr != nil {
+			newAPIError = preprocessErr
 			break
 		}
-
 		attemptStart := time.Now()
-		switch relayFormat {
-		case types.RelayFormatOpenAIRealtime:
-			newAPIError = relay.WssHelper(c, relayInfo)
-		case types.RelayFormatClaude:
-			newAPIError = relay.ClaudeHelper(c, relayInfo)
-		case types.RelayFormatGemini:
-			newAPIError = geminiRelayHandler(c, relayInfo)
-		default:
-			newAPIError = relayHandler(c, relayInfo)
-		}
+		newAPIError = func() *types.NewAPIError {
+			var attemptErr *types.NewAPIError
+			defer restoreRequest()
+			finishResponse := middleware.StartHTTPResponseRedaction(c, relayFormat)
+			cleanEOF := false
+			defer func() { finishResponse(cleanEOF) }()
+			switch relayFormat {
+			case types.RelayFormatOpenAIRealtime:
+				attemptErr = relay.WssHelper(c, relayInfo)
+			case types.RelayFormatClaude:
+				attemptErr = relay.ClaudeHelper(c, relayInfo)
+			case types.RelayFormatGemini:
+				attemptErr = geminiRelayHandler(c, relayInfo)
+			default:
+				attemptErr = relayHandler(c, relayInfo)
+			}
+			stream := relayInfo.StreamStatus
+			cleanEOF = attemptErr == nil && stream != nil && stream.EndReason() == relaycommon.StreamEndReasonEOF && !stream.HasErrors()
+			return attemptErr
+		}()
 		if !relayInfo.IsChannelTest {
 			appmetrics.ObserveUpstreamAttempt(appmetrics.UpstreamAttempt{
 				Model:       relayInfo.OriginModelName,
@@ -397,6 +395,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		return channel, nil
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
+	if errors.Is(err, service.ErrWebSearchGroupDisabled) {
+		return nil, types.NewErrorWithStatusCode(errors.New(i18n.T(c, service.WebSearchGroupDisabledMessage)), service.WebSearchGroupDisabledCode, http.StatusForbidden, types.ErrOptionWithSkipRetry())
+	}
 	if err != nil {
 		return nil, types.NewError(errors.New(i18n.T(c, i18n.MsgRelayRetryGetChannelFailed, map[string]any{"Group": selectGroup, "Model": info.OriginModelName, "Error": err.Error()})), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
@@ -808,7 +809,8 @@ func executeTaskSubmissionWith(
 		}
 	}
 	diagnostics.insertStart(task)
-	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
+	walletDebitTransferred, insertErr := service.InsertTaskWithBilling(c.Request.Context(), relayInfo, task, insertOmits...)
+	if insertErr != nil {
 		common.SysError(common.LogText("insert task error: %s", insertErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
 		diagnostics.failed("insert", "database_error", taskErr, false)
@@ -819,7 +821,7 @@ func executeTaskSubmissionWith(
 	diagnostics.durable(task)
 	diagnostics.settleStart(task, result.Quota)
 
-	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+	if settleErr := service.SettleSubmittedTask(c, relayInfo, result.Quota, walletDebitTransferred); settleErr != nil {
 		common.SysError(common.LogText("settle task billing error: %s", settleErr.Error()))
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
 		diagnostics.failed("settle", "billing_error", taskErr, true)

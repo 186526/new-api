@@ -22,7 +22,30 @@ import { z } from 'zod'
 import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
 
 import { DEFAULT_GROUP } from '../constants'
-import type { ApiKey, ApiKeyFormData } from '../types'
+import {
+  redactionConfigSchema,
+  type ApiKey,
+  type ApiKeyFormData,
+} from '../types'
+
+export const DEFAULT_REDACTION_CONFIG = redactionConfigSchema.parse({
+  strategy: 'typed_placeholder',
+  builtin_rules: [
+    'email',
+    'phone',
+    'cn_id',
+    'credit_card',
+    'api_keys',
+    'cloud_tokens',
+    'dsn_secret',
+    'jwt_bearer',
+    'pem_private_key',
+  ],
+  scopes: { user_messages: true, tool_io: true, system_prompt: false },
+  allowlist: [],
+  custom_rules: [],
+  restore_pii_in_response: false,
+})
 
 // ============================================================================
 // Form Schema
@@ -31,6 +54,7 @@ import type { ApiKey, ApiKeyFormData } from '../types'
 export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
   const autoGroupLimit =
     Number.isInteger(maxAutoGroups) && maxAutoGroups > 0 ? maxAutoGroups : 5
+  const countError = t('Token count must be between 1 and 100.')
 
   return z
     .object({
@@ -41,11 +65,13 @@ export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
       model_limits: z.array(z.string()),
       allow_ips: z.string().optional(),
       allow_user_quota_query: z.boolean(),
+      redaction_enabled: z.boolean().optional(),
+      redaction_config: redactionConfigSchema.optional(),
       group: z.string().optional(),
       auto_groups_mode: z.enum(['inherit', 'custom']),
       auto_groups: z.array(z.string()),
       cross_group_retry: z.boolean().optional(),
-      tokenCount: z.number().min(1).optional(),
+      tokenCount: z.number(countError).int(countError).min(1, countError).max(100, countError).optional(),
     })
     .superRefine((data, ctx) => {
       if (data.group === 'auto') {
@@ -139,9 +165,15 @@ export function getApiKeyFormDefaultValues(
  * Transform form data to API payload
  */
 export function transformFormDataToPayload(
-  data: ApiKeyFormValues
+  data: ApiKeyFormValues,
+  changed: { enabled: boolean; config: boolean } = {
+    enabled: true,
+    config: true,
+  }
 ): ApiKeyFormData {
   return {
+    ...(changed.enabled && { redaction_enabled: data.redaction_enabled }),
+    ...(changed.config && { redaction_config: data.redaction_config }),
     name: data.name,
     remain_quota: data.unlimited_quota
       ? 0
@@ -179,6 +211,8 @@ export function transformApiKeyToFormDefaults(
   const autoGroupsMode = storedAutoGroups.length > 0 ? 'custom' : 'inherit'
 
   return {
+    redaction_enabled: apiKey.redaction_enabled,
+    redaction_config: apiKey.redaction_config,
     name: apiKey.name,
     remain_quota_dollars: apiKey.unlimited_quota
       ? 0

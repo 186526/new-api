@@ -16,29 +16,22 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-import {
-  CodeBlock,
-  CodeBlockCopyButton,
-} from '@/components/ai-elements/code-block'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 import {
   API_KEY_ENV,
-  SAMPLE_LANGUAGE_HIGHLIGHT,
-  SAMPLE_LANGUAGE_LABELS,
   SAMPLE_LANGUAGES,
-  type ApiSampleLanguage,
+  SAMPLE_LANGUAGE_LABELS,
 } from '../constants'
-import { buildEndpointSample, type SampleContext } from '../lib/samples'
+import { buildEndpointSample } from '../lib/samples'
+import { DocsCode } from './docs-code'
 
 type EndpointSamplesProps = {
   endpointId: string
   method: string
   path: string
-  title: string
   baseUrl: string
   model: string
 }
@@ -50,64 +43,51 @@ type EndpointSamplesProps = {
  */
 export function EndpointSamples(props: EndpointSamplesProps) {
   const { t } = useTranslation()
-  const [language, setLanguage] = useState<ApiSampleLanguage>('curl')
-
-  const context = useMemo<SampleContext>(
-    () => ({
-      baseUrl: props.baseUrl,
-      apiKeyEnv: API_KEY_ENV,
-      model: props.model,
-      path: props.path,
-    }),
-    [props.baseUrl, props.model, props.path]
-  )
-
-  const code = useMemo(
-    () => buildEndpointSample(props.endpointId, language, context),
-    [props.endpointId, context, language]
-  )
-
-  if (!code) {
-    return null
+  const context = {
+    baseUrl: props.baseUrl,
+    apiKeyEnv: API_KEY_ENV,
+    model: props.model,
+    path: props.path,
   }
+  const endpoint = `${props.method} ${props.path}`
 
   return (
-    <div className='space-y-2'>
-      <div className='flex flex-wrap items-center gap-2'>
-        <code className='font-mono text-sm font-medium break-all'>
-          {props.method} {props.path}
-        </code>
-        <span className='text-muted-foreground text-xs'>{props.title}</span>
-        <Tabs
-          value={language}
-          onValueChange={(value) => setLanguage(value as ApiSampleLanguage)}
-          className='ml-auto'
-        >
-          <TabsList className='bg-muted/40 h-8 p-0.5'>
-            {SAMPLE_LANGUAGES.map((option) => (
-              <TabsTrigger
-                key={option}
-                value={option}
-                className='h-7 px-2.5 text-xs'
-              >
-                {SAMPLE_LANGUAGE_LABELS[option]}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
+    <Tabs defaultValue='curl' className='min-w-0'>
+      <div className='flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1'>
+        <h3 className='min-w-0 font-mono text-sm font-medium wrap-anywhere'>
+          {endpoint}
+        </h3>
+        <TabsList variant='line' aria-label={endpoint}>
+          {SAMPLE_LANGUAGES.map((language) => (
+            <TabsTrigger
+              key={language}
+              value={language}
+              className='transition-none after:transition-none'
+            >
+              {SAMPLE_LANGUAGE_LABELS[language]}
+            </TabsTrigger>
+          ))}
+        </TabsList>
       </div>
-      <CodeBlock code={code} language={SAMPLE_LANGUAGE_HIGHLIGHT[language]}>
-        <CodeBlockCopyButton />
-      </CodeBlock>
-      <p className='text-muted-foreground text-xs'>
-        {t('apiDocs.sample.keyHint', {
-          defaultValue: 'The examples read your API key from',
-        })}{' '}
-        <code className='bg-muted rounded px-1 py-0.5 font-mono text-[11px]'>
-          {API_KEY_ENV}
-        </code>
-        .
-      </p>
-    </div>
+      {SAMPLE_LANGUAGES.map((language) => {
+        const code = buildEndpointSample(props.endpointId, language, context)
+        if (!code) return null
+
+        const title = SAMPLE_LANGUAGE_LABELS[language]
+        return (
+          <TabsContent key={language} value={language} className='min-w-0'>
+            <DocsCode
+              code={code}
+              title={title}
+              copyLabel={t('apiDocs.sample.copyEndpoint', {
+                defaultValue: 'Copy {{language}} example for {{endpoint}}',
+                language: title,
+                endpoint,
+              })}
+            />
+          </TabsContent>
+        )
+      })}
+    </Tabs>
   )
 }

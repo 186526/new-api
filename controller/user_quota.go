@@ -43,7 +43,9 @@ func manageUserQuota(c *gin.Context, req ManageRequest) {
 		markAuditLogged(c)
 	}()
 
-	adjustment, err := model.AdjustUserQuota(req.Id, c.GetInt("role"), req.Mode, req.Value)
+	adjustment, err := model.AdjustUserQuotaWithActor(req.Id, req.Mode, req.Value, model.UserQuotaAdjustmentActor{
+		ID: c.GetInt("id"), Role: c.GetInt("role"), RequestID: c.GetString(common.RequestIdKey),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, model.ErrInvalidUserQuotaAdjustment):

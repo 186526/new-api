@@ -14,7 +14,9 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/websearch_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -361,4 +363,36 @@ func TestSharedEndpointRebindsToBoundNewAPIExtension(t *testing.T) {
 	require.Nil(t, SetupContextForSelectedChannel(c, channel, "task-model"))
 	assert.Equal(t, "alpha", c.GetString("task_plugin_key"), "the first bound candidate executes regardless of the earlier pin")
 	assert.Equal(t, "alpha", c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint).Plugin.Meta.Key)
+}
+
+func TestWebSearchGroupPoliciesBlockAllFiveContractsBeforeRelay(t *testing.T) {
+	key := websearch_setting.GroupPoliciesOptionKey
+	previous := websearch_setting.Get().GroupPolicies
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{key: previous}))
+		require.NoError(t, websearch_setting.UpdateAndSync())
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{key: `{"default":{
+		"tools/search":{"mode":"disabled"},"tools/fetch":{"mode":"disabled"},
+		"alpha/search":{"mode":"disabled"},"moonshot/search":{"mode":"disabled"},"moonshot/fetch":{"mode":"disabled"}
+	}}`}))
+	require.NoError(t, websearch_setting.UpdateAndSync())
+
+	for _, path := range []string{"/v1/tools/search", "/v1/tools/fetch", "/v1/alpha/search", "/moonshot.service/v1/search", "/moonshot.service/v1/fetch"} {
+		t.Run(path, func(t *testing.T) {
+			engine := gin.New()
+			engine.POST(path, func(ctx *gin.Context) {
+				common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
+				common.SetContextKey(ctx, constant.ContextKeyUsingGroup, "default")
+			}, Distribute(), func(ctx *gin.Context) {
+				t.Fatal("disabled tool request reached relay and billing")
+			})
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"gpt-5","query":"test","text_query":"test","url":"https://example.com"}`))
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, req)
+			assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"websearch_group_disabled"`)
+		})
+	}
 }

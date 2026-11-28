@@ -207,6 +207,28 @@ func TestAntigravityResolveSearchRedirectsDropsAShortLinkItCannotFollow(t *testi
 	}
 }
 
+func TestAntigravityNormalizedResultContainsNoShortLinks(t *testing.T) {
+	stub := newRedirectStub(t, http.StatusFound, "https://a.example/page")
+	other := newRedirectStub(t, http.StatusFound, "https://vertexaisearch.example/grounding-api-redirect/next")
+	citation := shortLinkCitation(stub, "good")
+	chain := shortLinkCitation(other, "chain")
+	body := `{"response":{"candidates":[{"groundingMetadata":{"groundingChunks":[{"web":{"uri":"` + citation + `"}},{"web":{"uri":"` + chain + `"}}],"groundingSupports":[{"segment":{"text":"A modeled sentence. ` + citation + `"},"groundingChunkIndices":[0]}]}}]}}`
+	entry, err := normalizeAntigravitySearch(t.Context(), abstract.ChannelContext{}, forwardEntry{StatusCode: http.StatusOK, Body: []byte(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(entry.Body), "grounding-api-redirect") {
+		t.Fatalf("normalized cache body includes a short link: %s", entry.Body)
+	}
+	results, err := (antigravityResultParser{}).ParseSearch(entry.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].URL != "https://a.example/page" || results[0].Snippet != "" || !strings.Contains(results[0].Summary, "A modeled sentence") {
+		t.Fatalf("unexpected normalized results: %+v", results)
+	}
+}
+
 func TestAntigravityRequesterPublishesNoNativeContract(t *testing.T) {
 	requester, err := For(websearch_setting.ProviderAntigravity)
 	if err != nil {
