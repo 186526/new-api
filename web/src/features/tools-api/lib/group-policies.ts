@@ -30,6 +30,15 @@ export const TOOL_ENDPOINTS = {
 
 export type ToolContract = keyof typeof TOOL_ENDPOINTS
 export const TOOL_CONTRACTS = Object.keys(TOOL_ENDPOINTS) as ToolContract[]
+export const SEARCH_CONTRACTS: ToolContract[] = [
+  'tools/search',
+  'alpha/search',
+  'moonshot/search',
+]
+export const FETCH_CONTRACTS: ToolContract[] = [
+  'tools/fetch',
+  'moonshot/fetch',
+]
 
 export const TOOL_PROVIDERS = [
   'antigravity',
@@ -107,9 +116,8 @@ export function parseProviderOrder(value: string): string[] {
     .filter(Boolean)
 }
 
-export function normalizeProviderOrder(providers: string[], contract?: ToolContract): string[] {
-  if (!contract?.endsWith('/fetch')) return providers
-  return [...providers.filter((provider) => provider !== 'local'), ...providers.filter((provider) => provider === 'local')]
+export function normalizeProviderOrder(providers: string[], _contract?: ToolContract): string[] {
+  return providers
 }
 
 export function createGroupPolicyFormSchema(

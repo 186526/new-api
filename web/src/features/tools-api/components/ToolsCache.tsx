@@ -60,18 +60,26 @@ export function ToolsCache() {
           </Button>
         )}
         {!!status.data?.length && (
-          <ul className='flex flex-col gap-1 text-sm'>
+          <ul className='grid gap-3 sm:grid-cols-2'>
             {status.data.map((item) => (
-              <li key={item.scope}>
-                {scopeLabel(item.scope)}: {item.backend} ·{' '}
-                {item.backend === 'redis'
-                  ? t('Shared across instances')
-                  : t('This instance only')}
-                <dl className='text-muted-foreground'>
+              <li
+                key={item.scope}
+                className='bg-muted/20 flex flex-col gap-1.5 rounded-lg border p-3 text-sm'
+              >
+                <div className='flex items-center justify-between gap-2'>
+                  <span className='font-medium'>{scopeLabel(item.scope)}</span>
+                  <span className='text-muted-foreground text-xs'>
+                    {item.backend} ·{' '}
+                    {item.backend === 'redis'
+                      ? t('Shared across instances')
+                      : t('This instance only')}
+                  </span>
+                </div>
+                <dl className='text-muted-foreground grid gap-1 text-xs'>
                   {item.valid_entries != null && (
-                    <div>
-                      <dt className='inline'>{t('Valid entries')}: </dt>
-                      <dd className='inline'>
+                    <div className='flex justify-between gap-2'>
+                      <dt>{t('Valid entries')}</dt>
+                      <dd className='font-mono tabular-nums'>
                         {item.entries_truncated
                           ? t('At least {{entries}} (scan limit reached)', {
                               entries: formatNumber(item.valid_entries, locale),
@@ -80,16 +88,16 @@ export function ToolsCache() {
                       </dd>
                     </div>
                   )}
-                  <div>
-                    <dt className='inline'>{t('Exact invalidation markers')}: </dt>
-                    <dd className='inline'>
+                  <div className='flex justify-between gap-2'>
+                    <dt>{t('Exact invalidation markers')}</dt>
+                    <dd className='font-mono tabular-nums'>
                       {formatNumber(item.exact_invalidations, locale)}
                     </dd>
                   </div>
                   {item.generation != null && (
-                    <div>
-                      <dt className='inline'>{t('Cache generation')}: </dt>
-                      <dd className='inline'>
+                    <div className='flex justify-between gap-2'>
+                      <dt>{t('Cache generation')}</dt>
+                      <dd>
                         <code className='wrap-anywhere'>
                           {item.generation || '—'}
                         </code>

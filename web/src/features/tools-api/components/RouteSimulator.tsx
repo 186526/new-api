@@ -321,26 +321,112 @@ export function RouteSimulator(props: {
                 })}
           </p>
           {result && (
-            <div className='flex flex-col gap-2 text-sm'>
-              <p>
-                {t('Group')}: {result.group ?? simulation.variables?.group}
-              </p>
+            <div className='flex flex-col gap-3 text-sm'>
+              <div className='bg-muted/30 grid gap-3 rounded-lg border p-3 sm:grid-cols-2'>
+                <div className='flex flex-col gap-0.5'>
+                  <span className='text-muted-foreground text-xs'>{t('Group')}</span>
+                  <span className='font-medium'>{result.group ?? simulation.variables?.group}</span>
+                </div>
+                {result.source && (
+                  <div className='flex flex-col gap-0.5'>
+                    <span className='text-muted-foreground text-xs'>{t('Rule source')}</span>
+                    <span className='font-medium'>
+                      {labels.ruleSource.get(result.source) ?? labels.unknown}
+                    </span>
+                  </div>
+                )}
+                {result.channel_id !== undefined && (() => {
+                  const primary = result.candidates?.[0]
+                  const nonChannelBilling =
+                    result.source === 'builtin_fallback' ||
+                    primary?.origin === 'local' ||
+                    primary?.origin === 'global_credential'
+                  let channelHeading = t('Channel')
+                  if (nonChannelBilling) {
+                    channelHeading = t('Matched carrier channel (not billed)')
+                  } else if (result.channel_is_sample) {
+                    channelHeading = t('Sampled channel')
+                  }
+                  return (
+                    <div className='flex flex-col gap-0.5 sm:col-span-2'>
+                      <span className='text-muted-foreground text-xs'>
+                        {channelHeading}
+                      </span>
+                      <span className='font-medium'>
+                        {result.channel_name} (#{result.channel_id})
+                        {result.channel_type != null && ` · ${channelType(result.channel_type)}`}
+                      </span>
+                      {nonChannelBilling && (
+                        <span className='text-muted-foreground text-xs'>
+                          {primary?.origin === 'global_credential'
+                            ? t('Executed via global credential — no channel quota charged.')
+                            : t('Executed via built-in local fetcher — no channel quota charged.')}
+                        </span>
+                      )}
+                    </div>
+                  )
+                })()}
+                <div className='flex flex-col gap-0.5'>
+                  <span className='text-muted-foreground text-xs'>{t('Billing model')}</span>
+                  <code className='text-xs font-medium'>{result.billing_model}</code>
+                </div>
+                <div className='flex flex-col gap-0.5'>
+                  <span className='text-muted-foreground text-xs'>{t('Pricing status')}</span>
+                  <span className='font-medium'>
+                    {labels.pricingStatus.get(result.pricing_status) ?? labels.unknown}
+                  </span>
+                </div>
+                {result.tool_price_per_thousand != null && (
+                  <div className='flex flex-col gap-0.5'>
+                    <span className='text-muted-foreground text-xs'>{t('Tool price per 1,000 calls')}</span>
+                    <span className='font-mono text-xs font-medium'>{result.tool_price_per_thousand}</span>
+                  </div>
+                )}
+                {result.group_ratio != null && (
+                  <div className='flex flex-col gap-0.5'>
+                    <span className='text-muted-foreground text-xs'>{t('Group ratio')}</span>
+                    <span className='font-mono text-xs font-medium'>{result.group_ratio}</span>
+                  </div>
+                )}
+                {result.legacy_price != null && (
+                  <div className='flex flex-col gap-0.5'>
+                    <span className='text-muted-foreground text-xs'>{t('Model price')}</span>
+                    <span className='font-mono text-xs font-medium'>{result.legacy_price}</span>
+                  </div>
+                )}
+                {result.legacy_model_ratio != null && (
+                  <div className='flex flex-col gap-0.5'>
+                    <span className='text-muted-foreground text-xs'>{t('Model ratio')}</span>
+                    <span className='font-mono text-xs font-medium'>{result.legacy_model_ratio}</span>
+                  </div>
+                )}
+                {result.billing_expression && (
+                  <div className='flex flex-col gap-0.5 sm:col-span-2'>
+                    <span className='text-muted-foreground text-xs'>{t('Billing expression')}</span>
+                    <code className='bg-background rounded border px-2 py-1 text-xs wrap-anywhere'>
+                      {result.billing_expression}
+                    </code>
+                  </div>
+                )}
+              </div>
+
               {result.authorization_verified === false && (
-                <p>{t('Runtime authorization was not verified.')}</p>
+                <p className='text-muted-foreground text-xs'>
+                  {t('Runtime authorization was not verified.')}
+                </p>
               )}
-              {result.channel_id !== undefined && (
-                <p>
-                  {result.channel_is_sample ? t('Sampled channel') : t('Channel')}: {result.channel_name} (#{result.channel_id})
-                  {result.channel_type != null && ` · ${channelType(result.channel_type)}`}
+              {result.weighted_selection && (
+                <p className='text-muted-foreground text-xs'>
+                  {t('Weighted selection may choose another channel.')}
                 </p>
               )}
               {!!result.channels?.length && (
                 <SimulationChannels channels={result.channels} />
               )}
               {!!result.eligibility?.length && (
-                <div>
-                  <p>{t('Eligibility details')}</p>
-                  <ul className='list-disc ps-5'>
+                <div className='rounded-lg border p-3'>
+                  <p className='mb-1.5 text-xs font-medium'>{t('Eligibility details')}</p>
+                  <ul className='text-muted-foreground list-disc space-y-1 ps-5 text-xs'>
                     {result.eligibility.map((entry) => (
                       <li key={JSON.stringify([entry.group, entry.channel_id, entry.provider, entry.origin, entry.reason])}>
                         {entry.group}
@@ -353,70 +439,24 @@ export function RouteSimulator(props: {
                   </ul>
                 </div>
               )}
-              {result.weighted_selection && (
-                <p>{t('Weighted selection may choose another channel.')}</p>
-              )}
-              {result.source && (
-                <p>
-                  {t('Rule source')}:{' '}
-                  <span>
-                    {labels.ruleSource.get(result.source) ?? labels.unknown}
-                  </span>
-                </p>
-              )}
-              <p>
-                {t('Billing model')}: <code>{result.billing_model}</code>
-              </p>
-              <p>
-                {t('Pricing status')}:{' '}
-                <span>
-                  {labels.pricingStatus.get(result.pricing_status) ??
-                    labels.unknown}
-                </span>
-              </p>
-              {result.billing_expression && (
-                <code className='wrap-anywhere'>
-                  {result.billing_expression}
-                </code>
-              )}
-              {result.legacy_price != null && (
-                <p>
-                  {t('Model price')}: {result.legacy_price}
-                </p>
-              )}
-              {result.legacy_model_ratio != null && (
-                <p>
-                  {t('Model ratio')}: {result.legacy_model_ratio}
-                </p>
-              )}
-              {result.tool_price_per_thousand != null && (
-                <p>
-                  {t('Tool price per 1,000 calls')}:{' '}
-                  {result.tool_price_per_thousand}
-                </p>
-              )}
-              {result.group_ratio != null && (
-                <p>
-                  {t('Group ratio')}: {result.group_ratio}
-                </p>
-              )}
-              <p>{t('Candidate order')}</p>
-              {result.candidates?.length ? (
-                <ol className='list-decimal ps-5'>
-                  {result.candidates.map((entry) => (
-                    <li key={`${entry.origin}-${entry.provider}`}>
-                      {entry.provider} —{' '}
-                      {labels.candidateOrigin.get(entry.origin) ??
-                        labels.unknown}
-                      {entry.native && ` · ${t('Native')}`}
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <p>{t('No candidates')}</p>
-              )}
+              <div className='rounded-lg border p-3'>
+                <p className='mb-1.5 text-xs font-medium'>{t('Candidate order')}</p>
+                {result.candidates?.length ? (
+                  <ol className='list-decimal space-y-1 ps-5 text-xs'>
+                    {result.candidates.map((entry) => (
+                      <li key={`${entry.origin}-${entry.provider}`}>
+                        {entry.provider} —{' '}
+                        {labels.candidateOrigin.get(entry.origin) ?? labels.unknown}
+                        {entry.native && ` · ${t('Native')}`}
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className='text-muted-foreground text-xs'>{t('No candidates')}</p>
+                )}
+              </div>
               {!!result.steps?.length && (
-                <ul className='list-disc ps-5'>
+                <ul className='text-muted-foreground list-disc space-y-1 ps-5 text-xs'>
                   {result.steps.map((step) => (
                     <li key={`${step.group}-${step.reason}`}>
                       {step.group}:{' '}
@@ -436,7 +476,7 @@ export function RouteSimulator(props: {
                       ? simulation.variables.model
                       : undefined,
                 }}
-                className='text-primary self-start underline'
+                className='text-primary self-start text-xs font-medium underline underline-offset-4'
               >
                 {t('Open Playground')}
               </Link>

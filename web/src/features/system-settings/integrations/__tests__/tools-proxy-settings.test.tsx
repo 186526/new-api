@@ -263,7 +263,11 @@ test('a disabled cache TTL of -1 is accepted and saved', async () => {
 })
 
 test('legacy retry settings are displayed as read-only', async () => {
+  const user = userEvent.setup()
   await renderSettings()
+  await user.click(
+    screen.getByRole('button', { name: 'Advanced network & legacy settings' })
+  )
   expect(screen.getByRole('spinbutton', { name: 'Retry attempts' })).toHaveAttribute('readonly')
   expect(screen.getByRole('spinbutton', { name: 'Retry base delay (milliseconds)' })).toHaveAttribute('readonly')
 })

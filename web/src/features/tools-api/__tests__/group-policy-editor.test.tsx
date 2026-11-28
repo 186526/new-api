@@ -89,6 +89,9 @@ test('selecting another configured group displays its independent rules', async 
   renderToolsApi()
   const user = userEvent.setup()
   const group = await screen.findByRole('combobox', { name: 'Group' })
+  await user.click(
+    screen.getByRole('button', { name: /Per-protocol overrides \(Advanced\)/ })
+  )
 
   expect(getRuleMode(toolsSearch, 'toolsApi.inherit')).toHaveAttribute(
     'aria-pressed',
@@ -206,6 +209,9 @@ test('submitting an empty allowlist focuses the invalid field without writing op
   renderToolsApi()
   await screen.findByRole('combobox', { name: 'Group' })
   const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: /Per-protocol overrides \(Advanced\)/ })
+  )
   const only = getRuleMode(toolsSearch, 'Only listed providers')
   only.focus()
   await user.keyboard('[Space]')
@@ -230,6 +236,9 @@ test('rejected saves show the server message and keep the edited rules', async (
   renderToolsApi()
   const group = await screen.findByRole('combobox', { name: 'Group' })
   const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: /Per-protocol overrides \(Advanced\)/ })
+  )
   const disabled = getRuleMode(toolsSearch, 'Disabled')
   await user.click(disabled)
   await user.click(screen.getByRole('button', { name: 'Save changes' }))
@@ -320,6 +329,9 @@ test('a version conflict preserves the draft and does not retry the write', asyn
   renderToolsApi()
   await screen.findByRole('combobox', { name: 'Group' })
   const user = userEvent.setup()
+  await user.click(
+    screen.getByRole('button', { name: /Per-protocol overrides \(Advanced\)/ })
+  )
   await user.click(getRuleMode(toolsSearch, 'Disabled'))
   await user.click(screen.getByRole('button', { name: 'Save changes' }))
   const review = await screen.findByRole('button', { name: 'Keep draft' })
@@ -573,7 +585,9 @@ test('provider readiness displays the returned mapping and credential states', a
       <ToolsDiagnostics />
     </QueryClientProvider>
   )
-  expect(await screen.findByText('alpha/search · Native')).toBeVisible()
-  expect(screen.getByText(/Missing mappings:/)).toBeVisible()
+  const user = userEvent.setup()
+  expect(await screen.findByText(/Missing mappings:/)).toBeVisible()
   expect(screen.getByText('Global key configured')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: 'Provider details' }))
+  expect(await screen.findByText('Search · Native')).toBeVisible()
 })

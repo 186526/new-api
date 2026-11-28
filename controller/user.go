@@ -642,10 +642,18 @@ func GetUserModels(c *gin.Context) {
 			groupsToQuery = []string{group}
 		}
 	}
+	rawModels := service.GetGroupsEnabledModels(groupsToQuery)
+	visibleModels := make([]string, 0, len(rawModels))
+	for _, modelName := range rawModels {
+		if constant.IsInternalCapabilityModel(modelName) {
+			continue
+		}
+		visibleModels = append(visibleModels, modelName)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    service.GetGroupsEnabledModels(groupsToQuery),
+		"data":    visibleModels,
 	})
 }
 

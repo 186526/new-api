@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { ChevronDown, Database } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
@@ -26,6 +27,11 @@ import * as z from 'zod'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Form,
   FormControl,
@@ -37,7 +43,17 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from '@/components/ui/sheet'
 import { Switch } from '@/components/ui/switch'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 import { ToolsApiContent } from '@/features/tools-api'
 import { ProviderOrderEditor } from '@/features/tools-api/components/ProviderOrderEditor'
 import { ToolsCache } from '@/features/tools-api/components/ToolsCache'
@@ -219,6 +235,22 @@ export function ToolsProxySettingsSection({
   const queryClient = useQueryClient()
   const updateOption = useUpdateOption()
   const [clearKeyOpen, setClearKeyOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [activeTab, setActiveTab] = useState<'default' | 'policies'>(() =>
+    typeof window !== 'undefined' && window.location.hash === '#group-policies'
+      ? 'policies'
+      : 'default'
+  )
+
+  useEffect(() => {
+    const syncHash = () => {
+      if (window.location.hash === '#group-policies') {
+        setActiveTab('policies')
+      }
+    }
+    window.addEventListener('hashchange', syncHash)
+    return () => window.removeEventListener('hashchange', syncHash)
+  }, [])
   const orderTitleId = useId()
   const cacheTitleId = useId()
   const upstreamTitleId = useId()
@@ -340,15 +372,48 @@ export function ToolsProxySettingsSection({
   }
 
   return (
-    <SettingsSection title={t('Tools Proxy')} className='gap-6'>
-      <ToolsNavigation />
-      <Form {...form}>
-        <SettingsForm onSubmit={form.handleSubmit(onSubmit)} autoComplete='off'>
-          <SettingsPageFormActions
-            onSave={form.handleSubmit(onSubmit)}
-            isSaving={updateOption.isPending}
-            saveLabel='Save Tools Proxy settings'
-          />
+    <SettingsSection title={t('Tools Proxy')} className='gap-5'>
+      <div className='flex flex-wrap items-center justify-between gap-2'>
+        <ToolsNavigation />
+        <Sheet>
+          <SheetTrigger
+            render={<Button type='button' variant='outline' size='sm' />}
+          >
+            <Database className='mr-1.5 size-3.5' aria-hidden='true' />
+            {t('Tool cache')}
+          </SheetTrigger>
+          <SheetContent className='overflow-y-auto sm:max-w-lg'>
+            <SheetHeader>
+              <SheetTitle>{t('Tool cache')}</SheetTitle>
+              <SheetDescription>
+                {t('Inspect or invalidate cached search and fetch answers.')}
+              </SheetDescription>
+            </SheetHeader>
+            <div className='px-4 pb-4'>
+              <ToolsCache />
+            </div>
+          </SheetContent>
+        </Sheet>
+      </div>
+      <ToolsDiagnostics />
+      <Tabs
+        value={activeTab}
+        onValueChange={(value) => setActiveTab(value as 'default' | 'policies')}
+        className='gap-4'
+      >
+        <TabsList>
+          <TabsTrigger value='default'>{t('Global defaults')}</TabsTrigger>
+          <TabsTrigger value='policies'>{t('Group policies')}</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value='default' className='mt-0'>
+          <Form {...form}>
+            <SettingsForm onSubmit={form.handleSubmit(onSubmit)} autoComplete='off'>
+              <SettingsPageFormActions
+                onSave={form.handleSubmit(onSubmit)}
+                isSaving={updateOption.isPending}
+                saveLabel='Save Tools Proxy settings'
+              />
 
           <div
             role='group'
@@ -451,23 +516,6 @@ export function ToolsProxySettingsSection({
               {t('Cache and retries')}
             </h4>
             <SettingsFormGrid>
-              {searchFallback !== undefined && (
-                <FormField control={form.control} name='websearch_setting.fallback_enabled' render={({ field }) => (
-                  <SettingsSwitchItem>
-                    <SettingsSwitchContent><FormLabel>{t('Inject default search parameters')}</FormLabel></SettingsSwitchContent>
-                    <FormControl><Switch checked={field.value ?? false} onCheckedChange={field.onChange} /></FormControl>
-                  </SettingsSwitchItem>
-                )} />
-              )}
-              {fetchLimit !== undefined && (
-                <FormField control={form.control} name='websearch_setting.local_fetch_max_bytes' render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Local fetch limit (bytes)')}</FormLabel>
-                    <FormControl><Input type='number' min={1} max={8 * 1024 * 1024} step={1} {...safeNumberFieldProps(field)} /></FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )} />
-              )}
               <FormField
                 control={form.control}
                 name='websearch_setting.search_cache_ttl_seconds'
@@ -514,100 +562,143 @@ export function ToolsProxySettingsSection({
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name='websearch_setting.redirect_cache_ttl_seconds'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Redirect cache TTL (seconds)')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        min={-1}
-                        step={1}
-                        {...safeNumberFieldProps(field)}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t(
-                        '0 uses the built-in 86400 seconds. -1 disables the redirect cache.'
-                      )}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name='websearch_setting.response_header_timeout_seconds'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      {t('Response header timeout (seconds)')}
-                    </FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        min={0}
-                        step={1}
-                        {...safeNumberFieldProps(field)}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('0 uses the built-in 25 seconds.')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name='websearch_setting.retry_attempts'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('Retry attempts')}</FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        min={0}
-                        max={5}
-                        readOnly
-                        step={1}
-                        {...safeNumberFieldProps(field)}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('Legacy setting. Tool requests are not retried after sending.')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              <FormField
-                control={form.control}
-                name='websearch_setting.retry_base_delay_milliseconds'
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>
-                      {t('Retry base delay (milliseconds)')}
-                    </FormLabel>
-                    <FormControl>
-                      <Input
-                        type='number'
-                        readOnly
-                        min={0}
-                        step={1}
-                        {...safeNumberFieldProps(field)}
-                      />
-                    </FormControl>
-                    <FormDescription>
-                      {t('Legacy setting. Tool requests are not retried after sending.')}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
             </SettingsFormGrid>
+
+            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+              <div className='rounded-lg border px-3.5 py-2.5'>
+                <CollapsibleTrigger
+                  render={
+                    <button
+                      type='button'
+                      className='flex w-full items-center justify-between gap-2 py-1 text-left text-sm font-medium'
+                    />
+                  }
+                >
+                  <span>{t('Advanced network & legacy settings')}</span>
+                  <ChevronDown
+                    className={cn(
+                      'text-muted-foreground size-4 transition-transform',
+                      advancedOpen && 'rotate-180'
+                    )}
+                    aria-hidden='true'
+                  />
+                </CollapsibleTrigger>
+                <CollapsibleContent className='pt-3'>
+                  <SettingsFormGrid>
+                    {searchFallback !== undefined && (
+                      <FormField control={form.control} name='websearch_setting.fallback_enabled' render={({ field }) => (
+                        <SettingsSwitchItem>
+                          <SettingsSwitchContent><FormLabel>{t('Inject default search parameters')}</FormLabel></SettingsSwitchContent>
+                          <FormControl><Switch checked={field.value ?? false} onCheckedChange={field.onChange} /></FormControl>
+                        </SettingsSwitchItem>
+                      )} />
+                    )}
+                    {fetchLimit !== undefined && (
+                      <FormField control={form.control} name='websearch_setting.local_fetch_max_bytes' render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Local fetch limit (bytes)')}</FormLabel>
+                          <FormControl><Input type='number' min={1} max={8 * 1024 * 1024} step={1} {...safeNumberFieldProps(field)} /></FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )} />
+                    )}
+                    <FormField
+                      control={form.control}
+                      name='websearch_setting.redirect_cache_ttl_seconds'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Redirect cache TTL (seconds)')}</FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={-1}
+                              step={1}
+                              {...safeNumberFieldProps(field)}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t(
+                              '0 uses the built-in 86400 seconds. -1 disables the redirect cache.'
+                            )}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='websearch_setting.response_header_timeout_seconds'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Response header timeout (seconds)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              step={1}
+                              {...safeNumberFieldProps(field)}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t('0 uses the built-in 25 seconds.')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='websearch_setting.retry_attempts'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>{t('Retry attempts')}</FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              min={0}
+                              max={5}
+                              readOnly
+                              step={1}
+                              {...safeNumberFieldProps(field)}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t('Legacy setting. Tool requests are not retried after sending.')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name='websearch_setting.retry_base_delay_milliseconds'
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>
+                            {t('Retry base delay (milliseconds)')}
+                          </FormLabel>
+                          <FormControl>
+                            <Input
+                              type='number'
+                              readOnly
+                              min={0}
+                              step={1}
+                              {...safeNumberFieldProps(field)}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            {t('Legacy setting. Tool requests are not retried after sending.')}
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </SettingsFormGrid>
+                </CollapsibleContent>
+              </div>
+            </Collapsible>
           </div>
 
           <Separator />
@@ -682,12 +773,14 @@ export function ToolsProxySettingsSection({
                   </FormItem>
                 )}
               />
-              <dl>
-                <dt>{t('Antigravity search model')}</dt>
-                <dd className='text-muted-foreground text-sm'>
+              <div className='flex flex-col gap-2'>
+                <span className='text-sm font-medium leading-none'>
+                  {t('Antigravity search model')}
+                </span>
+                <div className='bg-muted/30 text-muted-foreground flex h-9 items-center rounded-md border px-3 font-mono text-sm'>
                   gemini-3.5-flash-lite
-                </dd>
-              </dl>
+                </div>
+              </div>
             </SettingsFormGrid>
           </div>
         </SettingsForm>
@@ -705,11 +798,14 @@ export function ToolsProxySettingsSection({
         disabled={!exaKeyConfigured || isSubmitting}
         handleConfirm={() => void clearExaKey()}
       />
-      <ToolsDiagnostics />
-      <div id='group-policies' className='min-w-0 scroll-mt-16'>
-        <ToolsApiContent />
-      </div>
-      <ToolsCache />
+        </TabsContent>
+
+        <TabsContent value='policies' className='mt-0'>
+          <div id='group-policies' className='min-w-0 scroll-mt-16'>
+            <ToolsApiContent />
+          </div>
+        </TabsContent>
+      </Tabs>
     </SettingsSection>
   )
 }

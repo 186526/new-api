@@ -92,6 +92,7 @@ func moonshotServiceSearch(c *gin.Context, info *relaycommon.RelayInfo, channel 
 
 	answer, err := websearch.Search(c.Request.Context(), channel, query)
 	recordWebsearchResult(info, query.Contract, answer, err)
+	clearNonChannelWebsearchAttribution(c, info, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			appmetrics.ObserveMoonshotServiceRequest(
@@ -149,6 +150,7 @@ func moonshotServiceFetch(c *gin.Context, info *relaycommon.RelayInfo, channel a
 
 	answer, err := websearch.Fetch(c.Request.Context(), channel, query)
 	recordWebsearchResult(info, query.Contract, answer, err)
+	clearNonChannelWebsearchAttribution(c, info, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			appmetrics.ObserveMoonshotServiceRequest(

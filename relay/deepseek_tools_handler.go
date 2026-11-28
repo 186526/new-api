@@ -97,6 +97,7 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 		answer, err = websearch.Search(c.Request.Context(), channel, query)
 	}
 	recordWebsearchResult(info, contract, answer, err)
+	clearNonChannelWebsearchAttribution(c, info, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			// Allow retry onto another channel that may support this endpoint.
@@ -225,6 +226,24 @@ func recordWebsearchResult(info *relaycommon.RelayInfo, contract abstract.Contra
 		outcome = "success"
 	}
 	info.ToolExecution = &relaycommon.ToolExecutionMeta{Contract: string(contract), Provider: answer.Provider, Outcome: outcome, CacheHit: answer.Cached}
+}
+
+// clearNonChannelWebsearchAttribution clears the carrier channel attribution
+// when a tool call was fulfilled by the in-process local fetcher or a global
+// credential rather than the selected channel's own upstream, so channel quota
+// and usage logs are not erroneously attributed to the carrier channel.
+func clearNonChannelWebsearchAttribution(c *gin.Context, info *relaycommon.RelayInfo, answer websearch.Answer, err error) {
+	if err != nil || !websearchOK(answer.StatusCode) {
+		return
+	}
+	if answer.Provider != websearch_setting.ProviderLocal && answer.Origin != abstract.OriginGlobalCredential {
+		return
+	}
+	info.ChannelId = 0
+	if c != nil {
+		common.SetContextKey(c, constant.ContextKeyChannelId, 0)
+		common.SetContextKey(c, constant.ContextKeyChannelName, "")
+	}
 }
 
 func requestWebsearchRefund(c *gin.Context, info *relaycommon.RelayInfo) {

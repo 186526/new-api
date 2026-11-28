@@ -116,8 +116,8 @@ func qualifiedCandidates(channel ChannelContext, contract Contract, settings web
 			order[index] = strings.ToLower(strings.TrimSpace(order[index]))
 		}
 	}
-	if len(order) > 0 || !settings.NativeFirst || bound != "" {
-		rankCandidates(candidates, order, bound, settings.NativeFirst)
+	if len(order) > 0 || !settings.NativeFirst || bound != "" || !contract.IsSearch() {
+		rankCandidates(candidates, order, bound, settings.NativeFirst, !contract.IsSearch())
 	}
 	if len(channel.PreferredProviders) != 0 {
 		positions := make(map[string]int, len(channel.PreferredProviders))
@@ -129,19 +129,26 @@ func qualifiedCandidates(channel ChannelContext, contract Contract, settings web
 			return firstRank != 0 && (secondRank == 0 || firstRank < secondRank)
 		})
 	}
-	pinFetchFallback(candidates, contract)
 	return candidates, diagnostics
 }
 
 // rankCandidates applies the operator's preference. It reorders only: every
 // candidate stays in the list, because a provider that lost the rank still has
 // a credential and can still answer.
-func rankCandidates(candidates []Candidate, order []string, bound string, nativeFirst bool) {
+func rankCandidates(candidates []Candidate, order []string, bound string, nativeFirst bool, fetch bool) {
 	position := make(map[string]int, len(order))
 	for index, provider := range order {
 		position[provider] = index
 	}
 	originRank := func(candidate Candidate) int {
+		if fetch {
+			if candidate.Origin == OriginLocal {
+				return int(OriginChannelUpstream) + 1
+			}
+			if candidate.Origin == OriginGlobalCredential {
+				return int(OriginChannelUpstream) + 2
+			}
+		}
 		if !nativeFirst && candidate.Origin != OriginOperatorBinding {
 			return int(OriginChannelUpstream) + 1
 		}
@@ -167,21 +174,4 @@ func rankCandidates(candidates []Candidate, order []string, bound string, native
 		}
 		return a.Provider < b.Provider
 	})
-}
-
-// pinFetchFallback keeps the in-process fetcher last: it is the fallback, so an
-// operator order that names it first must not change that.
-func pinFetchFallback(candidates []Candidate, contract Contract) {
-	if contract.IsSearch() {
-		return
-	}
-	for index, candidate := range candidates {
-		if candidate.Provider != websearch_setting.ProviderLocal {
-			continue
-		}
-		local := candidate
-		copy(candidates[index:], candidates[index+1:])
-		candidates[len(candidates)-1] = local
-		return
-	}
 }

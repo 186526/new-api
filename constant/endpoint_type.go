@@ -33,3 +33,9 @@ const (
 	ToolsSearchModel = "tools-search"
 	ToolsFetchModel  = "tools-fetch"
 )
+
+// IsInternalCapabilityModel reports whether name is a gateway-internal virtual
+// capability model used for routing/billing rather than a chat/completion model.
+func IsInternalCapabilityModel(name string) bool {
+	return name == ToolsSearchModel || name == ToolsFetchModel
+}

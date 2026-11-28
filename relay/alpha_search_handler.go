@@ -65,6 +65,7 @@ func AlphaSearchHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError
 
 	answer, err := websearch.Search(c.Request.Context(), channel, query)
 	recordWebsearchResult(info, query.Contract, answer, err)
+	clearNonChannelWebsearchAttribution(c, info, answer, err)
 	if err != nil {
 		if errors.Is(err, websearch.ErrUnsupportedChannel) {
 			// Allow retry onto another channel that may support this endpoint.

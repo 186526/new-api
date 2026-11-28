@@ -1,3 +1,4 @@
+import { ArrowDown, ArrowUp, X } from 'lucide-react'
 import { useId, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -40,8 +41,7 @@ export function ProviderOrderEditor(props: ProviderOrderEditorProps) {
       !(!props.directory && props.contract?.endsWith('/fetch') &&
         (provider === 'antigravity' || provider === 'codex'))
   )
-  const isPinned = (provider: string) =>
-    props.contract?.endsWith('/fetch') && provider === 'local'
+  const isPinned = (_provider: string) => false
 
   function update(next: string[]) {
     props.onChange(normalizeProviderOrder(next, props.contract).join(', '))
@@ -92,75 +92,88 @@ export function ProviderOrderEditor(props: ProviderOrderEditorProps) {
         ))}
       </NativeSelect>
       {providers.length > 0 && (
-        <ol className='flex flex-col gap-1'>
+        <ol className='flex flex-col gap-1.5'>
           {providers.map((provider, index) => {
             const supply = props.directory?.find((entry) => entry.provider === provider)
             const channelCount = props.contract
               ? supply?.contract_details?.find((detail) => detail.contract === props.contract)?.available_channels
               : supply?.available_channels
+            const moveUpDisabled =
+              index === 0 ||
+              !!isPinned(provider) ||
+              !!isPinned(providers[index - 1])
+            const moveDownDisabled =
+              index === providers.length - 1 ||
+              !!isPinned(provider) ||
+              !!isPinned(providers[index + 1])
             return (
-            <li
-              key={`${provider}:${providers.slice(0, index).filter((entry) => entry === provider).length}`}
-              className='flex flex-wrap items-center gap-1'
-            >
-              <div className='me-auto flex flex-wrap items-center gap-1'>
-                <code className='wrap-anywhere'>{provider}</code>
-                {props.contract && supply?.native_contracts?.includes(props.contract) && (
-                  <Badge variant='outline'>{t('Native')}</Badge>
-                )}
-                {channelCount === 0 && !supply?.global_credential_configured && provider !== 'local' && (
-                  <Badge variant='secondary'>{t('No configured channels')}</Badge>
-                )}
-              </div>
-              <Button
-                type='button'
-                variant='outline'
-                size='sm'
-                aria-label={`${t('Move up')}: ${provider}`}
-                disabled={props.disabled}
-                aria-disabled={
-                  index === 0 ||
-                  !!isPinned(provider) ||
-                  !!isPinned(providers[index - 1])
-                }
-                onClick={(event) => {
-                  move(index, -1)
-                  event.currentTarget.focus()
-                }}
+              <li
+                key={`${provider}:${providers.slice(0, index).filter((entry) => entry === provider).length}`}
+                className='bg-muted/30 flex items-center gap-2 rounded-md border px-2.5 py-1.5'
               >
-                {t('Move up')}
-              </Button>
-              <Button
-                type='button'
-                variant='outline'
-                size='sm'
-                aria-label={`${t('Move down')}: ${provider}`}
-                disabled={props.disabled}
-                aria-disabled={
-                  index === providers.length - 1 ||
-                  !!isPinned(provider) ||
-                  !!isPinned(providers[index + 1])
-                }
-                onClick={(event) => {
-                  move(index, 1)
-                  event.currentTarget.focus()
-                }}
-              >
-                {t('Move down')}
-              </Button>
-              <Button
-                type='button'
-                variant='ghost'
-                size='sm'
-                aria-label={`${t('Remove')}: ${provider}`}
-                disabled={props.disabled}
-                onClick={() =>
-                  update(providers.filter((_, position) => position !== index))
-                }
-              >
-                {t('Remove')}
-              </Button>
-            </li>
+                <span className='bg-background text-muted-foreground inline-flex size-5 shrink-0 items-center justify-center rounded-full border font-mono text-[11px] tabular-nums'>
+                  {index + 1}
+                </span>
+                <div className='me-auto flex min-w-0 flex-wrap items-center gap-1.5'>
+                  <code className='text-sm font-medium wrap-anywhere'>{provider}</code>
+                  {props.contract && supply?.native_contracts?.includes(props.contract) && (
+                    <Badge variant='outline' className='h-5 text-[11px]'>
+                      {t('Native')}
+                    </Badge>
+                  )}
+                  {channelCount === 0 && !supply?.global_credential_configured && provider !== 'local' && (
+                    <Badge variant='secondary' className='h-5 text-[11px]'>
+                      {t('No configured channels')}
+                    </Badge>
+                  )}
+                </div>
+                <div className='flex shrink-0 items-center gap-1'>
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='icon-xs'
+                    title={t('Move up')}
+                    aria-label={`${t('Move up')}: ${provider}`}
+                    disabled={props.disabled}
+                    aria-disabled={moveUpDisabled}
+                    onClick={(event) => {
+                      move(index, -1)
+                      event.currentTarget.focus()
+                    }}
+                  >
+                    <ArrowUp className='size-3.5' aria-hidden='true' />
+                  </Button>
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='icon-xs'
+                    title={t('Move down')}
+                    aria-label={`${t('Move down')}: ${provider}`}
+                    disabled={props.disabled}
+                    aria-disabled={moveDownDisabled}
+                    onClick={(event) => {
+                      move(index, 1)
+                      event.currentTarget.focus()
+                    }}
+                  >
+                    <ArrowDown className='size-3.5' aria-hidden='true' />
+                  </Button>
+                  <Button
+                    type='button'
+                    variant='ghost'
+                    size='icon-xs'
+                    title={t('Remove')}
+                    aria-label={`${t('Remove')}: ${provider}`}
+                    disabled={props.disabled}
+                    className='text-muted-foreground hover:text-destructive'
+                    onClick={() =>
+                      update(providers.filter((_, position) => position !== index))
+                    }
+                  >
+                    <X className='size-3.5' aria-hidden='true' />
+                  </Button>
+                </div>
+              </li>
             )
           })}
         </ol>

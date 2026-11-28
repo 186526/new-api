@@ -56,7 +56,7 @@ func TestRequesterDiscoveryBindsOnlyTheCandidatesConnection(t *testing.T) {
 	fetch, err := requestFetch(ctx, channel, query)
 	require.NoError(t, err)
 	require.Len(t, fetch, 3)
-	local := fetch[2]
+	local := fetch[1]
 	require.Equal(t, websearch_setting.ProviderLocal, local.candidate.Provider)
 	require.Equal(t, abstract.OriginLocal, local.candidate.Origin)
 	var localChannel abstract.ChannelContext

@@ -24,6 +24,7 @@ import { useAuthStore } from '@/stores/auth-store'
 
 import { PlaygroundChat } from './components/chat/playground-chat'
 import { PlaygroundInput } from './components/input/playground-input'
+import { PlaygroundSystemOne } from './components/playground-systemone'
 import { PlaygroundTools } from './components/playground-tools'
 import {
   useChatHandler,
@@ -47,9 +48,11 @@ export function Playground() {
       value={options.mode ?? 'chat'}
       className='size-full min-h-0'
       onValueChange={(mode) => {
+        const nextMode =
+          mode === 'tools' || mode === 'systemone' ? mode : undefined
         void navigate({
           to: '/playground',
-          search: { ...options, mode: mode === 'tools' ? 'tools' : undefined },
+          search: { ...options, mode: nextMode },
         })
       }}
     >
@@ -59,6 +62,7 @@ export function Playground() {
       >
         <TabsTrigger value='chat'>{t('Chat')}</TabsTrigger>
         <TabsTrigger value='tools'>{t('Tools')}</TabsTrigger>
+        <TabsTrigger value='systemone'>System One</TabsTrigger>
       </TabsList>
       <TabsContent value='chat' keepMounted className='min-h-0'>
         <ChatPlayground />
@@ -72,6 +76,11 @@ export function Playground() {
             group={group}
             model={options.model}
           />
+        )}
+      </TabsContent>
+      <TabsContent value='systemone' className='min-h-0 overflow-y-auto'>
+        {userId != null && (
+          <PlaygroundSystemOne userId={userId} group={group} />
         )}
       </TabsContent>
     </Tabs>

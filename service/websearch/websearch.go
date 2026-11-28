@@ -59,6 +59,7 @@ type Answer struct {
 	StatusCode  int
 	Header      http.Header
 	Provider    string
+	Origin      abstract.CandidateOrigin
 	// Cached reports that this answer came from the cache rather than from an
 	// upstream call, so a caller can count the hit in its metrics.
 	Cached bool
@@ -247,6 +248,7 @@ func render(ctx context.Context, upstream request.Upstream, renderer response.Re
 		StatusCode:  upstream.StatusCode,
 		Header:      upstream.Header,
 		Provider:    candidate.Provider,
+		Origin:      candidate.Origin,
 		Cached:      upstream.Cached,
 	}
 

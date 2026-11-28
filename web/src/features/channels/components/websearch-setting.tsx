@@ -20,6 +20,7 @@ import { useId } from 'react'
 import { useFormContext, useWatch } from 'react-hook-form'
 import { useTranslation } from 'react-i18next'
 
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Field, FieldLabel } from '@/components/ui/field'
 import {
@@ -263,7 +264,7 @@ export function WebSearchSetting(props: {
           )}
           <fieldset
             disabled={props.disabled || props.settingsLocked}
-            className='space-y-4 disabled:opacity-60'
+            className='bg-muted/20 space-y-4 rounded-lg border p-3.5 disabled:opacity-60'
           >
             {(availability.canConfigure ||
               (!props.toolCatalog && provider)) && (
@@ -318,12 +319,14 @@ export function WebSearchSetting(props: {
             )}
 
             {fixedSearchModel && searchEnabled && (
-              <dl>
-                <dt>{antigravity ? t('Antigravity search model') : t('Search model')}</dt>
-                <dd className='text-muted-foreground text-sm'>
+              <div className='bg-background flex items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm'>
+                <span className='font-medium'>
+                  {antigravity ? t('Antigravity search model') : t('Search model')}
+                </span>
+                <Badge variant='secondary' className='font-mono text-xs'>
                   {fixedSearchModel}
-                </dd>
-              </dl>
+                </Badge>
+              </div>
             )}
 
             {searchEnabled && (

@@ -32,7 +32,7 @@ export type ToolsFormValues = z.infer<typeof toolsFormSchema>
 
 export const toolsPlaygroundSearchSchema = z
   .object({
-    mode: z.literal('tools').optional().catch(undefined),
+    mode: z.enum(['tools', 'systemone']).optional().catch(undefined),
     endpoint: z
       .string()
       .optional()
